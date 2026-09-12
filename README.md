@@ -52,9 +52,19 @@ npm --prefix reanchor run check
 
 The OMP relay, existing browser-extension trust and selected browser conversation must be verified independently before launching a watch. Consult `python -m chat_watchdog --help` and `node reanchor/bin/reanchor.mjs --help` for the installed command contracts. Do not copy a different host's live scope or conversation IDs into a new deployment.
 
-## Portable Git recovery
+## Repository and recovery
 
-A self-contained Git bundle can preserve this repository while creation of a dedicated remote is blocked. Clone the exact bundle recorded in the mymem closeout note:
+The canonical repository is `user141514/watchdog`, created by the user. Its SSH remote is `git@github.com:user141514/watchdog.git`. Clone it normally:
+
+```sh
+git clone git@github.com:user141514/watchdog.git watchdog
+cd watchdog
+git fsck --full
+```
+
+The existing PC installation continues to use `C:/Users/Administrator/gitproject/chat-watchdog`; a new remote name does not require moving that checkout or reinstalling the runtime. The imported baseline was rebased onto the user's initial LICENSE commit without changing runtime or test files. The original pre-publication commit `ad697062820cd502f3376ffe055e7e7d6fad49e0` remains in the local backup branch and the archived bundle; it is a historical baseline, not the current remote HEAD.
+
+The self-contained bundle recorded in the mymem closeout note remains an independent offline recovery option:
 
 ```sh
 git clone /path/to/chat-watchdog-<commit>.bundle chat-watchdog
@@ -62,4 +72,4 @@ cd chat-watchdog
 git fsck --full
 ```
 
-An archived bundle is a versioned recovery artifact, not an assertion that a standalone GitHub repository exists. Configure a dedicated `origin` only after that repository is actually created and verified. Do not force-push or replace a repository with a similar name.
+The bundle restores the pre-publication baseline rather than tracking later remote commits. For current source use the canonical repository above and verify its remote HEAD. Preserve existing history; do not force-push or substitute the earlier proposed but unused `user141514/chat-watchdog` repository name.
