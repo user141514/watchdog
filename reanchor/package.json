@@ -1,0 +1,23 @@
+{
+  "name": "@local/reanchor",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Provider-neutral, memory-backed re-anchoring protocol. It preserves authority and provenance; it does not judge task semantics.",
+  "engines": { "node": ">=22" },
+  "exports": {
+    ".": "./src/engine.mjs",
+    "./boundary": "./src/boundary.mjs",
+    "./orca-mission-adapter": "./src/orca-mission-adapter.mjs",
+    "./json-cli-runner": "./src/json-cli-runner.mjs"
+  },
+  "bin": {
+    "reanchor": "./bin/reanchor.mjs",
+    "reanchor-orca-mission": "./bin/reanchor-orca-mission.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs",
+    "demo": "node examples/local-roundtrip.mjs",
+    "check": "node --check src/store.mjs && node --check src/protocol.mjs && node --check src/engine.mjs && node --check src/boundary.mjs && node --check src/json-cli-runner.mjs && node --check src/orca-mission-adapter.mjs && node --check bin/reanchor.mjs && node --check bin/reanchor-orca-mission.mjs"
+  }
+}

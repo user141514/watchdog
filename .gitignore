@@ -1,0 +1,14 @@
+# Runtime state and host-specific acceptance evidence stay outside source control.
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+node_modules/
+graft/
+*.log
+/acceptance/
+/DEPLOYMENT_STATUS.md
+/nul
+/'

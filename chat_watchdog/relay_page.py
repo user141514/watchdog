@@ -1,0 +1,373 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+import json
+import time
+from typing import Callable, Iterable, Mapping
+from urllib.parse import urlparse
+from urllib.request import urlopen
+
+from .dom_snapshot import DOM_SNAPSHOT_JS
+from .model import DomSignals, PageSnapshot, Phase, PromptDelivery, classify_phase
+from .relay_cdp import RelayCdpError, RelayCdpProtocol
+
+
+class RelayTargetSelectionError(RuntimeError):
+    pass
+
+
+def _build_submit_expression(prompt: str) -> str:
+    text = json.dumps(prompt)
+    return f"""
+(async () => {{
+  const visible = (el) => {{
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  }};
+  const assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  const latest = assistants.length ? assistants[assistants.length - 1] : null;
+  const turn = latest
+    ? (latest.closest('[data-testid^="conversation-turn-"]') || latest.closest('article[data-turn="assistant"]') || latest)
+    : null;
+  const stop = document.querySelector('[data-testid="stop-button"]');
+  const busy = !!(turn && (turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')));
+  if (visible(stop) || busy) return {{ submitted: false, reason: 'generation-active' }};
+
+  const editor = document.querySelector('#prompt-textarea') ||
+    document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
+    document.querySelector('div[contenteditable="true"]');
+  if (!editor || !visible(editor) || editor.getAttribute('aria-disabled') === 'true') {{
+    return {{ submitted: false, reason: 'composer-unavailable' }};
+  }}
+  const existing = typeof editor.value === 'string'
+    ? editor.value
+    : (editor.innerText || editor.textContent || '');
+  if (existing.trim()) return {{ submitted: false, reason: 'composer-not-empty' }};
+
+  const text = {text};
+  editor.focus();
+  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {{
+    const prototype = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+    if (setter) setter.call(editor, text);
+    else editor.value = text;
+    editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
+  }} else {{
+    document.execCommand('selectAll', false);
+    const inserted = document.execCommand('insertText', false, text);
+    if (!inserted) {{
+      editor.textContent = text;
+      editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
+    }}
+  }}
+
+  const findSend = () => document.querySelector('[data-testid="send-button"]') ||
+    Array.from(document.querySelectorAll('button')).find((button) => {{
+      const label = (button.getAttribute('aria-label') || button.textContent || '').trim().toLowerCase();
+      return label === 'send' || label.includes('send message') || label.includes('发送');
+    }});
+  for (let attempt = 0; attempt < 16; attempt += 1) {{
+    const button = findSend();
+    if (button && visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {{
+      button.click();
+      return {{ submitted: true }};
+    }}
+    await new Promise((resolve) => setTimeout(resolve, 125));
+  }}
+  return {{ submitted: false, reason: 'send-unavailable' }};
+}})()
+""".strip()
+
+
+@dataclass
+class RelayChatGPTPage:
+    target_id: str
+    target_url: str
+    session_id: str
+    socket: object
+    protocol: RelayCdpProtocol
+    match_url: str
+    relay_url: str | None = None
+    fetch_json: Callable[[str], object] | None = None
+    websocket_factory: object = None
+
+    @classmethod
+    def connect(
+        cls,
+        relay_url: str,
+        match_url: str,
+        *,
+        fetch_json: Callable[[str], object] = None,
+        websocket_factory=None,
+    ) -> "RelayChatGPTPage":
+        fetch = fetch_json or _fetch_json
+        target = discover_unique_target(relay_url, match_url, fetch_json=fetch)
+        target_id = str(target["id"])
+        target_url = str(target["url"])
+        ws_url = discover_websocket_url(relay_url, fetch_json=fetch)
+        if websocket_factory is None:
+            import websocket
+
+            websocket_factory = websocket.create_connection
+        socket = websocket_factory(ws_url, timeout=3.0, suppress_origin=True)
+        protocol = RelayCdpProtocol(socket)
+        session_id = protocol.attach_target(target_id)
+        return cls(
+            target_id=target_id,
+            target_url=target_url,
+            session_id=session_id,
+            socket=socket,
+            protocol=protocol,
+            match_url=match_url,
+            relay_url=relay_url,
+            fetch_json=fetch,
+            websocket_factory=websocket_factory,
+        )
+
+    def _reconnect(self) -> bool:
+        if not self.relay_url or self.websocket_factory is None:
+            return False
+        replacement_socket = None
+        try:
+            target = discover_unique_target(
+                self.relay_url,
+                self.match_url,
+                fetch_json=self.fetch_json or _fetch_json,
+            )
+            ws_url = discover_websocket_url(
+                self.relay_url,
+                fetch_json=self.fetch_json or _fetch_json,
+            )
+            replacement_socket = self.websocket_factory(
+                ws_url,
+                timeout=3.0,
+                suppress_origin=True,
+            )
+            protocol = RelayCdpProtocol(replacement_socket)
+            target_id = str(target["id"])
+            session_id = protocol.attach_target(target_id)
+        except Exception:
+            close = getattr(replacement_socket, "close", None)
+            if callable(close):
+                close()
+            return False
+
+        self.close()
+        self.target_id = target_id
+        self.target_url = str(target["url"])
+        self.session_id = session_id
+        self.socket = replacement_socket
+        self.protocol = protocol
+        return True
+
+    def snapshot(self, *, _allow_reconnect: bool = True) -> PageSnapshot:
+        try:
+            current_url = self.protocol.evaluate(self.session_id, "location.href")
+            if (
+                not isinstance(current_url, str)
+                or not _is_chatgpt_url(current_url)
+                or self.match_url not in current_url
+            ):
+                return PageSnapshot(
+                    phase=Phase.BLOCKED,
+                    assistant_turn_id="navigated-away",
+                    assistant_text_signature="",
+                    assistant_text="",
+                    assistant_count=0,
+                    user_count=0,
+                )
+
+            payload = self.protocol.evaluate(
+                self.session_id,
+                f"({DOM_SNAPSHOT_JS})()",
+            )
+        except RelayCdpError:
+            if _allow_reconnect and self._reconnect():
+                return self.snapshot(_allow_reconnect=False)
+            return PageSnapshot(
+                phase=Phase.BLOCKED,
+                assistant_turn_id="relay-unavailable",
+                assistant_text_signature="",
+                assistant_text="",
+                assistant_count=0,
+                user_count=0,
+            )
+        if not isinstance(payload, Mapping):
+            return PageSnapshot(
+                phase=Phase.BLOCKED,
+                assistant_turn_id="invalid-snapshot",
+                assistant_text_signature="",
+                assistant_text="",
+                assistant_count=0,
+                user_count=0,
+            )
+        signals = DomSignals(
+            stop_visible=bool(payload.get("stopVisible")),
+            assistant_busy=bool(payload.get("assistantBusy")),
+            thinking_visible=bool(payload.get("thinkingVisible")),
+            composer_ready=bool(payload.get("composerReady")),
+            composer_has_draft=bool(payload.get("composerHasDraft", False)),
+            assistant_present=int(payload.get("assistantCount", 0)) > 0,
+            assistant_finalized=bool(payload.get("assistantFinalized", False)),
+            interaction_required=bool(payload.get("interactionRequired", False)),
+            send_timeout=bool(payload.get("sendTimeout", False)),
+            stream_interrupted=bool(payload.get("streamInterrupted", False)),
+        )
+        return PageSnapshot(
+            phase=classify_phase(signals),
+            assistant_turn_id=str(payload.get("assistantTurnId", "assistant-0")),
+            assistant_text_signature=str(payload.get("assistantTextSignature", "")),
+            assistant_text=str(payload.get("assistantText", "")),
+            assistant_count=int(payload.get("assistantCount", 0)),
+            user_count=int(payload.get("userCount", 0)),
+            user_turn_id=str(payload.get("userTurnId", "")),
+            user_text=str(payload.get("userText", "")),
+            interaction_required=bool(payload.get("interactionRequired", False)),
+            send_timeout=bool(payload.get("sendTimeout", False)),
+            stream_interrupted=bool(payload.get("streamInterrupted", False)),
+            fault_text=str(payload.get("faultText", "")),
+        )
+
+    def _send_prompt(
+        self,
+        prompt: str,
+        expected_turn_key: tuple[int, str],
+        *,
+        acceptance_timeout: float,
+        require_message_id: bool,
+    ) -> PromptDelivery:
+        before = self.snapshot()
+        if before.turn_key != expected_turn_key:
+            return PromptDelivery(accepted=True)
+        if before.phase is not Phase.FINISHED:
+            return PromptDelivery(
+                accepted=before.phase in (Phase.THINKING, Phase.RESPONDING)
+            )
+
+        try:
+            result = self.protocol.evaluate(
+                self.session_id,
+                _build_submit_expression(prompt),
+                await_promise=True,
+            )
+        except RelayCdpError:
+            return PromptDelivery(accepted=False)
+        if not isinstance(result, Mapping) or result.get("submitted") is not True:
+            return PromptDelivery(accepted=False)
+
+        deadline = time.monotonic() + acceptance_timeout
+        message_id = ""
+        accepted_observed = False
+        while time.monotonic() < deadline:
+            current = self.snapshot()
+            if (
+                current.user_count > before.user_count
+                and current.user_turn_id
+                and current.user_turn_id != before.user_turn_id
+            ):
+                message_id = current.user_turn_id
+            if (
+                current.turn_key != before.turn_key
+                or current.phase in (Phase.THINKING, Phase.RESPONDING)
+            ):
+                accepted_observed = True
+            if accepted_observed and (message_id or not require_message_id):
+                return PromptDelivery(accepted=True, message_id=message_id)
+            time.sleep(0.1)
+        return PromptDelivery(accepted=accepted_observed, message_id=message_id)
+
+    def send_prompt(
+        self,
+        prompt: str,
+        expected_turn_key: tuple[int, str],
+        acceptance_timeout: float = 3.0,
+    ) -> PromptDelivery:
+        return self._send_prompt(
+            prompt,
+            expected_turn_key,
+            acceptance_timeout=acceptance_timeout,
+            require_message_id=True,
+        )
+
+    def send_continue(
+        self,
+        prompt: str,
+        expected_turn_key: tuple[int, str],
+        acceptance_timeout: float = 3.0,
+    ) -> bool:
+        return self._send_prompt(
+            prompt,
+            expected_turn_key,
+            acceptance_timeout=acceptance_timeout,
+            require_message_id=False,
+        ).accepted
+
+    def close(self) -> None:
+        close = getattr(self.socket, "close", None)
+        if callable(close):
+            close()
+
+
+def _is_chatgpt_url(url: str) -> bool:
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return False
+    return host == "chatgpt.com" or host.endswith(".chatgpt.com")
+
+
+def _fetch_json(url: str):
+    with urlopen(url, timeout=3.0) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def discover_websocket_url(
+    relay_url: str,
+    *,
+    fetch_json: Callable[[str], object] = _fetch_json,
+) -> str:
+    payload = fetch_json(f"{relay_url.rstrip('/')}/json/version")
+    if not isinstance(payload, Mapping):
+        raise RelayTargetSelectionError("relay /json/version returned a non-object payload")
+    ws_url = payload.get("webSocketDebuggerUrl")
+    if not isinstance(ws_url, str) or not ws_url:
+        raise RelayTargetSelectionError("relay /json/version did not provide webSocketDebuggerUrl")
+    return ws_url
+
+
+def discover_unique_target(
+    relay_url: str,
+    match_url: str,
+    *,
+    fetch_json: Callable[[str], object] = _fetch_json,
+) -> Mapping[str, object]:
+    targets = fetch_json(f"{relay_url.rstrip('/')}/json/list".replace("\\/", "/"))
+    if not isinstance(targets, list):
+        raise RelayTargetSelectionError("relay /json/list returned a non-list payload")
+    return select_unique_target(targets, match_url)
+
+
+def select_unique_target(
+    targets: Iterable[Mapping[str, object]],
+    match_url: str,
+) -> Mapping[str, object]:
+    matches = [
+        target
+        for target in targets
+        if target.get("type") == "page"
+        and isinstance(target.get("url"), str)
+        and _is_chatgpt_url(str(target["url"]))
+        and match_url in str(target["url"])
+    ]
+    if not matches:
+        raise RelayTargetSelectionError(
+            f"no matching ChatGPT target for URL substring {match_url!r}"
+        )
+    if len(matches) > 1:
+        urls = ", ".join(str(target.get("url", "")) for target in matches)
+        raise RelayTargetSelectionError(
+            f"multiple matching ChatGPT targets; use a more specific --match-url: {urls}"
+        )
+    return matches[0]
