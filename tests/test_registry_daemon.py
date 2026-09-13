@@ -16,6 +16,7 @@ class FakeWatcher:
     should_stop: bool = False
     steps: int = 0
     closed: bool = False
+    completion_text: str | None = None
 
     def step(self) -> None:
         self.steps += 1

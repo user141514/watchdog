@@ -184,6 +184,24 @@ class Supervisor:
             self._last_progress_at = now
         return now
 
+    def _attempt_direct_continue(self, snapshot: PageSnapshot) -> StepResult | None:
+        key = snapshot.turn_key
+        if key in self._continued:
+            return StepResult.ALREADY_HANDLED
+        if key in self._direct_attempted:
+            return None
+
+        self._direct_attempted.add(key)
+        try:
+            accepted = self._page.send_continue(CONTINUE_PROMPT, key)
+        except Exception:
+            accepted = False
+        if not accepted:
+            return None
+
+        self._continued.add(key)
+        return StepResult.CONTINUED
+
     def step(self) -> StepResult:
         snapshot = self._page.snapshot()
         now = self._observe_progress(snapshot)
@@ -214,6 +232,14 @@ class Supervisor:
             if snapshot.stream_interrupted:
                 self._remember_frontend_fault(snapshot)
                 return StepResult.STREAM_INTERRUPTED
+            if (
+                snapshot.assistant_text.strip()
+                and self._last_progress_at is not None
+                and now - self._last_progress_at >= self._recovery_timeout_seconds
+            ):
+                direct = self._attempt_direct_continue(snapshot)
+                if direct is not None:
+                    return direct
             return StepResult.BLOCKED
 
         if self._reanchor is not None:
@@ -246,19 +272,9 @@ class Supervisor:
             self.should_stop = True
             return StepResult.DONE
 
-        key = snapshot.turn_key
-        if key in self._continued:
-            return StepResult.ALREADY_HANDLED
-
-        if key not in self._direct_attempted:
-            self._direct_attempted.add(key)
-            try:
-                accepted = self._page.send_continue(CONTINUE_PROMPT, key)
-            except Exception:
-                accepted = False
-            if accepted:
-                self._continued.add(key)
-                return StepResult.CONTINUED
+        direct = self._attempt_direct_continue(snapshot)
+        if direct is not None:
+            return direct
 
         return self._try_recovery(snapshot)
 
