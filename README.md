@@ -57,13 +57,16 @@ The OMP relay, existing browser-extension trust and selected browser conversatio
 Registry mode owns one in-memory hash map keyed by ChatGPT's own conversation UUID from `/c/<uuid>`. A normal URL such as `https://chatgpt.com/c/<uuid>` and a Project URL such as `https://chatgpt.com/g/<project>/c/<uuid>` therefore refer to the same watch. Browser title, focus and transient `PAGE...` target IDs are never identity.
 
 ```powershell
-chat-watchdog --registry-port 9235 --relay-url http://127.0.0.1:9224 --poll-seconds 60
+chat-watchdog --registry-port 9235 --relay-url http://127.0.0.1:9224 --poll-seconds 60 \
+  --send-admission-url http://127.0.0.1:7337/internal/send-admission
 chat-watchdog-registry add https://chatgpt.com/g/g-p-example-agent/c/6aa542fd-708c-83ea-869a-721efd83d7f3
 chat-watchdog-registry list --json
 chat-watchdog-registry remove 6aa542fd-708c-83ea-869a-721efd83d7f3
 ```
 
 The control API binds to localhost only and exposes `POST /register`, `POST /unregister`, and `GET /watches`. Registration is idempotent by conversation UUID. Each entry reuses the existing single-conversation Supervisor; when that Supervisor reaches `SUPERVISOR_DONE`, the entry closes and is removed.
+
+When `--send-admission-url` is configured, Watchdog must obtain Sidecar's localhost admission before any managed continuation or frontend-fault recovery can send. Denial or an unavailable admission owner is fail-closed. Omitting the option preserves standalone legacy behavior, but that mode makes no claim about a global cross-sender 120-second interval.
 
 The hash map is intentionally not durable. If the daemon restarts, callers re-register the conversations they still own. This keeps target authority with the caller and avoids a second task database. Registry mode does not share one reanchor scope across multiple conversations; the existing single-conversation mode remains available when an explicit reanchor binding is required.
 
