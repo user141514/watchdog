@@ -56,8 +56,12 @@ class RegistryCliTests(unittest.TestCase):
         self.assertEqual(json.loads(output.getvalue()), payload["watches"])
 
     def test_main_watchdog_parser_exposes_registry_mode_without_removing_single_watch_mode(self) -> None:
-        dynamic = build_watchdog_parser().parse_args(["--registry-port", "9235"])
+        dynamic = build_watchdog_parser().parse_args([
+            "--registry-port", "9235",
+            "--send-admission-url", "http://127.0.0.1:7337/internal/send-admission",
+        ])
         self.assertEqual(dynamic.registry_port, 9235)
+        self.assertEqual(dynamic.send_admission_url, "http://127.0.0.1:7337/internal/send-admission")
 
         legacy = build_watchdog_parser().parse_args(
             ["--match-url", f"/c/{CHAT_ID}", "--poll-seconds", "30"]

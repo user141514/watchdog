@@ -85,6 +85,7 @@ class Supervisor:
         heartbeat_seconds: float = 900.0,
         clock=time.monotonic,
         reanchor: ReanchorPort | None = None,
+        send_admission=None,
     ) -> None:
         self._page = page
         self._agent_pool = agent_pool
@@ -98,6 +99,7 @@ class Supervisor:
         self._heartbeat_seconds = heartbeat_seconds
         self._clock = clock
         self._reanchor = reanchor
+        self._send_admission = send_admission
         self._last_progress_key: tuple[tuple[int, str], str, int] | None = None
         self._last_progress_at: float | None = None
         self._pending_reanchor_reason: str | None = None
@@ -170,6 +172,21 @@ class Supervisor:
         except ReanchorBridgeError:
             pass
 
+    def _try_fault_recovery(self, snapshot: PageSnapshot) -> StepResult:
+        if self.recovery_lease is not None:
+            return StepResult.RECOVERY_RUNNING
+        if self._send_admission is not None:
+            target_url = getattr(self._page, "target_url", "")
+            if not target_url:
+                return StepResult.WAITING
+            try:
+                admission = self._send_admission.admit(target_url)
+            except Exception:
+                return StepResult.WAITING
+            if getattr(admission, "admitted", False) is not True:
+                return StepResult.WAITING
+        return self._try_recovery(snapshot)
+
     def _observe_progress(self, snapshot: PageSnapshot) -> float:
         now = self._clock()
         progress_key = (
@@ -189,7 +206,18 @@ class Supervisor:
         if key in self._continued:
             return StepResult.ALREADY_HANDLED
         if key in self._direct_attempted:
-            return None
+            return StepResult.BLOCKED if self._send_admission is not None else None
+
+        if self._send_admission is not None:
+            target_url = getattr(self._page, "target_url", "")
+            if not target_url:
+                return StepResult.WAITING
+            try:
+                admission = self._send_admission.admit(target_url)
+            except Exception:
+                return StepResult.WAITING
+            if getattr(admission, "admitted", False) is not True:
+                return StepResult.WAITING
 
         self._direct_attempted.add(key)
         try:
@@ -197,7 +225,7 @@ class Supervisor:
         except Exception:
             accepted = False
         if not accepted:
-            return None
+            return StepResult.BLOCKED if self._send_admission is not None else None
 
         self._continued.add(key)
         return StepResult.CONTINUED
@@ -228,10 +256,10 @@ class Supervisor:
                 return StepResult.NEED_INPUT
             if snapshot.send_timeout:
                 self._remember_frontend_fault(snapshot)
-                return StepResult.SEND_TIMEOUT
+                return self._try_fault_recovery(snapshot)
             if snapshot.stream_interrupted:
                 self._remember_frontend_fault(snapshot)
-                return StepResult.STREAM_INTERRUPTED
+                return self._try_fault_recovery(snapshot)
             if (
                 snapshot.assistant_text.strip()
                 and self._last_progress_at is not None

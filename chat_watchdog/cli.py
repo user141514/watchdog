@@ -12,6 +12,7 @@ from .agent_runner import AgentPool, AgentSpec
 from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
+from .send_admission import SidecarSendAdmission
 from .supervisor import Supervisor
 
 
@@ -104,6 +105,11 @@ def _run_registry_mode(args, pool: AgentPool) -> int:
             recovery_timeout_seconds=args.recovery_timeout_seconds,
             heartbeat_seconds=args.reanchor_heartbeat_seconds,
             reanchor=None,
+            send_admission=(
+                SidecarSendAdmission(args.send_admission_url)
+                if args.send_admission_url
+                else None
+            ),
         )
         return _SupervisorWatcher(page, supervisor)
 
@@ -145,6 +151,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--match-url",
         default="chatgpt.com",
         help="substring that must uniquely identify the existing ChatGPT tab",
+    )
+    parser.add_argument(
+        "--send-admission-url",
+        default=os.environ.get("CHAT_WATCHDOG_SEND_ADMISSION_URL"),
+        help="optional Sidecar localhost send-admission endpoint; enables shared pacing",
     )
     parser.add_argument(
         "--registry-port",
@@ -267,6 +278,11 @@ def main(argv: list[str] | None = None) -> int:
         recovery_timeout_seconds=args.recovery_timeout_seconds,
         heartbeat_seconds=args.reanchor_heartbeat_seconds,
         reanchor=reanchor,
+        send_admission=(
+            SidecarSendAdmission(args.send_admission_url)
+            if args.send_admission_url
+            else None
+        ),
     )
 
     logging.info("watching %s every %.1fs", page.target_url, args.poll_seconds)
