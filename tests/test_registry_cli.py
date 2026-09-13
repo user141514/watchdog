@@ -21,6 +21,14 @@ class RegistryCliTests(unittest.TestCase):
         self.assertEqual(args.url, CHAT_URL)
         self.assertEqual(args.control_url, "http://127.0.0.1:9235")
 
+    def test_start_and_finish_are_lifecycle_aliases(self) -> None:
+        start = build_parser().parse_args(["start", CHAT_URL])
+        finish = build_parser().parse_args(["finish", CHAT_ID])
+        self.assertEqual(start.command, "start")
+        self.assertEqual(start.url, CHAT_URL)
+        self.assertEqual(finish.command, "finish")
+        self.assertEqual(finish.conversation, CHAT_ID)
+
     def test_add_forwards_exact_url_to_running_registry(self) -> None:
         output = io.StringIO()
         with patch(

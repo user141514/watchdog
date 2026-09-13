@@ -23,10 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    add = subparsers.add_parser("add", help="watch one exact ChatGPT conversation URL")
+    add = subparsers.add_parser("add", aliases=["start"], help="watch one exact ChatGPT conversation URL")
     add.add_argument("url")
 
-    remove = subparsers.add_parser("remove", help="stop watching a conversation UUID or URL")
+    remove = subparsers.add_parser("remove", aliases=["finish"], help="stop watching a conversation UUID or URL")
     remove.add_argument("conversation")
 
     list_parser = subparsers.add_parser("list", help="list currently watched conversations")
@@ -63,13 +63,13 @@ def _request(
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
-        if args.command == "add":
+        if args.command in {"add", "start"}:
             result = _request(args.control_url, "POST", "/register", {"url": args.url})
             state = "created" if result.get("created") is True else "existing"
             print(f"{result.get('conversation_id')}\t{state}")
             return 0
 
-        if args.command == "remove":
+        if args.command in {"remove", "finish"}:
             key = "url" if "://" in args.conversation else "conversation_id"
             result = _request(
                 args.control_url,
