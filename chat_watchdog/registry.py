@@ -1,219 +1,234 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
-from pathlib import Path
-import re
-import sqlite3
-from urllib.parse import urlsplit, urlunsplit
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import json
+from threading import RLock
+from typing import Callable, Protocol
+from urllib.parse import urlsplit
+from uuid import UUID
 
 
-WATCH_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
-WATCH_STATES = frozenset({"active", "paused", "completed"})
+class Watcher(Protocol):
+    should_stop: bool
+
+    def step(self) -> object: ...
+
+    def close(self) -> None: ...
 
 
 @dataclass(frozen=True)
-class WatchEntry:
-    watch_id: str
+class RegisterResult:
+    conversation_id: str
+    created: bool
+
+
+@dataclass(frozen=True)
+class WatchRegistration:
+    conversation_id: str
     target_url: str
-    state: str
-    reanchor_scope: str | None
-    reanchor_epoch: str | None
-    last_result: str | None
-    created_at: str
-    updated_at: str
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+@dataclass
+class _WatchEntry:
+    conversation_id: str
+    target_url: str
+    watcher: Watcher
 
 
-def canonical_conversation_url(value: str) -> str:
+def conversation_id_from_url(value: str) -> str:
+    """Return ChatGPT's own stable conversation UUID from a conversation URL."""
     if not isinstance(value, str) or not value:
-        raise ValueError("target_url must be a non-empty string")
+        raise ValueError("conversation URL must be a non-empty string")
+
     parsed = urlsplit(value)
-    if parsed.scheme != "https" or parsed.netloc != "chatgpt.com":
-        raise ValueError("target_url must use https://chatgpt.com")
-    if parsed.query or parsed.fragment or parsed.username or parsed.password:
-        raise ValueError("target_url must not contain query, fragment, or credentials")
+    if parsed.scheme != "https" or parsed.hostname != "chatgpt.com":
+        raise ValueError("conversation URL must use https://chatgpt.com")
 
-    segments = parsed.path.split("/")
-    if len(segments) < 3 or segments[-2] != "c" or not segments[-1]:
-        raise ValueError("target_url must end with /c/<conversation-id>")
-    if any(not segment for segment in segments[1:]):
-        raise ValueError("target_url must be canonical and contain no empty path segments")
+    segments = [segment for segment in parsed.path.split("/") if segment]
+    try:
+        c_index = len(segments) - 2 - segments[-2::-1].index("c")
+    except ValueError as error:
+        raise ValueError("conversation URL must contain /c/<conversation-id>") from error
 
-    return urlunsplit(("https", "chatgpt.com", parsed.path, "", ""))
+    if c_index + 1 >= len(segments):
+        raise ValueError("conversation URL must contain /c/<conversation-id>")
 
+    candidate = segments[c_index + 1]
+    try:
+        conversation_id = str(UUID(candidate))
+    except (ValueError, AttributeError) as error:
+        raise ValueError("conversation id must be a UUID") from error
 
-def _validate_watch_id(watch_id: str) -> str:
-    if not isinstance(watch_id, str) or not WATCH_ID_RE.fullmatch(watch_id):
-        raise ValueError("watch_id must match [A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
-    return watch_id
-
-
-def _validate_state(state: str) -> str:
-    if state not in WATCH_STATES:
-        raise ValueError(f"state must be one of {sorted(WATCH_STATES)}")
-    return state
+    if c_index + 2 != len(segments):
+        raise ValueError("conversation URL must end with /c/<conversation-id>")
+    return conversation_id
 
 
-def _validate_reanchor_pair(scope: str | None, epoch: str | None) -> tuple[str | None, str | None]:
-    scope = scope or None
-    epoch = epoch or None
-    if (scope is None) != (epoch is None):
-        raise ValueError("reanchor_scope and reanchor_epoch must be provided together")
-    return scope, epoch
+def _conversation_id(value: str) -> str:
+    if "://" in value:
+        return conversation_id_from_url(value)
+    try:
+        return str(UUID(value))
+    except (ValueError, AttributeError) as error:
+        raise ValueError("conversation id must be a UUID") from error
 
 
 class WatchRegistry:
-    def __init__(self, path: str | Path):
-        self.path = Path(path).expanduser()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection: sqlite3.Connection | None = sqlite3.connect(self.path)
-        self._connection.row_factory = sqlite3.Row
-        self._initialize()
+    """Thread-safe in-memory map from ChatGPT conversation UUID to watcher."""
 
-    def _conn(self) -> sqlite3.Connection:
-        if self._connection is None:
-            raise RuntimeError("registry is closed")
-        return self._connection
+    def __init__(self, watcher_factory: Callable[[str], Watcher]) -> None:
+        self._watcher_factory = watcher_factory
+        self._watchers: dict[str, _WatchEntry] = {}
+        self._lock = RLock()
 
-    def _initialize(self) -> None:
-        with self._conn():
-            self._conn().execute(
-                """
-                CREATE TABLE IF NOT EXISTS watches (
-                    watch_id TEXT PRIMARY KEY,
-                    target_url TEXT NOT NULL UNIQUE,
-                    state TEXT NOT NULL CHECK (state IN ('active', 'paused', 'completed')),
-                    reanchor_scope TEXT,
-                    reanchor_epoch TEXT,
-                    last_result TEXT,
-                    created_at TEXT NOT NULL,
-                    updated_at TEXT NOT NULL,
-                    CHECK (
-                        (reanchor_scope IS NULL AND reanchor_epoch IS NULL)
-                        OR (reanchor_scope IS NOT NULL AND reanchor_epoch IS NOT NULL)
-                    )
+    def register(self, target_url: str) -> RegisterResult:
+        conversation_id = conversation_id_from_url(target_url)
+        with self._lock:
+            if conversation_id in self._watchers:
+                return RegisterResult(conversation_id=conversation_id, created=False)
+            watcher = self._watcher_factory(target_url)
+            self._watchers[conversation_id] = _WatchEntry(
+                conversation_id=conversation_id,
+                target_url=target_url,
+                watcher=watcher,
+            )
+        return RegisterResult(conversation_id=conversation_id, created=True)
+
+    def unregister(self, conversation: str) -> bool:
+        conversation_id = _conversation_id(conversation)
+        with self._lock:
+            entry = self._watchers.pop(conversation_id, None)
+        if entry is None:
+            return False
+        entry.watcher.close()
+        return True
+
+    def list_ids(self) -> list[str]:
+        with self._lock:
+            return sorted(self._watchers)
+
+    def list(self) -> list[WatchRegistration]:
+        with self._lock:
+            return [
+                WatchRegistration(entry.conversation_id, entry.target_url)
+                for entry in sorted(
+                    self._watchers.values(),
+                    key=lambda item: item.conversation_id,
                 )
-                """
-            )
+            ]
 
-    @staticmethod
-    def _entry(row: sqlite3.Row) -> WatchEntry:
-        return WatchEntry(
-            watch_id=row["watch_id"],
-            target_url=row["target_url"],
-            state=row["state"],
-            reanchor_scope=row["reanchor_scope"],
-            reanchor_epoch=row["reanchor_epoch"],
-            last_result=row["last_result"],
-            created_at=row["created_at"],
-            updated_at=row["updated_at"],
-        )
+    def step_all(self) -> None:
+        with self._lock:
+            snapshot = list(self._watchers.items())
 
-    def add(
-        self,
-        watch_id: str,
-        target_url: str,
-        *,
-        reanchor_scope: str | None = None,
-        reanchor_epoch: str | None = None,
-    ) -> WatchEntry:
-        watch_id = _validate_watch_id(watch_id)
-        target_url = canonical_conversation_url(target_url)
-        reanchor_scope, reanchor_epoch = _validate_reanchor_pair(
-            reanchor_scope,
-            reanchor_epoch,
-        )
-        now = _utc_now()
-        try:
-            with self._conn():
-                self._conn().execute(
-                    """
-                    INSERT INTO watches (
-                        watch_id, target_url, state, reanchor_scope, reanchor_epoch,
-                        last_result, created_at, updated_at
-                    ) VALUES (?, ?, 'active', ?, ?, NULL, ?, ?)
-                    """,
-                    (watch_id, target_url, reanchor_scope, reanchor_epoch, now, now),
-                )
-        except sqlite3.IntegrityError as error:
-            raise ValueError("watch_id and target_url must both be unique") from error
-        entry = self.get(watch_id)
-        assert entry is not None
-        return entry
+        completed: list[tuple[str, Watcher]] = []
+        for conversation_id, entry in snapshot:
+            entry.watcher.step()
+            if entry.watcher.should_stop:
+                completed.append((conversation_id, entry.watcher))
 
-    def get(self, watch_id: str) -> WatchEntry | None:
-        _validate_watch_id(watch_id)
-        row = self._conn().execute(
-            "SELECT * FROM watches WHERE watch_id = ?",
-            (watch_id,),
-        ).fetchone()
-        return None if row is None else self._entry(row)
-
-    def list(self, *, state: str | None = None) -> list[WatchEntry]:
-        if state is None:
-            rows = self._conn().execute(
-                "SELECT * FROM watches ORDER BY created_at, watch_id"
-            ).fetchall()
-        else:
-            _validate_state(state)
-            rows = self._conn().execute(
-                "SELECT * FROM watches WHERE state = ? ORDER BY created_at, watch_id",
-                (state,),
-            ).fetchall()
-        return [self._entry(row) for row in rows]
-
-    def set_state(self, watch_id: str, state: str) -> WatchEntry:
-        watch_id = _validate_watch_id(watch_id)
-        state = _validate_state(state)
-        now = _utc_now()
-        with self._conn():
-            cursor = self._conn().execute(
-                "UPDATE watches SET state = ?, updated_at = ? WHERE watch_id = ?",
-                (state, now, watch_id),
-            )
-        if cursor.rowcount != 1:
-            raise KeyError(watch_id)
-        entry = self.get(watch_id)
-        assert entry is not None
-        return entry
-
-    def record_result(self, watch_id: str, result: str) -> WatchEntry:
-        watch_id = _validate_watch_id(watch_id)
-        if not isinstance(result, str) or not result:
-            raise ValueError("result must be a non-empty string")
-        now = _utc_now()
-        with self._conn():
-            cursor = self._conn().execute(
-                "UPDATE watches SET last_result = ?, updated_at = ? WHERE watch_id = ?",
-                (result, now, watch_id),
-            )
-        if cursor.rowcount != 1:
-            raise KeyError(watch_id)
-        entry = self.get(watch_id)
-        assert entry is not None
-        return entry
-
-    def remove(self, watch_id: str) -> bool:
-        watch_id = _validate_watch_id(watch_id)
-        with self._conn():
-            cursor = self._conn().execute(
-                "DELETE FROM watches WHERE watch_id = ?",
-                (watch_id,),
-            )
-        return cursor.rowcount == 1
+        for conversation_id, watcher in completed:
+            with self._lock:
+                current = self._watchers.get(conversation_id)
+                if current is None or current.watcher is not watcher:
+                    continue
+                self._watchers.pop(conversation_id)
+            watcher.close()
 
     def close(self) -> None:
-        if self._connection is None:
-            return
-        self._connection.close()
-        self._connection = None
+        with self._lock:
+            entries = list(self._watchers.values())
+            self._watchers.clear()
+        for entry in entries:
+            entry.watcher.close()
 
-    def __enter__(self) -> "WatchRegistry":
-        return self
 
-    def __exit__(self, *_exc_info) -> None:
-        self.close()
+def create_control_server(
+    registry: WatchRegistry,
+    host: str = "127.0.0.1",
+    port: int = 9235,
+) -> HTTPServer:
+    if host not in {"127.0.0.1", "localhost"}:
+        raise ValueError("watchdog control server must bind to localhost")
+
+    class ControlHandler(BaseHTTPRequestHandler):
+        def log_message(self, _format: str, *_args: object) -> None:
+            return None
+
+        def _send_json(self, status: int, payload: object) -> None:
+            encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "application/json")
+            self.send_header("content-length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def _read_json(self) -> dict[str, object]:
+            try:
+                length = int(self.headers.get("content-length", "0"))
+            except ValueError as error:
+                raise ValueError("invalid content-length") from error
+            if length <= 0 or length > 65536:
+                raise ValueError("request body must be 1..65536 bytes")
+            try:
+                payload = json.loads(self.rfile.read(length).decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise ValueError("request body must be JSON") from error
+            if not isinstance(payload, dict):
+                raise ValueError("request body must be a JSON object")
+            return payload
+
+        def do_GET(self) -> None:
+            if self.path != "/watches":
+                self._send_json(404, {"error": "not found"})
+                return
+            self._send_json(
+                200,
+                {
+                    "watches": [
+                        {
+                            "conversation_id": entry.conversation_id,
+                            "target_url": entry.target_url,
+                        }
+                        for entry in registry.list()
+                    ]
+                },
+            )
+
+        def do_POST(self) -> None:
+            try:
+                payload = self._read_json()
+                if self.path == "/register":
+                    target_url = payload.get("url")
+                    if not isinstance(target_url, str):
+                        raise ValueError("url must be a string")
+                    result = registry.register(target_url)
+                    self._send_json(
+                        200,
+                        {
+                            "conversation_id": result.conversation_id,
+                            "created": result.created,
+                        },
+                    )
+                    return
+
+                if self.path == "/unregister":
+                    conversation = payload.get("conversation_id", payload.get("url"))
+                    if not isinstance(conversation, str):
+                        raise ValueError("conversation_id or url must be a string")
+                    conversation_id = _conversation_id(conversation)
+                    removed = registry.unregister(conversation_id)
+                    self._send_json(
+                        200,
+                        {"conversation_id": conversation_id, "removed": removed},
+                    )
+                    return
+
+                self._send_json(404, {"error": "not found"})
+            except ValueError as error:
+                self._send_json(400, {"error": str(error)})
+            except RuntimeError as error:
+                self._send_json(409, {"error": str(error)})
+
+    return HTTPServer((host, port), ControlHandler)

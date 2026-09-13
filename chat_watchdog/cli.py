@@ -10,6 +10,7 @@ import time
 
 from .agent_runner import AgentPool, AgentSpec
 from .reanchor_bridge import ReanchorBridge, ReanchorCli
+from .registry import WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .supervisor import Supervisor
 
@@ -64,6 +65,65 @@ def build_reanchor_bridge(args) -> ReanchorBridge | None:
     )
 
 
+class _SupervisorWatcher:
+    def __init__(self, page: RelayChatGPTPage, supervisor: Supervisor) -> None:
+        self.page = page
+        self.supervisor = supervisor
+
+    @property
+    def should_stop(self) -> bool:
+        return self.supervisor.should_stop
+
+    def step(self) -> object:
+        result = self.supervisor.step()
+        logging.info("watchdog %s state: %s", self.page.target_url, result.value)
+        return result
+
+    def close(self) -> None:
+        self.supervisor.close()
+        self.page.close()
+
+
+def _run_registry_mode(args, pool: AgentPool) -> int:
+    if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
+        raise SystemExit("registry mode does not share one reanchor scope across multiple conversations")
+
+    def create_watcher(target_url: str) -> _SupervisorWatcher:
+        conversation_id = conversation_id_from_url(target_url)
+        page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
+        supervisor = Supervisor(
+            page,
+            pool,
+            recovery_timeout_seconds=args.recovery_timeout_seconds,
+            heartbeat_seconds=args.reanchor_heartbeat_seconds,
+            reanchor=None,
+        )
+        return _SupervisorWatcher(page, supervisor)
+
+    registry = WatchRegistry(create_watcher)
+    server = create_control_server(registry, args.registry_host, args.registry_port)
+    server.timeout = min(0.5, args.poll_seconds)
+    logging.info(
+        "watch registry listening on http://%s:%d; register exact ChatGPT conversation URLs",
+        args.registry_host,
+        server.server_address[1],
+    )
+    next_poll = time.monotonic()
+    try:
+        while True:
+            server.handle_request()
+            now = time.monotonic()
+            if now >= next_poll:
+                registry.step_all()
+                next_poll = now + args.poll_seconds
+    except KeyboardInterrupt:
+        logging.info("stopped by user")
+        return 130
+    finally:
+        server.server_close()
+        registry.close()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chat-watchdog",
@@ -78,6 +138,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--match-url",
         default="chatgpt.com",
         help="substring that must uniquely identify the existing ChatGPT tab",
+    )
+    parser.add_argument(
+        "--registry-port",
+        type=int,
+        default=None,
+        help="enable dynamic watch registry on localhost at this port",
+    )
+    parser.add_argument(
+        "--registry-host",
+        default="127.0.0.1",
+        help="registry control host; localhost only",
     )
     parser.add_argument(
         "--poll-seconds",
@@ -167,15 +238,21 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--recovery-timeout-seconds must be > 0")
     if args.reanchor_heartbeat_seconds <= 0:
         raise SystemExit("--reanchor-heartbeat-seconds must be > 0")
+    if args.registry_port is not None and not 1 <= args.registry_port <= 65535:
+        raise SystemExit("--registry-port must be between 1 and 65535")
+
+    specs = [parse_agent_command(args.agent)]
+    specs.extend(parse_agent_command(value) for value in args.fallback_agent)
+    pool = AgentPool(specs, startup_probe_seconds=args.agent_probe_seconds)
+
+    if args.registry_port is not None:
+        return _run_registry_mode(args, pool)
 
     try:
         reanchor = build_reanchor_bridge(args)
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
-    specs = [parse_agent_command(args.agent)]
-    specs.extend(parse_agent_command(value) for value in args.fallback_agent)
-    pool = AgentPool(specs, startup_probe_seconds=args.agent_probe_seconds)
     page = RelayChatGPTPage.connect(args.relay_url, args.match_url)
     supervisor = Supervisor(
         page,

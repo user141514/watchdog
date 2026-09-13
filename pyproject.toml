@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "chat-watchdog"
 version = "0.1.0"
-description = "Private watchdog for one already-open ChatGPT work conversation"
+description = "Private watchdog for exact ChatGPT work conversations"
 requires-python = ">=3.11"
 dependencies = ["websocket-client>=1.8"]
 

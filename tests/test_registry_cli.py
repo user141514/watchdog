@@ -2,102 +2,60 @@ from __future__ import annotations
 
 import io
 import json
-import tempfile
 import unittest
 from contextlib import redirect_stdout
-from pathlib import Path
+from unittest.mock import patch
 
-from chat_watchdog.cli import build_parser as build_legacy_parser
+from chat_watchdog.cli import build_parser as build_watchdog_parser
 from chat_watchdog.registry_cli import build_parser, main
 
 
+CHAT_ID = "6aa542fd-708c-83ea-869a-721efd83d7f3"
+CHAT_URL = f"https://chatgpt.com/g/g-p-example-agent/c/{CHAT_ID}"
+
+
 class RegistryCliTests(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.store = str(Path(self.temp.name) / "registry.sqlite3")
+    def test_parser_is_only_a_thin_client(self) -> None:
+        args = build_parser().parse_args(["add", CHAT_URL])
+        self.assertEqual(args.command, "add")
+        self.assertEqual(args.url, CHAT_URL)
+        self.assertEqual(args.control_url, "http://127.0.0.1:9235")
 
-    def tearDown(self):
-        self.temp.cleanup()
-
-    def run_cli(self, *args: str) -> tuple[int, str]:
+    def test_add_forwards_exact_url_to_running_registry(self) -> None:
         output = io.StringIO()
-        with redirect_stdout(output):
-            code = main(["--store", self.store, *args])
-        return code, output.getvalue().strip()
+        with patch(
+            "chat_watchdog.registry_cli._request",
+            return_value={"conversation_id": CHAT_ID, "created": True},
+        ) as request, redirect_stdout(output):
+            code = main(["add", CHAT_URL])
 
-    def test_crud_commands_persist_machine_readable_state(self):
-        code, text = self.run_cli(
-            "add",
-            "agent-main",
-            "https://chatgpt.com/g/g-p-agent/c/abc-123",
-        )
         self.assertEqual(code, 0)
-        self.assertIn("agent-main", text)
+        request.assert_called_once_with(
+            "http://127.0.0.1:9235",
+            "POST",
+            "/register",
+            {"url": CHAT_URL},
+        )
+        self.assertEqual(output.getvalue().strip(), f"{CHAT_ID}\tcreated")
 
-        code, text = self.run_cli("list", "--json")
+    def test_list_prints_machine_readable_registry_state(self) -> None:
+        payload = {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL}]}
+        output = io.StringIO()
+        with patch("chat_watchdog.registry_cli._request", return_value=payload), redirect_stdout(output):
+            code = main(["list", "--json"])
+
         self.assertEqual(code, 0)
-        payload = json.loads(text)
-        self.assertEqual(len(payload), 1)
-        self.assertEqual(payload[0]["watch_id"], "agent-main")
-        self.assertEqual(payload[0]["state"], "active")
+        self.assertEqual(json.loads(output.getvalue()), payload["watches"])
 
-        self.assertEqual(self.run_cli("pause", "agent-main")[0], 0)
-        payload = json.loads(self.run_cli("list", "--json")[1])
-        self.assertEqual(payload[0]["state"], "paused")
+    def test_main_watchdog_parser_exposes_registry_mode_without_removing_single_watch_mode(self) -> None:
+        dynamic = build_watchdog_parser().parse_args(["--registry-port", "9235"])
+        self.assertEqual(dynamic.registry_port, 9235)
 
-        self.assertEqual(self.run_cli("arm", "agent-main")[0], 0)
-        payload = json.loads(self.run_cli("list", "--json")[1])
-        self.assertEqual(payload[0]["state"], "active")
-
-        self.assertEqual(self.run_cli("remove", "agent-main")[0], 0)
-        self.assertEqual(json.loads(self.run_cli("list", "--json")[1]), [])
-
-    def test_add_accepts_optional_reanchor_binding(self):
-        self.assertEqual(
-            self.run_cli(
-                "add",
-                "anchored",
-                "https://chatgpt.com/c/anchored",
-                "--reanchor-scope",
-                "scope-a",
-                "--reanchor-epoch",
-                "epoch-a",
-            )[0],
-            0,
+        legacy = build_watchdog_parser().parse_args(
+            ["--match-url", f"/c/{CHAT_ID}", "--poll-seconds", "30"]
         )
-        payload = json.loads(self.run_cli("list", "--json")[1])
-        self.assertEqual(payload[0]["reanchor_scope"], "scope-a")
-        self.assertEqual(payload[0]["reanchor_epoch"], "epoch-a")
-
-    def test_run_parser_exposes_registry_daemon_settings(self):
-        args = build_parser().parse_args(
-            [
-                "--store",
-                self.store,
-                "run",
-                "--relay-url",
-                "http://127.0.0.1:9224",
-                "--poll-seconds",
-                "15",
-                "--agent",
-                "omp -p",
-                "--reanchor-store",
-                "C:/mem/reanchor",
-                "--reanchor-cli",
-                "C:/repo/reanchor/bin/reanchor.mjs",
-            ]
-        )
-        self.assertEqual(args.command, "run")
-        self.assertEqual(args.poll_seconds, 15.0)
-        self.assertEqual(args.relay_url, "http://127.0.0.1:9224")
-        self.assertEqual(args.reanchor_store, "C:/mem/reanchor")
-
-    def test_legacy_single_conversation_parser_remains_available(self):
-        args = build_legacy_parser().parse_args(
-            ["--match-url", "/c/legacy", "--poll-seconds", "30"]
-        )
-        self.assertEqual(args.match_url, "/c/legacy")
-        self.assertEqual(args.poll_seconds, 30.0)
+        self.assertEqual(legacy.match_url, f"/c/{CHAT_ID}")
+        self.assertEqual(legacy.poll_seconds, 30.0)
 
 
 if __name__ == "__main__":

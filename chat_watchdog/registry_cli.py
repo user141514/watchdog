@@ -1,237 +1,99 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import asdict, dataclass
 import json
-import logging
 import os
-from pathlib import Path
-import socket
 import sys
-import time
-
-from .agent_runner import AgentPool
-from .cli import parse_agent_command
-from .reanchor_bridge import ReanchorBridge, ReanchorCli
-from .registry import WATCH_STATES, WatchEntry, WatchRegistry
-from .registry_daemon import WatchDaemon
-from .relay_page import RelayChatGPTPage
-from .supervisor import Supervisor
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
-def default_registry_path() -> Path:
-    configured = os.environ.get("CHAT_WATCHDOG_REGISTRY")
-    if configured:
-        return Path(configured).expanduser()
-    return Path.home() / ".chat-watchdog" / "watch-registry.sqlite3"
-
-
-@dataclass
-class _LiveRuntime:
-    page: RelayChatGPTPage
-    supervisor: Supervisor
-
-    def close(self) -> None:
-        self.supervisor.close()
-        self.page.close()
-
-
-def _add_common_run_arguments(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument(
-        "--relay-url",
-        default=os.environ.get("CHAT_WATCHDOG_RELAY_URL", "http://127.0.0.1:9224"),
-        help="OMP browser-relay HTTP endpoint",
-    )
-    parser.add_argument("--poll-seconds", type=float, default=60.0)
-    parser.add_argument("--agent", default="omp -p")
-    parser.add_argument("--fallback-agent", action="append", default=[])
-    parser.add_argument("--agent-probe-seconds", type=float, default=1.0)
-    parser.add_argument("--recovery-timeout-seconds", type=float, default=120.0)
-    parser.add_argument(
-        "--reanchor-heartbeat-seconds",
-        type=float,
-        default=float(os.environ.get("CHAT_WATCHDOG_REANCHOR_HEARTBEAT_SECONDS", "900")),
-    )
-    parser.add_argument(
-        "--reanchor-store",
-        default=os.environ.get("CHAT_WATCHDOG_REANCHOR_STORE"),
-    )
-    parser.add_argument(
-        "--reanchor-cli",
-        default=os.environ.get("CHAT_WATCHDOG_REANCHOR_CLI"),
-    )
-    parser.add_argument(
-        "--reanchor-owner",
-        default=os.environ.get("CHAT_WATCHDOG_REANCHOR_OWNER", "coordinator"),
-    )
-    parser.add_argument(
-        "--reanchor-context-root",
-        default=os.environ.get("CHAT_WATCHDOG_REANCHOR_CONTEXT_ROOT"),
-    )
-    parser.add_argument(
-        "--reanchor-node",
-        default=os.environ.get("CHAT_WATCHDOG_REANCHOR_NODE", "node"),
-    )
-    parser.add_argument("--verbose", action="store_true")
+DEFAULT_CONTROL_URL = "http://127.0.0.1:9235"
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="chat-watchdog-registry",
-        description="Manage and run a durable registry of exact ChatGPT conversation watches.",
+        description="Register exact ChatGPT conversations with a running watchdog registry.",
     )
     parser.add_argument(
-        "--store",
-        default=str(default_registry_path()),
-        help="SQLite watch registry path",
+        "--control-url",
+        default=os.environ.get("CHAT_WATCHDOG_CONTROL_URL", DEFAULT_CONTROL_URL),
+        help=f"watchdog registry control URL; default: {DEFAULT_CONTROL_URL}",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    add = subparsers.add_parser("add", help="register one exact ChatGPT conversation")
-    add.add_argument("watch_id")
-    add.add_argument("target_url")
-    add.add_argument("--reanchor-scope")
-    add.add_argument("--reanchor-epoch")
+    add = subparsers.add_parser("add", help="watch one exact ChatGPT conversation URL")
+    add.add_argument("url")
 
-    list_parser = subparsers.add_parser("list", help="list registered watches")
+    remove = subparsers.add_parser("remove", help="stop watching a conversation UUID or URL")
+    remove.add_argument("conversation")
+
+    list_parser = subparsers.add_parser("list", help="list currently watched conversations")
     list_parser.add_argument("--json", action="store_true")
-    list_parser.add_argument("--state", choices=sorted(WATCH_STATES))
-
-    for command, help_text in (
-        ("pause", "pause a watch without deleting it"),
-        ("arm", "activate a paused or completed watch"),
-        ("remove", "remove a watch"),
-    ):
-        item = subparsers.add_parser(command, help=help_text)
-        item.add_argument("watch_id")
-
-    run = subparsers.add_parser("run", help="run the dynamic registry daemon")
-    _add_common_run_arguments(run)
     return parser
 
 
-def _print_entry(entry: WatchEntry) -> None:
-    print(f"{entry.watch_id}\t{entry.state}\t{entry.target_url}")
-
-
-def _build_reanchor(entry: WatchEntry, args) -> ReanchorBridge | None:
-    if entry.reanchor_scope is None:
-        return None
-    if not args.reanchor_store or not args.reanchor_cli:
-        raise ValueError(
-            f"watch {entry.watch_id!r} requires --reanchor-store and --reanchor-cli"
-        )
-    context = {
-        "host": socket.gethostname(),
-        "root": args.reanchor_context_root or os.getcwd(),
-        "revision": None,
-        "epoch": entry.reanchor_epoch,
-    }
-    return ReanchorBridge(
-        cli=ReanchorCli(
-            store=args.reanchor_store,
-            cli_path=args.reanchor_cli,
-            node_executable=args.reanchor_node,
-        ),
-        scope=entry.reanchor_scope,
-        owner=args.reanchor_owner,
-        context=context,
+def _request(
+    base_url: str,
+    method: str,
+    path: str,
+    payload: dict[str, object] | None = None,
+) -> dict[str, object]:
+    data = None if payload is None else json.dumps(payload).encode("utf-8")
+    request = Request(
+        f"{base_url.rstrip('/')}{path}",
+        data=data,
+        method=method,
+        headers={"content-type": "application/json"},
     )
-
-
-def _run_daemon(registry: WatchRegistry, args) -> int:
-    if args.poll_seconds <= 0:
-        raise ValueError("--poll-seconds must be > 0")
-    if args.agent_probe_seconds < 0:
-        raise ValueError("--agent-probe-seconds must be >= 0")
-    if args.recovery_timeout_seconds <= 0:
-        raise ValueError("--recovery-timeout-seconds must be > 0")
-    if args.reanchor_heartbeat_seconds <= 0:
-        raise ValueError("--reanchor-heartbeat-seconds must be > 0")
-
-    for entry in registry.list(state="active"):
-        if entry.reanchor_scope is not None and (
-            not args.reanchor_store or not args.reanchor_cli
-        ):
-            raise ValueError(
-                f"watch {entry.watch_id!r} has reanchor binding but daemon reanchor installation is incomplete"
-            )
-
-    specs = [parse_agent_command(args.agent)]
-    specs.extend(parse_agent_command(value) for value in args.fallback_agent)
-    pool = AgentPool(specs, startup_probe_seconds=args.agent_probe_seconds)
-
-    def runtime_factory(entry: WatchEntry) -> _LiveRuntime:
-        page = RelayChatGPTPage.connect(args.relay_url, entry.target_url)
-        try:
-            supervisor = Supervisor(
-                page,
-                pool,
-                recovery_timeout_seconds=args.recovery_timeout_seconds,
-                heartbeat_seconds=args.reanchor_heartbeat_seconds,
-                reanchor=_build_reanchor(entry, args),
-            )
-        except Exception:
-            page.close()
-            raise
-        return _LiveRuntime(page=page, supervisor=supervisor)
-
-    daemon = WatchDaemon(registry, runtime_factory)
-    logging.info("watch registry daemon started: %s", registry.path)
     try:
-        while True:
-            results = daemon.step()
-            for watch_id, result in results.items():
-                logging.info("watchdog state: %s=%s", watch_id, result.value)
-            time.sleep(args.poll_seconds)
-    except KeyboardInterrupt:
-        logging.info("registry daemon stopped by user")
-        return 130
-    finally:
-        daemon.close()
+        with urlopen(request, timeout=3) as response:
+            body = json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        message = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"watchdog registry HTTP {error.code}: {message}") from error
+    except URLError as error:
+        raise RuntimeError(f"watchdog registry unavailable: {error.reason}") from error
+    if not isinstance(body, dict):
+        raise RuntimeError("watchdog registry returned non-object JSON")
+    return body
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
-    logging.basicConfig(
-        level=logging.DEBUG if getattr(args, "verbose", False) else logging.INFO,
-        format="%(asctime)s %(levelname)s %(message)s",
-    )
-
     try:
-        with WatchRegistry(args.store) as registry:
-            if args.command == "add":
-                entry = registry.add(
-                    args.watch_id,
-                    args.target_url,
-                    reanchor_scope=args.reanchor_scope,
-                    reanchor_epoch=args.reanchor_epoch,
-                )
-                _print_entry(entry)
-                return 0
-            if args.command == "list":
-                entries = registry.list(state=args.state)
-                if args.json:
-                    print(json.dumps([asdict(entry) for entry in entries], ensure_ascii=False))
-                else:
-                    for entry in entries:
-                        _print_entry(entry)
-                return 0
-            if args.command == "pause":
-                _print_entry(registry.set_state(args.watch_id, "paused"))
-                return 0
-            if args.command == "arm":
-                _print_entry(registry.set_state(args.watch_id, "active"))
-                return 0
-            if args.command == "remove":
-                if not registry.remove(args.watch_id):
-                    print(f"watch not found: {args.watch_id}", file=sys.stderr)
-                    return 1
-                print(args.watch_id)
-                return 0
-            if args.command == "run":
-                return _run_daemon(registry, args)
-    except (KeyError, ValueError) as error:
+        if args.command == "add":
+            result = _request(args.control_url, "POST", "/register", {"url": args.url})
+            state = "created" if result.get("created") is True else "existing"
+            print(f"{result.get('conversation_id')}\t{state}")
+            return 0
+
+        if args.command == "remove":
+            key = "url" if "://" in args.conversation else "conversation_id"
+            result = _request(
+                args.control_url,
+                "POST",
+                "/unregister",
+                {key: args.conversation},
+            )
+            state = "removed" if result.get("removed") is True else "missing"
+            print(f"{result.get('conversation_id')}\t{state}")
+            return 0
+
+        if args.command == "list":
+            result = _request(args.control_url, "GET", "/watches")
+            watches = result.get("watches", [])
+            if not isinstance(watches, list):
+                raise RuntimeError("watchdog registry returned invalid watches list")
+            if args.json:
+                print(json.dumps(watches, ensure_ascii=False))
+            else:
+                for item in watches:
+                    if isinstance(item, dict):
+                        print(f"{item.get('conversation_id')}\t{item.get('target_url')}")
+            return 0
+    except RuntimeError as error:
         print(str(error), file=sys.stderr)
         return 2
 
