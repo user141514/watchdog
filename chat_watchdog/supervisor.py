@@ -214,6 +214,21 @@ class Supervisor:
             if snapshot.stream_interrupted:
                 self._remember_frontend_fault(snapshot)
                 return StepResult.STREAM_INTERRUPTED
+            if (
+                snapshot.assistant_text.strip()
+                and self._last_progress_at is not None
+                and now - self._last_progress_at >= self._recovery_timeout_seconds
+            ):
+                key = snapshot.turn_key
+                if key in self._continued:
+                    return StepResult.ALREADY_HANDLED
+                try:
+                    accepted = self._page.send_continue(CONTINUE_PROMPT, key)
+                except Exception:
+                    accepted = False
+                if accepted:
+                    self._continued.add(key)
+                    return StepResult.CONTINUED
             return StepResult.BLOCKED
 
         if self._reanchor is not None:
