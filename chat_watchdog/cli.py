@@ -93,6 +93,10 @@ class _SupervisorWatcher:
             self._state = "need_input"
         elif result in {StepResult.WAITING, StepResult.USER_TURN_PENDING}:
             self._state = "waiting"
+        elif result in {StepResult.BLOCKED, StepResult.RECOVERY_UNAVAILABLE}:
+            self._state = "blocked"
+        elif result is StepResult.DELIVERY_UNCERTAIN:
+            self._state = "delivery_uncertain"
         else:
             self._state = "active"
         logging.info("watchdog %s state: %s", self.page.target_url, result.value)

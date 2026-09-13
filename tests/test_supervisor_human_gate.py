@@ -114,6 +114,15 @@ class HumanGateTests(unittest.TestCase):
         supervisor.result = StepResult.USER_TURN_PENDING
         watcher.step()
         self.assertEqual(watcher.state, "waiting")
+        supervisor.result = StepResult.BLOCKED
+        watcher.step()
+        self.assertEqual(watcher.state, "blocked")
+        supervisor.result = StepResult.RECOVERY_UNAVAILABLE
+        watcher.step()
+        self.assertEqual(watcher.state, "blocked")
+        supervisor.result = StepResult.DELIVERY_UNCERTAIN
+        watcher.step()
+        self.assertEqual(watcher.state, "delivery_uncertain")
         supervisor.result = StepResult.ACTIVE
         watcher.step()
         self.assertEqual(watcher.state, "active")
