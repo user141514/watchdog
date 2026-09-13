@@ -16,6 +16,37 @@ class RelayTargetSelectionError(RuntimeError):
     pass
 
 
+def _build_retry_fault_expression() -> str:
+    return r"""
+(() => {
+  const visible = (el) => {
+    if (!el) return false;
+    const style = window.getComputedStyle(el);
+    const rect = el.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const retryPattern = /^(重试|retry|try again)$/i;
+  const faultPattern = /(消息发送超时|消息流断开|message[^\n]{0,80}(?:timed out|timeout)|stream[^\n]{0,80}interrupted|response[^\n]{0,80}interrupted)/i;
+  const buttons = Array.from(document.querySelectorAll('button')).filter((button) => {
+    if (!visible(button)) return false;
+    const label = (button.innerText || button.getAttribute('aria-label') || button.textContent || '').trim();
+    return retryPattern.test(label) && !button.disabled && button.getAttribute('aria-disabled') !== 'true';
+  });
+  for (const button of buttons) {
+    let node = button;
+    for (let depth = 0; node && depth < 6; depth += 1, node = node.parentElement) {
+      const value = (node.innerText || node.textContent || '').trim();
+      if (faultPattern.test(value)) {
+        button.click();
+        return { retried: true };
+      }
+    }
+  }
+  return { retried: false, reason: 'fault-retry-unavailable' };
+})()
+""".strip()
+
+
 def _build_submit_expression(prompt: str) -> str:
     text = json.dumps(prompt)
     return f"""
@@ -303,6 +334,34 @@ class RelayChatGPTPage:
             acceptance_timeout=acceptance_timeout,
             require_message_id=False,
         ).accepted
+
+    def retry_fault(
+        self,
+        expected_turn_key: tuple[int, str],
+        acceptance_timeout: float = 3.0,
+    ) -> bool:
+        before = self.snapshot()
+        if before.turn_key != expected_turn_key:
+            return True
+        if not before.send_timeout and not before.stream_interrupted:
+            return before.phase in (Phase.THINKING, Phase.RESPONDING)
+        try:
+            result = self.protocol.evaluate(
+                self.session_id,
+                _build_retry_fault_expression(),
+            )
+        except RelayCdpError:
+            return False
+        if not isinstance(result, Mapping) or result.get("retried") is not True:
+            return False
+
+        deadline = time.monotonic() + acceptance_timeout
+        while time.monotonic() < deadline:
+            current = self.snapshot()
+            if current.turn_key != before.turn_key or current.phase in (Phase.THINKING, Phase.RESPONDING):
+                return True
+            time.sleep(0.1)
+        return False
 
     def close(self) -> None:
         close = getattr(self.socket, "close", None)

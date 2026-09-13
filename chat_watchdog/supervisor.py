@@ -30,6 +30,8 @@ class PagePort(Protocol):
         expected_turn_key: tuple[int, str],
     ) -> bool: ...
 
+    def retry_fault(self, expected_turn_key: tuple[int, str]) -> bool: ...
+
 
 class ReanchorPort(Protocol):
     def record_frontend_fault(
@@ -175,6 +177,8 @@ class Supervisor:
     def _try_fault_recovery(self, snapshot: PageSnapshot) -> StepResult:
         if self.recovery_lease is not None:
             return StepResult.RECOVERY_RUNNING
+        if snapshot.turn_key in self._continued:
+            return StepResult.ALREADY_HANDLED
         if self._send_admission is not None:
             target_url = getattr(self._page, "target_url", "")
             if not target_url:
@@ -185,6 +189,21 @@ class Supervisor:
                 return StepResult.WAITING
             if getattr(admission, "admitted", False) is not True:
                 return StepResult.WAITING
+
+        retry_fault = getattr(self._page, "retry_fault", None)
+        if callable(retry_fault):
+            try:
+                retried = retry_fault(snapshot.turn_key)
+            except Exception:
+                retried = False
+            if retried:
+                self._continued.add(snapshot.turn_key)
+                return StepResult.CONTINUED
+            if self._send_admission is not None:
+                return StepResult.BLOCKED
+        elif self._send_admission is not None:
+            return StepResult.BLOCKED
+
         return self._try_recovery(snapshot)
 
     def _observe_progress(self, snapshot: PageSnapshot) -> float:
