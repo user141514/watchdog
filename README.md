@@ -4,7 +4,7 @@ Versioned source for the existing, bounded PC watchdog deployment. This is not a
 
 ## Scope and invariants
 
-The watchdog observes one explicitly selected, already-open ChatGPT conversation through an independently owned OMP Browser Relay. Reanchor retains directives, observations, context identity, delivery identity and nonce-bound model checkpoints. A model checkpoint is advisory; it is not independent proof of semantic completion.
+The legacy `chat-watchdog` command observes one explicitly selected, already-open ChatGPT conversation through an independently owned OMP Browser Relay. The `chat-watchdog-registry` command adds a durable explicit set of exact conversation watches above the same per-conversation Supervisor, so new watches can be added or paused without restarting the daemon. Reanchor retains directives, observations, context identity, delivery identity and nonce-bound model checkpoints. A model checkpoint is advisory; it is not independent proof of semantic completion.
 
 - Do not select a target by a partial or ambiguous match when multiple tabs qualify.
 - Preserve the exact scope, context epoch, packet nonce and delivered message on recovery. Do not resend merely because a tool response or process was lost.
@@ -50,7 +50,21 @@ npm --prefix reanchor run check
 .venv/bin/python -m chat_watchdog --help
 ```
 
-The OMP relay, existing browser-extension trust and selected browser conversation must be verified independently before launching a watch. Consult `python -m chat_watchdog --help` and `node reanchor/bin/reanchor.mjs --help` for the installed command contracts. Do not copy a different host's live scope or conversation IDs into a new deployment.
+The OMP relay, existing browser-extension trust and selected browser conversation must be verified independently before launching a watch. Consult `python -m chat_watchdog --help`, `chat-watchdog-registry --help`, and `node reanchor/bin/reanchor.mjs --help` for the installed command contracts. Do not copy a different host's live scope or conversation IDs into a new deployment.
+
+## Dynamic watch registry
+
+The registry stores exact canonical ChatGPT conversation URLs in SQLite. It never follows browser focus and never silently retargets a watch ID.
+
+```powershell
+chat-watchdog-registry add agent-main https://chatgpt.com/g/g-p-example-agent/c/example-conversation
+chat-watchdog-registry list --json
+chat-watchdog-registry run --relay-url http://127.0.0.1:9224 --poll-seconds 60
+```
+
+While the daemon is running, `add`, `pause`, `arm`, and `remove` update the same SQLite registry transactionally. The daemon reconciles those changes on its next cycle. A watch that reaches `DONE` is persisted as `completed` and will not be recreated until an explicit `arm`.
+
+The default registry is `~/.chat-watchdog/watch-registry.sqlite3`; override it with `--store` or `CHAT_WATCHDOG_REGISTRY`. Reanchor remains optional and target-bound: add both `--reanchor-scope` and `--reanchor-epoch` to a watch, then supply the daemon's existing `--reanchor-store` and `--reanchor-cli` installation arguments. The registry does not retarget reanchor scopes.
 
 ## Repository and recovery
 
