@@ -12,6 +12,9 @@ from uuid import UUID
 class Watcher(Protocol):
     should_stop: bool
 
+    @property
+    def completion_text(self) -> str | None: ...
+
     def step(self) -> object: ...
 
     def close(self) -> None: ...
@@ -27,6 +30,13 @@ class RegisterResult:
 class WatchRegistration:
     conversation_id: str
     target_url: str
+
+
+@dataclass(frozen=True)
+class WatchCompletion:
+    conversation_id: str
+    target_url: str
+    result: str | None
 
 
 @dataclass
@@ -80,6 +90,7 @@ class WatchRegistry:
     def __init__(self, watcher_factory: Callable[[str], Watcher]) -> None:
         self._watcher_factory = watcher_factory
         self._watchers: dict[str, _WatchEntry] = {}
+        self._completed: dict[str, WatchCompletion] = {}
         self._lock = RLock()
 
     def register(self, target_url: str) -> RegisterResult:
@@ -87,6 +98,7 @@ class WatchRegistry:
         with self._lock:
             if conversation_id in self._watchers:
                 return RegisterResult(conversation_id=conversation_id, created=False)
+            self._completed.pop(conversation_id, None)
             watcher = self._watcher_factory(target_url)
             self._watchers[conversation_id] = _WatchEntry(
                 conversation_id=conversation_id,
@@ -107,6 +119,21 @@ class WatchRegistry:
     def list_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._watchers)
+
+    def is_active(self, conversation: str) -> bool:
+        conversation_id = _conversation_id(conversation)
+        with self._lock:
+            return conversation_id in self._watchers
+
+    def completion(self, conversation: str) -> WatchCompletion | None:
+        conversation_id = _conversation_id(conversation)
+        with self._lock:
+            return self._completed.get(conversation_id)
+
+    def ack_completion(self, conversation: str) -> bool:
+        conversation_id = _conversation_id(conversation)
+        with self._lock:
+            return self._completed.pop(conversation_id, None) is not None
 
     def list(self) -> list[WatchRegistration]:
         with self._lock:
@@ -133,6 +160,11 @@ class WatchRegistry:
                 current = self._watchers.get(conversation_id)
                 if current is None or current.watcher is not watcher:
                     continue
+                self._completed[conversation_id] = WatchCompletion(
+                    conversation_id=conversation_id,
+                    target_url=current.target_url,
+                    result=watcher.completion_text,
+                )
                 self._watchers.pop(conversation_id)
             watcher.close()
 
@@ -140,6 +172,7 @@ class WatchRegistry:
         with self._lock:
             entries = list(self._watchers.values())
             self._watchers.clear()
+            self._completed.clear()
         for entry in entries:
             entry.watcher.close()
 
@@ -219,6 +252,35 @@ def create_control_server(
                         raise ValueError("conversation_id or url must be a string")
                     conversation_id = _conversation_id(conversation)
                     removed = registry.unregister(conversation_id)
+                    self._send_json(
+                        200,
+                        {"conversation_id": conversation_id, "removed": removed},
+                    )
+                    return
+
+                if self.path == "/completion":
+                    conversation = payload.get("conversation_id", payload.get("url"))
+                    if not isinstance(conversation, str):
+                        raise ValueError("conversation_id or url must be a string")
+                    conversation_id = _conversation_id(conversation)
+                    completion = registry.completion(conversation_id)
+                    self._send_json(
+                        200,
+                        {
+                            "conversation_id": conversation_id,
+                            "active": registry.is_active(conversation_id),
+                            "completed": completion is not None,
+                            "result": None if completion is None else completion.result,
+                        },
+                    )
+                    return
+
+                if self.path == "/completion/ack":
+                    conversation = payload.get("conversation_id", payload.get("url"))
+                    if not isinstance(conversation, str):
+                        raise ValueError("conversation_id or url must be a string")
+                    conversation_id = _conversation_id(conversation)
+                    removed = registry.ack_completion(conversation_id)
                     self._send_json(
                         200,
                         {"conversation_id": conversation_id, "removed": removed},

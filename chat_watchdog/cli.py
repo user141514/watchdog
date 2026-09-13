@@ -74,6 +74,13 @@ class _SupervisorWatcher:
     def should_stop(self) -> bool:
         return self.supervisor.should_stop
 
+    @property
+    def completion_text(self) -> str | None:
+        try:
+            return self.page.snapshot().assistant_text
+        except Exception:
+            return None
+
     def step(self) -> object:
         result = self.supervisor.step()
         logging.info("watchdog %s state: %s", self.page.target_url, result.value)

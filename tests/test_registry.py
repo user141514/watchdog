@@ -17,6 +17,7 @@ class FakeWatcher:
     should_stop: bool = False
     steps: int = 0
     closed: bool = False
+    completion_text: str = "final watchdog result"
 
     def step(self) -> None:
         self.steps += 1
@@ -87,6 +88,11 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(watcher.steps, 2)
         self.assertTrue(watcher.closed)
         self.assertEqual(registry.list_ids(), [])
+        completion = registry.completion(CHAT_ID)
+        self.assertIsNotNone(completion)
+        self.assertEqual(completion.result, "final watchdog result")
+        self.assertTrue(registry.ack_completion(CHAT_ID))
+        self.assertIsNone(registry.completion(CHAT_ID))
 
 
 if __name__ == "__main__":

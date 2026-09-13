@@ -17,6 +17,7 @@ CHAT_URL = f"https://chatgpt.com/g/g-p-example-agent/c/{CHAT_ID}"
 class FakeWatcher:
     should_stop: bool = False
     closed: bool = False
+    completion_text: str = "final watchdog result"
 
     def step(self) -> None:
         return None
@@ -81,6 +82,35 @@ class RegistryHttpTests(unittest.TestCase):
         self.assertTrue(self.created[0].closed)
         _, listing = self.request("GET", "/watches")
         self.assertEqual(listing, {"watches": []})
+
+    def test_completion_receipt_survives_active_removal_until_ack(self) -> None:
+        self.request("POST", "/register", {"url": CHAT_URL})
+        self.created[0].should_stop = True
+        self.registry.step_all()
+
+        _, completion = self.request("POST", "/completion", {"url": CHAT_URL})
+        self.assertEqual(
+            completion,
+            {
+                "conversation_id": CHAT_ID,
+                "active": False,
+                "completed": True,
+                "result": "final watchdog result",
+            },
+        )
+
+        _, ack = self.request("POST", "/completion/ack", {"url": CHAT_URL})
+        self.assertEqual(ack, {"conversation_id": CHAT_ID, "removed": True})
+        _, missing = self.request("POST", "/completion", {"url": CHAT_URL})
+        self.assertEqual(
+            missing,
+            {
+                "conversation_id": CHAT_ID,
+                "active": False,
+                "completed": False,
+                "result": None,
+            },
+        )
 
 
 if __name__ == "__main__":
