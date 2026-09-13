@@ -75,7 +75,15 @@ _DONE_RE = re.compile(
     r"(?:\bSUPERVISOR_DONE\b|\[SUPERVISOR_STATE\s*:\s*DONE\])",
     re.IGNORECASE,
 )
+_NEED_INPUT_RE = re.compile(
+    r"(?:^|\n)\[SUPERVISOR_STATE\s*:\s*NEED_INPUT\]\s*\Z",
+    re.IGNORECASE,
+)
 
 
 def is_done(text: str) -> bool:
     return bool(_DONE_RE.search(text))
+
+
+def is_need_input(text: str) -> bool:
+    return bool(_NEED_INPUT_RE.search(text))

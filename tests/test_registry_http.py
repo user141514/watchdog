@@ -18,6 +18,7 @@ class FakeWatcher:
     should_stop: bool = False
     closed: bool = False
     completion_text: str = "final watchdog result"
+    state: str = "active"
 
     def step(self) -> None:
         return None
@@ -71,8 +72,12 @@ class RegistryHttpTests(unittest.TestCase):
         _, listing = self.request("GET", "/watches")
         self.assertEqual(
             listing,
-            {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL}]},
+            {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL, "state": "active"}]},
         )
+
+        self.created[0].state = "need_input"
+        _, paused = self.request("GET", "/watches")
+        self.assertEqual(paused["watches"][0]["state"], "need_input")
 
     def test_unregister_closes_registered_watcher(self) -> None:
         self.request("POST", "/register", {"url": CHAT_URL})

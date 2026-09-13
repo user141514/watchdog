@@ -15,6 +15,9 @@ class Watcher(Protocol):
     @property
     def completion_text(self) -> str | None: ...
 
+    @property
+    def state(self) -> str: ...
+
     def step(self) -> object: ...
 
     def close(self) -> None: ...
@@ -30,6 +33,7 @@ class RegisterResult:
 class WatchRegistration:
     conversation_id: str
     target_url: str
+    state: str = "active"
 
 
 @dataclass(frozen=True)
@@ -138,7 +142,11 @@ class WatchRegistry:
     def list(self) -> list[WatchRegistration]:
         with self._lock:
             return [
-                WatchRegistration(entry.conversation_id, entry.target_url)
+                WatchRegistration(
+                    entry.conversation_id,
+                    entry.target_url,
+                    getattr(entry.watcher, "state", "active"),
+                )
                 for entry in sorted(
                     self._watchers.values(),
                     key=lambda item: item.conversation_id,
@@ -223,6 +231,7 @@ def create_control_server(
                         {
                             "conversation_id": entry.conversation_id,
                             "target_url": entry.target_url,
+                            "state": entry.state,
                         }
                         for entry in registry.list()
                     ]

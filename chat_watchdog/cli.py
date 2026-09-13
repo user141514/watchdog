@@ -13,7 +13,7 @@ from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .send_admission import SidecarSendAdmission
-from .supervisor import Supervisor
+from .supervisor import StepResult, Supervisor
 
 
 def parse_agent_command(value: str) -> AgentSpec:
@@ -70,10 +70,15 @@ class _SupervisorWatcher:
     def __init__(self, page: RelayChatGPTPage, supervisor: Supervisor) -> None:
         self.page = page
         self.supervisor = supervisor
+        self._state = "active"
 
     @property
     def should_stop(self) -> bool:
         return self.supervisor.should_stop
+
+    @property
+    def state(self) -> str:
+        return self._state
 
     @property
     def completion_text(self) -> str | None:
@@ -84,6 +89,12 @@ class _SupervisorWatcher:
 
     def step(self) -> object:
         result = self.supervisor.step()
+        if result is StepResult.NEED_INPUT:
+            self._state = "need_input"
+        elif result in {StepResult.WAITING, StepResult.USER_TURN_PENDING}:
+            self._state = "waiting"
+        else:
+            self._state = "active"
         logging.info("watchdog %s state: %s", self.page.target_url, result.value)
         return result
 

@@ -18,6 +18,7 @@ class FakeWatcher:
     steps: int = 0
     closed: bool = False
     completion_text: str = "final watchdog result"
+    state: str = "active"
 
     def step(self) -> None:
         self.steps += 1
@@ -62,6 +63,7 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(second.conversation_id, CHAT_ID)
         self.assertEqual(len(created), 1)
         self.assertEqual(registry.list_ids(), [CHAT_ID])
+        self.assertEqual(registry.list()[0].state, "active")
 
     def test_unregister_closes_watcher(self) -> None:
         watcher = FakeWatcher(PROJECT_URL)
@@ -82,10 +84,15 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(watcher.steps, 1)
         self.assertEqual(registry.list_ids(), [CHAT_ID])
 
+        watcher.state = "need_input"
+        registry.step_all()
+        self.assertEqual(registry.list()[0].state, "need_input")
+        self.assertIsNone(registry.completion(CHAT_ID))
+
         watcher.should_stop = True
         registry.step_all()
 
-        self.assertEqual(watcher.steps, 2)
+        self.assertEqual(watcher.steps, 3)
         self.assertTrue(watcher.closed)
         self.assertEqual(registry.list_ids(), [])
         completion = registry.completion(CHAT_ID)

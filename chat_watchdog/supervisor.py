@@ -5,14 +5,16 @@ import time
 from typing import Collection, Protocol
 
 from .agent_runner import AgentLease
-from .model import PageSnapshot, Phase, is_done
+from .model import PageSnapshot, Phase, is_done, is_need_input
 from .reanchor_bridge import ReanchorBridgeError, ReanchorOutcome
 
 
 CONTINUE_PROMPT = (
     "继续当前任务，从已经完成的工作直接往下执行；不要重新调研、不要重复已经完成的步骤。"
     "如果整个任务已经真正完成，请在回复最后单独输出 SUPERVISOR_DONE。"
-    "如果还没完成，就继续实际推进任务。"
+    "如果继续需要用户手动操作、登录、授权、确认或补充信息，请说明需要的动作，"
+    "并在回复最后单独输出 [SUPERVISOR_STATE: NEED_INPUT]；不要自行假定用户已经完成。"
+    "如果还没完成且不需要用户介入，就继续实际推进任务。"
 )
 
 RECOVERY_PROMPT = (
@@ -73,6 +75,7 @@ class StepResult(str, Enum):
     STREAM_INTERRUPTED = "stream_interrupted"
     WAITING = "waiting"
     NEED_INPUT = "need_input"
+    USER_TURN_PENDING = "user_turn_pending"
     DELIVERY_UNCERTAIN = "delivery_uncertain"
     DONE = "done"
 
@@ -105,6 +108,7 @@ class Supervisor:
         self._last_progress_key: tuple[tuple[int, str], str, int] | None = None
         self._last_progress_at: float | None = None
         self._pending_reanchor_reason: str | None = None
+        self._human_gate: tuple[tuple[int, str], int, int] | None = None
         self.should_stop = False
 
     def _conversation_advanced(self, snapshot: PageSnapshot) -> bool:
@@ -206,6 +210,14 @@ class Supervisor:
 
         return self._try_recovery(snapshot)
 
+    def _suspend_for_human(self, snapshot: PageSnapshot) -> None:
+        self._close_recovery(reset_failures=True)
+        self._human_gate = (
+            snapshot.turn_key,
+            snapshot.assistant_count,
+            snapshot.user_count,
+        )
+
     def _observe_progress(self, snapshot: PageSnapshot) -> float:
         now = self._clock()
         progress_key = (
@@ -253,6 +265,17 @@ class Supervisor:
         snapshot = self._page.snapshot()
         now = self._observe_progress(snapshot)
 
+        if self._human_gate is not None:
+            gate_turn_key, gate_assistant_count, gate_user_count = self._human_gate
+            if snapshot.user_count <= gate_user_count:
+                return StepResult.NEED_INPUT
+            if (
+                snapshot.assistant_count < gate_assistant_count
+                or snapshot.turn_key == gate_turn_key
+            ):
+                return StepResult.USER_TURN_PENDING
+            self._human_gate = None
+
         recovery_closed = False
         if self.recovery_lease is not None and self._conversation_advanced(snapshot):
             self._close_recovery(reset_failures=True)
@@ -269,6 +292,10 @@ class Supervisor:
             ):
                 self._pending_reanchor_reason = "heartbeat"
             return StepResult.RECOVERY_CLOSED if recovery_closed else StepResult.ACTIVE
+
+        if is_need_input(snapshot.assistant_text):
+            self._suspend_for_human(snapshot)
+            return StepResult.NEED_INPUT
 
         if snapshot.phase is Phase.BLOCKED:
             if snapshot.interaction_required:
@@ -309,6 +336,7 @@ class Supervisor:
             if outcome is ReanchorOutcome.WAITING:
                 return StepResult.WAITING
             if outcome is ReanchorOutcome.NEED_INPUT:
+                self._suspend_for_human(snapshot)
                 return StepResult.NEED_INPUT
             if outcome is ReanchorOutcome.DELIVERY_UNCERTAIN:
                 return StepResult.DELIVERY_UNCERTAIN
