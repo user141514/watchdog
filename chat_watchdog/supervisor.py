@@ -256,6 +256,7 @@ class Supervisor:
         except Exception:
             accepted = False
         if not accepted:
+            self._direct_attempted.discard(key)
             return StepResult.BLOCKED if self._send_admission is not None else None
 
         self._continued.add(key)

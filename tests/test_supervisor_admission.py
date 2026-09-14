@@ -103,14 +103,16 @@ class SupervisorAdmissionTests(unittest.TestCase):
         self.assertEqual(page.sent, 0)
         self.assertEqual(agents.calls, 0)
 
-    def test_failed_dom_send_after_managed_grant_does_not_fall_through_to_recovery(self) -> None:
+    def test_failed_dom_send_after_managed_grant_retries_through_admission_without_recovery(self) -> None:
         page = FakePage(send_result=False)
         agents = FakeAgentPool()
-        supervisor = Supervisor(page, agents, send_admission=Admission(admitted=True))
+        admission = Admission(admitted=True)
+        supervisor = Supervisor(page, agents, send_admission=admission)
 
         self.assertEqual(supervisor.step(), StepResult.BLOCKED)
         self.assertEqual(supervisor.step(), StepResult.BLOCKED)
-        self.assertEqual(page.sent, 1)
+        self.assertEqual(page.sent, 2)
+        self.assertEqual(admission.calls, [page.target_url, page.target_url])
         self.assertEqual(agents.calls, 0)
 
     def test_legacy_unconfigured_mode_keeps_existing_recovery_fallback(self) -> None:

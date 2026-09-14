@@ -17,16 +17,19 @@ class FakeClock:
 class FakePage:
     target_url = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001"
 
-    def __init__(self, snapshot: PageSnapshot) -> None:
+    def __init__(self, snapshot: PageSnapshot, outcomes: list[bool] | None = None) -> None:
         self.current = snapshot
         self.sent: list[tuple[str, tuple[int, str]]] = []
+        self.outcomes = None if outcomes is None else list(outcomes)
 
     def snapshot(self) -> PageSnapshot:
         return self.current
 
     def send_continue(self, prompt: str, expected_turn_key: tuple[int, str]) -> bool:
         self.sent.append((prompt, expected_turn_key))
-        return True
+        if self.outcomes is None:
+            return True
+        return self.outcomes.pop(0) if self.outcomes else False
 
 
 class NoAgentPool:
@@ -76,6 +79,25 @@ class BlockedRecoveryTests(unittest.TestCase):
         clock.now = 240.0
         self.assertEqual(supervisor.step(), StepResult.ALREADY_HANDLED)
         self.assertEqual(len(page.sent), 1)
+
+    def test_failed_blocked_continue_is_retried_on_a_later_poll(self) -> None:
+        clock = FakeClock()
+        page = FakePage(blocked_snapshot(), outcomes=[False, True])
+        supervisor = Supervisor(
+            page,
+            NoAgentPool(),
+            recovery_timeout_seconds=120.0,
+            clock=clock,
+        )
+
+        self.assertEqual(supervisor.step(), StepResult.BLOCKED)
+        clock.now = 120.0
+        self.assertEqual(supervisor.step(), StepResult.BLOCKED)
+        self.assertEqual(len(page.sent), 1)
+
+        clock.now = 121.0
+        self.assertEqual(supervisor.step(), StepResult.CONTINUED)
+        self.assertEqual(len(page.sent), 2)
 
     def test_new_partial_progress_resets_blocked_timeout(self) -> None:
         clock = FakeClock()
