@@ -268,11 +268,14 @@ class RelayChatGPTPage:
         *,
         acceptance_timeout: float,
         require_message_id: bool,
+        allow_blocked: bool = False,
     ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
             return PromptDelivery(accepted=True)
-        if before.phase is not Phase.FINISHED:
+        if before.phase is not Phase.FINISHED and not (
+            allow_blocked and before.phase is Phase.BLOCKED
+        ):
             return PromptDelivery(
                 accepted=before.phase in (Phase.THINKING, Phase.RESPONDING)
             )
@@ -333,6 +336,7 @@ class RelayChatGPTPage:
             expected_turn_key,
             acceptance_timeout=acceptance_timeout,
             require_message_id=False,
+            allow_blocked=True,
         ).accepted
 
     def retry_fault(
