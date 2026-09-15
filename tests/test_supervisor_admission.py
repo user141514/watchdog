@@ -58,6 +58,14 @@ class FakeAgentPool:
         return None
 
 
+class FakeLease:
+    agent_name = "coordinator"
+    is_alive = True
+
+    def close(self) -> None:
+        self.is_alive = False
+
+
 class Admission:
     def __init__(self, *, admitted: bool = True, fail: bool = False) -> None:
         self.admitted = admitted
@@ -72,6 +80,19 @@ class Admission:
 
 
 class SupervisorAdmissionTests(unittest.TestCase):
+    def test_active_coordinator_lease_blocks_watchdog_send_even_when_admission_would_allow_it(self) -> None:
+        page = FakePage()
+        agents = FakeAgentPool()
+        admission = Admission(admitted=True)
+        supervisor = Supervisor(page, agents, send_admission=admission)
+        supervisor.recovery_lease = FakeLease()
+        supervisor._recovery_baseline = (page.snapshot().turn_key, page.snapshot().user_count)
+
+        self.assertEqual(supervisor.step(), StepResult.RECOVERY_RUNNING)
+        self.assertEqual(admission.calls, [])
+        self.assertEqual(page.sent, 0)
+        self.assertEqual(agents.calls, 0)
+
     def test_managed_continue_requires_admission_before_dom_send(self) -> None:
         page = FakePage()
         agents = FakeAgentPool()

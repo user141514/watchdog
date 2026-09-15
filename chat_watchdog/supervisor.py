@@ -233,6 +233,8 @@ class Supervisor:
         return now
 
     def _attempt_direct_continue(self, snapshot: PageSnapshot) -> StepResult | None:
+        if self.recovery_lease is not None:
+            return StepResult.RECOVERY_RUNNING
         key = snapshot.turn_key
         if key in self._continued:
             return StepResult.ALREADY_HANDLED
