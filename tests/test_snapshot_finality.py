@@ -39,8 +39,11 @@ const assistantTurn = {
   }
 };
 const userTurn = {getAttribute: name => name === 'data-testid' ? 'conversation-turn-3' : null};
+const pendingUser = {getAttribute: name => name === 'data-message-id' ? 'pending-user-message-uuid' : null,
+  closest: () => userTurn, innerText: 'new coordinator prompt', textContent: 'new coordinator prompt'};
 const assistant = {getAttribute: name => name === 'data-message-id' ? 'assistant-message-uuid' : null,
-  closest: () => assistantTurn};
+  closest: () => assistantTurn,
+  compareDocumentPosition(other) { return config.pendingUser && other === pendingUser ? 4 : 0; }};
 const user = {getAttribute: name => name === 'data-message-id' ? 'user-message-uuid' : null,
   closest: () => userTurn, innerText: 'fixture prompt', textContent: 'fixture prompt'};
 const composer = {...element(), innerText: '', textContent: ''};
@@ -54,7 +57,7 @@ const context = {
     },
     querySelectorAll(selector) {
       if (selector === '[data-message-author-role="assistant"]') return [assistant];
-      if (selector === '[data-message-author-role="user"]') return [user];
+      if (selector === '[data-message-author-role="user"]') return config.pendingUser ? [user, pendingUser] : [user];
       return [];
     }
   }
@@ -87,6 +90,12 @@ class SnapshotFinalityTests(unittest.TestCase):
         payload = self.payload(final=True)
         self.assertIs(payload.get('assistantFinalized'), True)
         self.assertEqual(self.snapshot(payload).phase, Phase.FINISHED)
+
+    def test_newer_unanswered_user_turn_blocks_previous_final_assistant(self):
+        payload = self.payload(final=True, pendingUser=True)
+        self.assertIs(payload.get('assistantFinalized'), True)
+        self.assertIs(payload.get('userTurnPending'), True)
+        self.assertEqual(self.snapshot(payload).phase, Phase.BLOCKED)
 
     def test_final_controls_outweigh_provisional_container_id(self):
         # Live ChatGPT retains request-* container IDs even after final controls appear.

@@ -13,6 +13,8 @@ let clicks = 0;
 class Element {
   getBoundingClientRect() { return {width: 10, height: 10}; }
   getAttribute(name) { return null; }
+  closest() { return this; }
+  querySelector() { return null; }
   dispatchEvent() {}
   focus() {}
 }
@@ -20,6 +22,9 @@ class Textarea extends Element { constructor() { super(); this.value = config.dr
 class Input extends Element {}
 const editor = new Textarea();
 const button = new Element();
+const assistant = new Element();
+const pendingUser = new Element();
+assistant.compareDocumentPosition = other => config.pendingUser && other === pendingUser ? 4 : 0;
 button.disabled = Boolean(config.disabled);
 button.getAttribute = name => name === 'aria-disabled' ? String(Boolean(config.ariaDisabled)) : null;
 button.click = () => { clicks += 1; };
@@ -31,7 +36,11 @@ const context = {
       if (selector === '[data-testid="stop-button"]') return config.active ? new Element() : null;
       return null;
     },
-    querySelectorAll() { return []; }
+    querySelectorAll(selector) {
+      if (selector === '[data-message-author-role="assistant"]') return [assistant];
+      if (selector === '[data-message-author-role="user"]') return config.pendingUser ? [pendingUser] : [];
+      return [];
+    }
   },
   window: {getComputedStyle: () => ({display: 'block', visibility: 'visible'})},
   HTMLTextAreaElement: Textarea,
@@ -79,6 +88,13 @@ class SubmitGuardTests(unittest.TestCase):
     def test_active_generation_is_not_interrupted(self):
         actual = self.run_expression(active=True)
         self.assertEqual(actual['result']['reason'], 'generation-active')
+        self.assertEqual(actual['draft'], '')
+        self.assertEqual(actual['clicks'], 0)
+
+    def test_unanswered_coordinator_user_turn_blocks_watchdog_submit(self):
+        actual = self.run_expression(pendingUser=True)
+        self.assertFalse(actual['result']['submitted'])
+        self.assertEqual(actual['result']['reason'], 'user-turn-pending')
         self.assertEqual(actual['draft'], '')
         self.assertEqual(actual['clicks'], 0)
 

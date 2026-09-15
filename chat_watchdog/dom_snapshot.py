@@ -19,6 +19,11 @@ DOM_SNAPSHOT_JS = r"""
   const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
   const assistant = assistants.length ? assistants[assistants.length - 1] : null;
   const user = users.length ? users[users.length - 1] : null;
+  const userTurnPending = !!(user && (
+    !assistant ||
+    (typeof assistant.compareDocumentPosition === 'function' &&
+      (assistant.compareDocumentPosition(user) & 4) !== 0)
+  ));
   const userTurn = user
     ? (user.closest('[data-testid^="conversation-turn-"]') || user.closest('article[data-turn="user"]') || user)
     : null;
@@ -125,6 +130,7 @@ DOM_SNAPSHOT_JS = r"""
     stopVisible: visible(stop),
     assistantBusy,
     assistantFinalized,
+    userTurnPending,
     thinkingVisible,
     composerReady,
     composerHasDraft,

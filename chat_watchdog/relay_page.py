@@ -58,13 +58,21 @@ def _build_submit_expression(prompt: str) -> str:
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   }};
   const assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
   const latest = assistants.length ? assistants[assistants.length - 1] : null;
+  const latestUser = users.length ? users[users.length - 1] : null;
+  const userTurnPending = !!(latestUser && (
+    !latest ||
+    (typeof latest.compareDocumentPosition === 'function' &&
+      (latest.compareDocumentPosition(latestUser) & 4) !== 0)
+  ));
   const turn = latest
     ? (latest.closest('[data-testid^="conversation-turn-"]') || latest.closest('article[data-turn="assistant"]') || latest)
     : null;
   const stop = document.querySelector('[data-testid="stop-button"]');
   const busy = !!(turn && (turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')));
   if (visible(stop) || busy) return {{ submitted: false, reason: 'generation-active' }};
+  if (userTurnPending) return {{ submitted: false, reason: 'user-turn-pending' }};
 
   const editor = document.querySelector('#prompt-textarea') ||
     document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
@@ -242,6 +250,7 @@ class RelayChatGPTPage:
             composer_has_draft=bool(payload.get("composerHasDraft", False)),
             assistant_present=int(payload.get("assistantCount", 0)) > 0,
             assistant_finalized=bool(payload.get("assistantFinalized", False)),
+            user_turn_pending=bool(payload.get("userTurnPending", False)),
             interaction_required=bool(payload.get("interactionRequired", False)),
             send_timeout=bool(payload.get("sendTimeout", False)),
             stream_interrupted=bool(payload.get("streamInterrupted", False)),

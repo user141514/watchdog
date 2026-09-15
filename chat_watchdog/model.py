@@ -24,6 +24,7 @@ class DomSignals:
     send_timeout: bool = False
     stream_interrupted: bool = False
     assistant_finalized: bool = False
+    user_turn_pending: bool = False
 
 
 @dataclass(frozen=True)
@@ -66,6 +67,7 @@ def classify_phase(signals: DomSignals) -> Phase:
         and not signals.composer_has_draft
         and signals.assistant_present
         and signals.assistant_finalized
+        and not signals.user_turn_pending
     ):
         return Phase.FINISHED
     return Phase.BLOCKED
