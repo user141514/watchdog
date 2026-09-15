@@ -91,6 +91,7 @@ class Supervisor:
         clock=time.monotonic,
         reanchor: ReanchorPort | None = None,
         send_admission=None,
+        intent_client=None,
     ) -> None:
         self._page = page
         self._agent_pool = agent_pool
@@ -105,6 +106,9 @@ class Supervisor:
         self._clock = clock
         self._reanchor = reanchor
         self._send_admission = send_admission
+        if intent_client is not None and reanchor is not None:
+            raise ValueError('managed intents cannot share a direct-write reanchor path')
+        self._intent_client = intent_client
         self._last_progress_key: tuple[tuple[int, str], str, int] | None = None
         self._last_progress_at: float | None = None
         self._pending_reanchor_reason: str | None = None
@@ -146,6 +150,8 @@ class Supervisor:
         self._close_recovery(reset_failures=False)
 
     def _try_recovery(self, snapshot: PageSnapshot) -> StepResult:
+        if self._intent_client is not None:
+            return StepResult.BLOCKED
         if self.recovery_lease is not None:
             return StepResult.RECOVERY_RUNNING
         target_url = getattr(self._page, "target_url", "")
@@ -179,6 +185,8 @@ class Supervisor:
             pass
 
     def _try_fault_recovery(self, snapshot: PageSnapshot) -> StepResult:
+        if self._intent_client is not None:
+            return self._publish_intent(snapshot, kind='retry')
         if self.recovery_lease is not None:
             return StepResult.RECOVERY_RUNNING
         if snapshot.turn_key in self._continued:
@@ -232,9 +240,34 @@ class Supervisor:
             self._last_progress_at = now
         return now
 
+    def _publish_intent(self, snapshot: PageSnapshot, *, kind: str = 'continue') -> StepResult:
+        if snapshot.turn_key in self._continued:
+            return StepResult.ALREADY_HANDLED
+        try:
+            result = self._intent_client.submit(self._page.target_url, snapshot, CONTINUE_PROMPT, kind=kind)
+        except Exception:
+            return StepResult.DELIVERY_UNCERTAIN
+        if result.get('accepted') is True:
+            self._continued.add(snapshot.turn_key)
+            return StepResult.CONTINUED
+        reason = result.get('reason')
+        if reason == 'delivery_uncertain':
+            return StepResult.DELIVERY_UNCERTAIN
+        if reason == 'need_input':
+            self._suspend_for_human(snapshot)
+            return StepResult.NEED_INPUT
+        if reason == 'stale_intent':
+            self._continued.add(snapshot.turn_key)
+            return StepResult.ALREADY_HANDLED
+        if reason in {'pacing', 'busy', 'user_turn_pending'}:
+            return StepResult.WAITING
+        return StepResult.BLOCKED
+
     def _attempt_direct_continue(self, snapshot: PageSnapshot) -> StepResult | None:
         if self.recovery_lease is not None:
             return StepResult.RECOVERY_RUNNING
+        if self._intent_client is not None:
+            return self._publish_intent(snapshot)
         key = snapshot.turn_key
         if key in self._continued:
             return StepResult.ALREADY_HANDLED

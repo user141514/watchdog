@@ -66,7 +66,11 @@ chat-watchdog-registry remove 6aa542fd-708c-83ea-869a-721efd83d7f3
 
 The control API binds to localhost only and exposes `POST /register`, `POST /unregister`, and `GET /watches`. Registration is idempotent by conversation UUID. Each entry reuses the existing single-conversation Supervisor; when that Supervisor reaches `SUPERVISOR_DONE`, the entry closes and is removed.
 
-When `--send-admission-url` is configured, Watchdog must obtain Sidecar's localhost admission before any managed continuation or frontend-fault recovery can send. Denial or an unavailable admission owner is fail-closed. Omitting the option preserves standalone legacy behavior, but that mode makes no claim about a global cross-sender 120-second interval.
+Managed mode now publishes intents to Sidecar, defaulting to `http://127.0.0.1:7337/internal/conversation-intents`. Use `--intent-url` to select another localhost Sidecar instance. The previous `--send-admission-url .../internal/send-admission` flag is accepted as a migration alias and translated to the sibling intent endpoint; it no longer grants direct browser-write authority.
+
+The Supervisor receives an observation-only page adapter. Every continuation carries both expected user and assistant message IDs. Sidecar owns serialization, durable reservation, idempotency, current lifecycle checks and pacing. Missing owner, denial, lost receipt or invalid response never falls back to Relay writes or recovery agents. A receipt means submission, not completion. Frontend retry intents currently return `recovery_requires_reconciliation`; managed mode does not click Retry or invent another prompt after ambiguous delivery.
+
+Unbrokered operation requires explicit `--legacy-direct-send`, cannot be combined with managed endpoint flags, and makes no cross-sender single-writer or pacing guarantee. Direct-write reanchor is available only in that explicitly selected legacy mode. Keep this boundary visible: the mailbox does not control a human clicking Send in another browser/profile.
 
 The hash map is intentionally not durable. If the daemon restarts, callers re-register the conversations they still own. This keeps target authority with the caller and avoids a second task database. Registry mode does not share one reanchor scope across multiple conversations; the existing single-conversation mode remains available when an explicit reanchor binding is required.
 

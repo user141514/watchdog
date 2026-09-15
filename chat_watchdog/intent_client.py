@@ -1,0 +1,38 @@
+"""Managed Watchdog publishes intents; Sidecar alone executes browser writes."""
+from __future__ import annotations
+import json
+from typing import Mapping
+from urllib.parse import urlsplit
+from urllib.request import Request, urlopen
+
+DEFAULT_INTENT_URL = 'http://127.0.0.1:7337/internal/conversation-intents'
+
+def _post(endpoint, payload):
+    request = Request(endpoint, data=json.dumps(payload).encode('utf-8'),
+                      headers={'content-type': 'application/json'}, method='POST')
+    with urlopen(request, timeout=5.0) as response:
+        if response.status != 200:
+            raise RuntimeError(f'intent owner returned HTTP {response.status}')
+        return json.loads(response.read().decode('utf-8'))
+
+class SidecarIntentClient:
+    def __init__(self, endpoint=DEFAULT_INTENT_URL, *, request_json=_post):
+        url = urlsplit(endpoint)
+        if (url.scheme != 'http' or url.hostname not in {'127.0.0.1', 'localhost', '::1'}
+                or url.username or url.password or url.query or url.fragment
+                or url.path != '/internal/conversation-intents'):
+            raise ValueError('intent owner must be the localhost Sidecar intent endpoint')
+        self.endpoint = endpoint
+        self._request = request_json
+
+    def submit(self, target, snapshot, text, *, kind='continue'):
+        if not snapshot.user_turn_id or not snapshot.assistant_turn_id:
+            raise ValueError('both expected message identities are required')
+        result = self._request(self.endpoint, {
+            'kind': kind, 'target': target, 'text': text,
+            'expected': {'userMessageId': snapshot.user_turn_id,
+                         'assistantMessageId': snapshot.assistant_turn_id},
+        })
+        if not isinstance(result, Mapping) or not isinstance(result.get('accepted'), bool):
+            raise RuntimeError('invalid intent owner receipt')
+        return result

@@ -12,7 +12,7 @@ from .agent_runner import AgentPool, AgentSpec
 from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
-from .send_admission import SidecarSendAdmission
+from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
 from .supervisor import StepResult, Supervisor
 
 
@@ -66,6 +66,32 @@ def build_reanchor_bridge(args) -> ReanchorBridge | None:
     )
 
 
+class _ObservationPage:
+    """Managed supervisors receive observation capability, not Relay mutation methods."""
+    def __init__(self, page):
+        self._page = page
+    @property
+    def target_url(self):
+        return self._page.target_url
+    def snapshot(self):
+        return self._page.snapshot()
+
+
+def build_intent_client(args):
+    if args.legacy_direct_send:
+        if args.intent_url or args.send_admission_url:
+            raise ValueError('legacy direct mode cannot claim managed admission or mailbox')
+        return None
+    if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
+        raise ValueError('direct-write reanchor requires explicit --legacy-direct-send')
+    endpoint = args.intent_url
+    if args.send_admission_url:
+        if endpoint or not args.send_admission_url.endswith('/internal/send-admission'):
+            raise ValueError('choose one Sidecar owner endpoint')
+        endpoint = args.send_admission_url.removesuffix('/internal/send-admission') + '/internal/conversation-intents'
+    return SidecarIntentClient(endpoint or DEFAULT_INTENT_URL)
+
+
 class _SupervisorWatcher:
     def __init__(self, page: RelayChatGPTPage, supervisor: Supervisor) -> None:
         self.page = page
@@ -108,6 +134,7 @@ class _SupervisorWatcher:
 
 
 def _run_registry_mode(args, pool: AgentPool) -> int:
+    intent_client = build_intent_client(args)
     if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
         raise SystemExit("registry mode does not share one reanchor scope across multiple conversations")
 
@@ -115,16 +142,12 @@ def _run_registry_mode(args, pool: AgentPool) -> int:
         conversation_id = conversation_id_from_url(target_url)
         page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
         supervisor = Supervisor(
-            page,
+            _ObservationPage(page) if intent_client else page,
             pool,
             recovery_timeout_seconds=args.recovery_timeout_seconds,
             heartbeat_seconds=args.reanchor_heartbeat_seconds,
             reanchor=None,
-            send_admission=(
-                SidecarSendAdmission(args.send_admission_url)
-                if args.send_admission_url
-                else None
-            ),
+            intent_client=intent_client,
         )
         return _SupervisorWatcher(page, supervisor)
 
@@ -172,6 +195,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.environ.get("CHAT_WATCHDOG_SEND_ADMISSION_URL"),
         help="optional Sidecar localhost send-admission endpoint; enables shared pacing",
     )
+    parser.add_argument('--intent-url', default=os.environ.get('CHAT_WATCHDOG_INTENT_URL'), help='Sidecar localhost intent owner')
+    parser.add_argument('--legacy-direct-send', action='store_true', help='explicit standalone opt-out; no single-writer guarantee')
     parser.add_argument(
         "--registry-port",
         type=int,
@@ -274,6 +299,11 @@ def main(argv: list[str] | None = None) -> int:
     if args.registry_port is not None and not 1 <= args.registry_port <= 65535:
         raise SystemExit("--registry-port must be between 1 and 65535")
 
+    try:
+        intent_client = build_intent_client(args)
+    except ValueError as error:
+        raise SystemExit(str(error)) from error
+
     specs = [parse_agent_command(args.agent)]
     specs.extend(parse_agent_command(value) for value in args.fallback_agent)
     pool = AgentPool(specs, startup_probe_seconds=args.agent_probe_seconds)
@@ -288,16 +318,12 @@ def main(argv: list[str] | None = None) -> int:
 
     page = RelayChatGPTPage.connect(args.relay_url, args.match_url)
     supervisor = Supervisor(
-        page,
+        _ObservationPage(page) if intent_client else page,
         pool,
         recovery_timeout_seconds=args.recovery_timeout_seconds,
         heartbeat_seconds=args.reanchor_heartbeat_seconds,
         reanchor=reanchor,
-        send_admission=(
-            SidecarSendAdmission(args.send_admission_url)
-            if args.send_admission_url
-            else None
-        ),
+        intent_client=intent_client,
     )
 
     logging.info("watching %s every %.1fs", page.target_url, args.poll_seconds)
