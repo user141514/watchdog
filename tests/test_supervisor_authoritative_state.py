@@ -74,12 +74,22 @@ class Pool:
 
 
 class Intents:
-    def __init__(self):
+    def __init__(self, response=None):
         self.calls = []
+        self.response = response or {"accepted": True}
 
-    def submit(self, target, snapshot, text, *, kind="continue"):
-        self.calls.append((target, snapshot.user_turn_id, snapshot.assistant_turn_id, kind))
-        return {"accepted": True}
+    def submit(self, *args, **kwargs):
+        raise AssertionError("authoritative managed mode must not publish legacy intent payloads")
+
+    def submit_v1(self, authoritative, text, *, source="watchdog", action="continue"):
+        state = authoritative.to_dict()
+        self.calls.append((
+            state["target"],
+            state["turn"]["userMessageId"],
+            state["turn"]["assistantMessageId"],
+            action,
+        ))
+        return self.response
 
 
 class States:
@@ -96,9 +106,9 @@ class States:
 
 
 class AuthoritativeStateSupervisorTests(unittest.TestCase):
-    def supervisor(self, authoritative, *, page=None):
+    def supervisor(self, authoritative, *, page=None, intent_response=None):
         page = page or Page()
-        intents = Intents()
+        intents = Intents(intent_response)
         pool = Pool()
         sup = Supervisor(page, pool, intent_client=intents, state_client=States(result=authoritative))
         return sup, page, intents, pool
@@ -200,3 +210,22 @@ class AuthoritativeStateSupervisorTests(unittest.TestCase):
         sup, _, intents, _ = self.supervisor(state(progress="terminal", body="substantive"), page=page)
         self.assertEqual(sup.step(), StepResult.WAITING)
         self.assertEqual(intents.calls, [])
+
+    def test_v1_state_race_denials_wait_for_reobservation_and_are_not_marked_handled(self):
+        for reason in ("stale_state", "writer_epoch_mismatch", "state_delivery_uncertain", "state_not_continuable"):
+            with self.subTest(reason=reason):
+                sup, _, intents, _ = self.supervisor(
+                    state(),
+                    intent_response={"accepted": False, "reason": reason, "currentStateVersion": 10, "currentWriterEpoch": 3},
+                )
+                self.assertEqual(sup.step(), StepResult.WAITING)
+                self.assertEqual(sup.step(), StepResult.WAITING)
+                self.assertEqual(len(intents.calls), 2)
+
+    def test_v1_current_effect_uncertainty_remains_delivery_uncertain(self):
+        sup, _, intents, _ = self.supervisor(
+            state(),
+            intent_response={"accepted": False, "reason": "delivery_uncertain"},
+        )
+        self.assertEqual(sup.step(), StepResult.DELIVERY_UNCERTAIN)
+        self.assertEqual(len(intents.calls), 1)

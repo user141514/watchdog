@@ -258,11 +258,14 @@ class Supervisor:
             self._last_progress_at = now
         return now
 
-    def _publish_intent(self, snapshot: PageSnapshot, *, kind: str = 'continue') -> StepResult:
+    def _publish_intent(self, snapshot, *, kind: str = 'continue', authoritative_state=None) -> StepResult:
         if snapshot.turn_key in self._continued:
             return StepResult.ALREADY_HANDLED
         try:
-            result = self._intent_client.submit(self._page.target_url, snapshot, CONTINUE_PROMPT, kind=kind)
+            if authoritative_state is not None:
+                result = self._intent_client.submit_v1(authoritative_state, CONTINUE_PROMPT)
+            else:
+                result = self._intent_client.submit(self._page.target_url, snapshot, CONTINUE_PROMPT, kind=kind)
         except Exception:
             return StepResult.DELIVERY_UNCERTAIN
         if result.get('accepted') is True:
@@ -272,8 +275,17 @@ class Supervisor:
         if reason == 'delivery_uncertain':
             return StepResult.DELIVERY_UNCERTAIN
         if reason == 'need_input':
-            self._suspend_for_human(snapshot)
+            if authoritative_state is None:
+                self._suspend_for_human(snapshot)
             return StepResult.NEED_INPUT
+        if authoritative_state is not None and reason in {
+            'stale_state', 'stale_intent', 'writer_epoch_mismatch',
+            'state_delivery_uncertain', 'state_not_continuable',
+            'pacing', 'busy', 'user_turn_pending', 'target_unavailable'
+        }:
+            return StepResult.WAITING
+        if authoritative_state is not None and reason == 'writer_mode_mismatch':
+            return StepResult.BLOCKED
         if reason == 'stale_intent':
             self._continued.add(snapshot.turn_key)
             return StepResult.ALREADY_HANDLED
@@ -326,7 +338,7 @@ class Supervisor:
 
         if progress == 'blocked':
             if body in {'empty', 'incomplete'}:
-                return self._publish_intent(authoritative)
+                return self._publish_intent(authoritative, authoritative_state=value)
             return StepResult.WAITING
 
         if progress == 'terminal':
@@ -340,7 +352,7 @@ class Supervisor:
                 self._close_recovery(reset_failures=True)
                 self.should_stop = True
                 return StepResult.DONE
-            return self._publish_intent(authoritative)
+            return self._publish_intent(authoritative, authoritative_state=value)
 
         return StepResult.WAITING
 
