@@ -85,6 +85,21 @@ def test_new_and_reuse_are_unambiguous():
         parse_intent_envelope(continue_with_allocation)
 
 
+def test_observation_assistant_text_allows_empty_evidence_and_has_response_sized_bound():
+    observation = json.loads(json.dumps(FIXTURE["observation"]))
+    observation["assistantMessageId"] = None
+    observation["assistantText"] = ""
+    observation["body"] = "empty"
+    assert parse_observation(observation).to_dict()["assistantText"] == ""
+
+    observation = json.loads(json.dumps(FIXTURE["observation"]))
+    observation["assistantText"] = "x" * 20_000
+    assert len(parse_observation(observation).to_dict()["assistantText"]) == 20_000
+    observation["assistantText"] = "x" * 1_000_001
+    with pytest.raises(ValueError, match="assistantText|string|length"):
+        parse_observation(observation)
+
+
 def test_unknown_state_stays_explicitly_unknown():
     unknown = json.loads(json.dumps(FIXTURE["state"]))
     unknown["stateVersion"] += 1

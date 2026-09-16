@@ -20,7 +20,7 @@ WRITER_MODES = {"managed", "legacy"}
 ACTIONS = {"continue", "open_child", "stop"}
 ALLOCATIONS = {"NEW", "REUSE"}
 
-OBS_KEYS = {"contractVersion", "source", "conversationId", "target", "observedAt", "turnId", "userMessageId", "assistantMessageId", "readable", "generating", "terminal", "body", "humanGate", "delivery", "requestId"}
+OBS_KEYS = {"contractVersion", "source", "conversationId", "target", "observedAt", "turnId", "userMessageId", "assistantMessageId", "assistantText", "readable", "generating", "terminal", "body", "humanGate", "delivery", "requestId"}
 STATE_KEYS = {"contractVersion", "conversationId", "target", "stateVersion", "turn", "progress", "body", "delivery", "gate", "writer"}
 TURN_KEYS = {"turnId", "userMessageId", "assistantMessageId"}
 WRITER_KEYS = {"mode", "epoch"}
@@ -48,11 +48,19 @@ def _enum(value: Any, allowed: set[str], label: str) -> str:
     return value
 
 
-def _str(value: Any, label: str, nullable: bool = False) -> str | None:
+def _str(value: Any, label: str, nullable: bool = False, max_length: int = 16_384) -> str | None:
     if nullable and value is None:
         return None
-    if not isinstance(value, str) or not value.strip() or len(value) > 16384:
-        raise ValueError(f"{label} must be a non-empty string")
+    if not isinstance(value, str) or not value.strip() or len(value) > max_length:
+        raise ValueError(f"{label} must be a non-empty string within its length bound")
+    return value
+
+
+def _text(value: Any, label: str, nullable: bool = False, max_length: int = 1_000_000) -> str | None:
+    if nullable and value is None:
+        return None
+    if not isinstance(value, str) or len(value) > max_length:
+        raise ValueError(f"{label} must be a string within its length bound")
     return value
 
 
@@ -123,6 +131,7 @@ def parse_observation(value: Mapping[str, Any]) -> ContractValue:
     _instant(obj["observedAt"])
     for key in ("turnId", "userMessageId", "assistantMessageId", "requestId"):
         _str(obj[key], key, nullable=True)
+    _text(obj["assistantText"], "assistantText", nullable=True)
     if not isinstance(obj["readable"], bool):
         raise ValueError("readable must be boolean")
     _bool(obj["generating"], "generating")

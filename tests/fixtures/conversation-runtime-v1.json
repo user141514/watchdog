@@ -8,6 +8,7 @@
     "turnId": "turn_fixture",
     "userMessageId": "user-1",
     "assistantMessageId": "assistant-1",
+    "assistantText": "partial response",
     "readable": true,
     "generating": false,
     "terminal": false,
