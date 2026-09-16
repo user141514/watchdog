@@ -13,6 +13,7 @@ from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
+from .state_client import SidecarStateClient, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
 
 
@@ -77,7 +78,7 @@ class _ObservationPage:
         return self._page.snapshot()
 
 
-def build_intent_client(args):
+def _managed_intent_endpoint(args):
     if args.legacy_direct_send:
         if args.intent_url or args.send_admission_url:
             raise ValueError('legacy direct mode cannot claim managed admission or mailbox')
@@ -89,7 +90,17 @@ def build_intent_client(args):
         if endpoint or not args.send_admission_url.endswith('/internal/send-admission'):
             raise ValueError('choose one Sidecar owner endpoint')
         endpoint = args.send_admission_url.removesuffix('/internal/send-admission') + '/internal/conversation-intents'
-    return SidecarIntentClient(endpoint or DEFAULT_INTENT_URL)
+    return endpoint or DEFAULT_INTENT_URL
+
+
+def build_intent_client(args):
+    endpoint = _managed_intent_endpoint(args)
+    return None if endpoint is None else SidecarIntentClient(endpoint)
+
+
+def build_state_client(args):
+    endpoint = _managed_intent_endpoint(args)
+    return None if endpoint is None else SidecarStateClient(sibling_state_endpoint(endpoint))
 
 
 class _SupervisorWatcher:
@@ -133,8 +144,7 @@ class _SupervisorWatcher:
         self.page.close()
 
 
-def _run_registry_mode(args, pool: AgentPool) -> int:
-    intent_client = build_intent_client(args)
+def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> int:
     if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
         raise SystemExit("registry mode does not share one reanchor scope across multiple conversations")
 
@@ -148,6 +158,7 @@ def _run_registry_mode(args, pool: AgentPool) -> int:
             heartbeat_seconds=args.reanchor_heartbeat_seconds,
             reanchor=None,
             intent_client=intent_client,
+            state_client=state_client,
         )
         return _SupervisorWatcher(page, supervisor)
 
@@ -301,6 +312,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         intent_client = build_intent_client(args)
+        state_client = build_state_client(args)
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
@@ -309,7 +321,7 @@ def main(argv: list[str] | None = None) -> int:
     pool = AgentPool(specs, startup_probe_seconds=args.agent_probe_seconds)
 
     if args.registry_port is not None:
-        return _run_registry_mode(args, pool)
+        return _run_registry_mode(args, pool, intent_client, state_client)
 
     try:
         reanchor = build_reanchor_bridge(args)
@@ -324,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_seconds=args.reanchor_heartbeat_seconds,
         reanchor=reanchor,
         intent_client=intent_client,
+        state_client=state_client,
     )
 
     logging.info("watching %s every %.1fs", page.target_url, args.poll_seconds)

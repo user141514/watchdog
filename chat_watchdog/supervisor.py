@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import Enum
 import time
 from typing import Collection, Protocol
@@ -7,6 +8,7 @@ from typing import Collection, Protocol
 from .agent_runner import AgentLease
 from .model import PageSnapshot, Phase, is_done, is_need_input
 from .reanchor_bridge import ReanchorBridgeError, ReanchorOutcome
+from .state_client import StateProtocolError, StateUnavailable
 
 
 CONTINUE_PROMPT = (
@@ -80,6 +82,18 @@ class StepResult(str, Enum):
     DONE = "done"
 
 
+@dataclass(frozen=True)
+class _AuthoritativeIntentSnapshot:
+    user_turn_id: str
+    assistant_turn_id: str
+    assistant_count: int = 0
+    user_count: int = 0
+
+    @property
+    def turn_key(self) -> tuple[int, str]:
+        return (0, self.assistant_turn_id)
+
+
 class Supervisor:
     def __init__(
         self,
@@ -92,6 +106,7 @@ class Supervisor:
         reanchor: ReanchorPort | None = None,
         send_admission=None,
         intent_client=None,
+        state_client=None,
     ) -> None:
         self._page = page
         self._agent_pool = agent_pool
@@ -108,7 +123,10 @@ class Supervisor:
         self._send_admission = send_admission
         if intent_client is not None and reanchor is not None:
             raise ValueError('managed intents cannot share a direct-write reanchor path')
+        if state_client is not None and intent_client is None:
+            raise ValueError('authoritative state requires managed intent ownership')
         self._intent_client = intent_client
+        self._state_client = state_client
         self._last_progress_key: tuple[tuple[int, str], str, int] | None = None
         self._last_progress_at: float | None = None
         self._pending_reanchor_reason: str | None = None
@@ -263,6 +281,69 @@ class Supervisor:
             return StepResult.WAITING
         return StepResult.BLOCKED
 
+    def _authoritative_identity(self, state: dict) -> _AuthoritativeIntentSnapshot | None:
+        turn = state.get('turn') or {}
+        user_id = turn.get('userMessageId')
+        assistant_id = turn.get('assistantMessageId')
+        if not isinstance(user_id, str) or not user_id or not isinstance(assistant_id, str) or not assistant_id:
+            return None
+        return _AuthoritativeIntentSnapshot(user_id, assistant_id)
+
+    def _step_authoritative(self, snapshot: PageSnapshot | None) -> StepResult:
+        try:
+            value = self._state_client.read(self._page.target_url)
+        except StateUnavailable:
+            return StepResult.WAITING
+        except StateProtocolError:
+            return StepResult.BLOCKED
+        except Exception:
+            return StepResult.BLOCKED
+
+        state = value.to_dict()
+        writer = state.get('writer') or {}
+        if writer.get('mode') != 'managed':
+            return StepResult.BLOCKED
+
+        delivery = state.get('delivery')
+        if delivery == 'uncertain':
+            return StepResult.DELIVERY_UNCERTAIN
+
+        if state.get('gate') == 'human_required':
+            return StepResult.NEED_INPUT
+
+        progress = state.get('progress')
+        body = state.get('body')
+        if progress == 'active':
+            return StepResult.ACTIVE
+        if progress in {'unknown', 'idle'}:
+            return StepResult.WAITING
+        if delivery != 'delivered':
+            return StepResult.WAITING
+
+        authoritative = self._authoritative_identity(state)
+        if authoritative is None:
+            return StepResult.WAITING
+
+        if progress == 'blocked':
+            if body in {'empty', 'incomplete'}:
+                return self._publish_intent(authoritative)
+            return StepResult.WAITING
+
+        if progress == 'terminal':
+            turn = state.get('turn') or {}
+            if snapshot is None or (
+                snapshot.user_turn_id != turn.get('userMessageId')
+                or snapshot.assistant_turn_id != turn.get('assistantMessageId')
+            ):
+                return StepResult.WAITING
+            if is_done(snapshot.assistant_text):
+                self._close_recovery(reset_failures=True)
+                self.should_stop = True
+                return StepResult.DONE
+            return self._publish_intent(authoritative)
+
+        return StepResult.WAITING
+
     def _attempt_direct_continue(self, snapshot: PageSnapshot) -> StepResult | None:
         if self.recovery_lease is not None:
             return StepResult.RECOVERY_RUNNING
@@ -298,6 +379,12 @@ class Supervisor:
         return StepResult.CONTINUED
 
     def step(self) -> StepResult:
+        if self._state_client is not None and self._intent_client is not None:
+            try:
+                snapshot = self._page.snapshot()
+            except Exception:
+                snapshot = None
+            return self._step_authoritative(snapshot)
         snapshot = self._page.snapshot()
         now = self._observe_progress(snapshot)
 
