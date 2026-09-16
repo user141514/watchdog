@@ -1,0 +1,70 @@
+{
+  "observation": {
+    "contractVersion": 1,
+    "source": "browser",
+    "conversationId": "conv_fixture",
+    "target": "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001",
+    "observedAt": "2026-09-16T02:00:00.000Z",
+    "turnId": "turn_fixture",
+    "userMessageId": "user-1",
+    "assistantMessageId": "assistant-1",
+    "readable": true,
+    "generating": false,
+    "terminal": false,
+    "body": "incomplete",
+    "humanGate": false,
+    "delivery": "delivered",
+    "requestId": "request-1"
+  },
+  "state": {
+    "contractVersion": 1,
+    "conversationId": "conv_fixture",
+    "target": "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001",
+    "stateVersion": 42,
+    "turn": {
+      "turnId": "turn_fixture",
+      "userMessageId": "user-1",
+      "assistantMessageId": "assistant-1"
+    },
+    "progress": "blocked",
+    "body": "incomplete",
+    "delivery": "delivered",
+    "gate": "none",
+    "writer": {
+      "mode": "managed",
+      "epoch": 7
+    }
+  },
+  "existingIntent": {
+    "contractVersion": 1,
+    "intentId": "intent-existing",
+    "source": "watchdog",
+    "conversationId": "conv_fixture",
+    "target": "https://chatgpt.com/c/00000000-0000-0000-0000-000000000001",
+    "expectedStateVersion": 42,
+    "expectedWriterEpoch": 7,
+    "action": "continue",
+    "allocation": null,
+    "text": "continue current task",
+    "expected": {
+      "userMessageId": "user-1",
+      "assistantMessageId": "assistant-1"
+    }
+  },
+  "newIntent": {
+    "contractVersion": 1,
+    "intentId": "intent-new",
+    "source": "human",
+    "conversationId": null,
+    "target": null,
+    "expectedStateVersion": null,
+    "expectedWriterEpoch": null,
+    "action": "open_child",
+    "allocation": "NEW",
+    "text": "audit current design",
+    "expected": {
+      "userMessageId": null,
+      "assistantMessageId": null
+    }
+  }
+}
