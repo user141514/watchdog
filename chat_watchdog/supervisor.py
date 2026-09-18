@@ -132,6 +132,7 @@ class Supervisor:
         self._pending_reanchor_reason: str | None = None
         self._human_gate: tuple[tuple[int, str], int, int] | None = None
         self.should_stop = False
+        self.diagnostics: dict[str, object] = {}
 
     def _conversation_advanced(self, snapshot: PageSnapshot) -> bool:
         if self._recovery_baseline is None:
@@ -266,8 +267,11 @@ class Supervisor:
                 result = self._intent_client.submit_v1(authoritative_state, CONTINUE_PROMPT)
             else:
                 result = self._intent_client.submit(self._page.target_url, snapshot, CONTINUE_PROMPT, kind=kind)
-        except Exception:
+        except Exception as error:
+            self.diagnostics.update(intent_accepted=None, intent_reason='delivery_uncertain',
+                                    error=f'{type(error).__name__}: {error}'[:1000])
             return StepResult.DELIVERY_UNCERTAIN
+        self.diagnostics.update(intent_accepted=result.get('accepted'), intent_reason=result.get('reason'))
         if result.get('accepted') is True:
             self._continued.add(snapshot.turn_key)
             return StepResult.CONTINUED
@@ -302,17 +306,30 @@ class Supervisor:
         return _AuthoritativeIntentSnapshot(user_id, assistant_id)
 
     def _step_authoritative(self, snapshot: PageSnapshot | None) -> StepResult:
+        self.diagnostics = {
+            'observed_at': time.time(), 'snapshot_available': snapshot is not None,
+            'state_available': False, 'reason': None, 'error': None,
+        }
         try:
             value = self._state_client.read(self._page.target_url)
-        except StateUnavailable:
+        except StateUnavailable as error:
+            self.diagnostics.update(reason='state_owner_unavailable', error=str(error)[:1000])
             return StepResult.WAITING
-        except StateProtocolError:
+        except StateProtocolError as error:
+            self.diagnostics.update(reason='state_protocol_error', error=str(error)[:1000])
             return StepResult.BLOCKED
-        except Exception:
+        except Exception as error:
+            self.diagnostics.update(reason='state_read_error', error=str(error)[:1000])
             return StepResult.BLOCKED
 
         state = value.to_dict()
         writer = state.get('writer') or {}
+        self.diagnostics.update(
+            state_available=True, state_version=state.get('stateVersion'),
+            progress=state.get('progress'), body=state.get('body'),
+            delivery=state.get('delivery'), gate=state.get('gate'),
+            writer_mode=writer.get('mode'), writer_epoch=writer.get('epoch'),
+        )
         if writer.get('mode') != 'managed':
             return StepResult.BLOCKED
 
@@ -396,7 +413,9 @@ class Supervisor:
                 snapshot = self._page.snapshot()
             except Exception:
                 snapshot = None
-            return self._step_authoritative(snapshot)
+            result = self._step_authoritative(snapshot)
+            self.diagnostics['decision'] = result.value
+            return result
         snapshot = self._page.snapshot()
         now = self._observe_progress(snapshot)
 

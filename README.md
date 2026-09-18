@@ -1,17 +1,19 @@
 # chat-watchdog + reanchor
 
-Versioned source for the existing, bounded PC watchdog deployment. This is not a new implementation and does not modify official DevSpace. The Python watchdog and the colocated Node reanchor package are kept together because the verified PC deployment already consumes this layout.
+A bounded watchdog for explicitly authorized ChatGPT conversations. `main` is the shared development and release line, validated on Windows; versions belong in tags and package metadata, not accumulating Windows version branches. This project does not modify official DevSpace. The Python watchdog and the colocated Node reanchor package preserve the existing PC deployment layout.
+
+Version 0.2.0 separates durable desired registration, current transport binding, recent polling, and the authoritative reason a conversation may or may not continue. A live process or registration ACK alone is not proof that work is advancing.
 
 ## Scope and invariants
 
-The legacy `chat-watchdog` command observes one explicitly selected, already-open ChatGPT conversation through an independently owned OMP Browser Relay. Registry mode (`chat-watchdog --registry-port 9235`) keeps an in-process hash map from ChatGPT's own conversation UUID to the same per-conversation Supervisor, so exact conversations can be added or removed without restarting the daemon. Reanchor retains directives, observations, context identity, delivery identity and nonce-bound model checkpoints. A model checkpoint is advisory; it is not independent proof of semantic completion.
+The legacy `chat-watchdog` command observes one explicitly selected, already-open ChatGPT conversation through an independently owned OMP Browser Relay. Registry mode (`chat-watchdog --registry-port 9235`) persists explicitly requested watches in SQLite and maintains disposable bindings from ChatGPT's own conversation UUID to a per-conversation Supervisor, so exact conversations can be added or removed without restarting the daemon. Reanchor retains directives, observations, context identity, delivery identity and nonce-bound model checkpoints. A model checkpoint is advisory; it is not independent proof of semantic completion.
 
 - Do not select a target by a partial or ambiguous match when multiple tabs qualify.
 - Preserve the exact scope, context epoch, packet nonce and delivered message on recovery. Do not resend merely because a tool response or process was lost.
 - A send ACK is not completion. `disabled=false` does not override `aria-disabled=true`.
 - Absence of a stop button does not prove finality. Ambiguous or stale page state must remain blocked.
 - A source installation, regression pass, runtime process and real browser acceptance are separate claims.
-- No continuous watcher, boot-time service, automatic browser refresh policy or 24/7 relay is installed by this repository.
+- Installing the package does not start a watcher or install a boot-time service, browser refresh policy or relay. Host services require an explicit, separately verified deployment.
 - Keep live conversation fixtures, credentials, event stores, browser profiles and raw execution logs outside source control.
 
 ## Provenance
@@ -20,7 +22,7 @@ The imported baseline is the already-verified PC source under `C:/Users/Administ
 
 The PC source includes the previously accepted submit/finality corrections and the original nonce-validation contract. On 2026-09-12 the retained acceptance store was re-read as COMPLETE with no pending packet; the successful process was re-read as terminal, succeeded, exit 0 and quiescent. That controlled acceptance was not rerun for this import.
 
-The available PC regression suite is 11 Python tests and 5 Node protocol tests. It is not the donor's complete historical suite. Host-specific receipts remain in the local `DEPLOYMENT_STATUS.md` and in the separately versioned mymem project records.
+The original PC import contained 11 Python tests and 5 Node protocol tests, not the donor's complete historical suite. The Python suite has since expanded; run the commands below for current acceptance. Host-specific receipts remain in the local `DEPLOYMENT_STATUS.md` and in the separately versioned mymem project records.
 
 ## Install and verify
 
@@ -54,17 +56,23 @@ The OMP relay, existing browser-extension trust and selected browser conversatio
 
 ## Dynamic watch registry
 
-Registry mode owns one in-memory hash map keyed by ChatGPT's own conversation UUID from `/c/<uuid>`. A normal URL such as `https://chatgpt.com/c/<uuid>` and a Project URL such as `https://chatgpt.com/g/<project>/c/<uuid>` therefore refer to the same watch. Browser title, focus and transient `PAGE...` target IDs are never identity.
+Registry mode owns a durable desired-watch table keyed by ChatGPT's own conversation UUID from `/c/<uuid>`. A normal URL such as `https://chatgpt.com/c/<uuid>` and a Project URL such as `https://chatgpt.com/g/<project>/c/<uuid>` therefore refer to the same watch. Browser title, focus and transient `PAGE...` target IDs are never identity.
 
 ```powershell
-chat-watchdog --registry-port 9235 --relay-url http://127.0.0.1:9224 --poll-seconds 60 \
-  --send-admission-url http://127.0.0.1:7337/internal/send-admission
-chat-watchdog-registry add https://chatgpt.com/g/g-p-example-agent/c/6aa542fd-708c-83ea-869a-721efd83d7f3
+chat-watchdog --registry-port 9235 --relay-url http://127.0.0.1:9224 --poll-seconds 15 `
+  --intent-url http://127.0.0.1:7337/internal/conversation-intents
+# Replace only with a conversation explicitly authorized by the user.
+chat-watchdog-registry add "https://chatgpt.com/c/<conversation-uuid>"
 chat-watchdog-registry list --json
-chat-watchdog-registry remove 6aa542fd-708c-83ea-869a-721efd83d7f3
+Invoke-RestMethod http://127.0.0.1:9235/health
+chat-watchdog-registry remove "<conversation-uuid>"
 ```
 
-The control API binds to localhost only and exposes `POST /register`, `POST /unregister`, and `GET /watches`. Registration is idempotent by conversation UUID. Each entry reuses the existing single-conversation Supervisor; when that Supervisor reaches `SUPERVISOR_DONE`, the entry closes and is removed.
+The localhost control API exposes `POST /register`, `POST /unregister`, `GET /watches`, `GET /health`, `POST /completion`, and `POST /completion/ack`. Registration is idempotent by conversation UUID. The production daemon acknowledges the durable commit without waiting for a browser connection: the ACK means desired, not connected. On `SUPERVISOR_DONE`, active registration atomically becomes a completion receipt, retained across restart until ACK.
+
+`GET /watches` preserves identity/state fields and adds polling timestamps, binding availability, consecutive failures, latest transport error and managed-state diagnostics. `connected` means a watcher binding exists, not current browser readiness. `last_success_at` means a watchdog step returned, not task progress. Inspect `diagnostics.state_available`, `progress`, `delivery`, `gate`, `writer_epoch` and `reason` too. Unknown state, uncertain delivery and human-required gates never authorize a direct-send fallback.
+
+`GET /health` exposes process/module and store identities, completed polling time and fatal polling errors. `ready` means a fresh registry loop, not a continuable target. Slow HTTP clients cannot block other control requests. Watcher failures are retained for retry without aborting siblings; unregister fences stale poll snapshots and waits for its in-flight generation.
 
 Managed mode now publishes intents to Sidecar, defaulting to `http://127.0.0.1:7337/internal/conversation-intents`. Use `--intent-url` to select another localhost Sidecar instance. The previous `--send-admission-url .../internal/send-admission` flag is accepted as a migration alias and translated to the sibling intent endpoint; it no longer grants direct browser-write authority.
 
@@ -72,7 +80,19 @@ The Supervisor receives an observation-only page adapter. Every continuation car
 
 Unbrokered operation requires explicit `--legacy-direct-send`, cannot be combined with managed endpoint flags, and makes no cross-sender single-writer or pacing guarantee. Direct-write reanchor is available only in that explicitly selected legacy mode. Keep this boundary visible: the mailbox does not control a human clicking Send in another browser/profile.
 
-The hash map is intentionally not durable. If the daemon restarts, callers re-register the conversations they still own. This keeps target authority with the caller and avoids a second task database. Registry mode does not share one reanchor scope across multiple conversations; the existing single-conversation mode remains available when an explicit reanchor binding is required.
+Desired registration is durable until explicit unregister or verified completion. Closing or restarting the daemon is not unregister. Restore is lazy: an absent browser or reloading relay remains `reconnecting`; the watchdog never opens a new tab or chooses a replacement target. Sidecar still owns task state, writer authority and delivery deduplication. The database is not a second task planner and storing a URL does not grant new authority.
+
+The Windows default is `%LOCALAPPDATA%/chat-watchdog/registry-v2.sqlite3`; POSIX uses `$XDG_STATE_HOME/chat-watchdog/registry-v2.sqlite3` (falling back to `~/.local/state`). Pin another location with `--registry-store` or `CHAT_WATCHDOG_REGISTRY_STORE`. Exactly one live process may own a store. Incompatible legacy databases are rejected, not silently migrated. Existing 0.1 deployments need an explicit inventory-preserving handover before stopping their in-memory registry.
+
+Registry mode does not share one reanchor scope across conversations; single-conversation mode remains available for an explicit reanchor binding. Localhost is a trusted local-operator boundary, not signed proof of human authorization. Callers must retain requester/explicit-target policy; never infer authority from browser focus, a title, a previous assistant summary, or a recovered URL.
+
+## Release and deployment gates
+
+Build a wheel with `python -m build --wheel`, install it into a new stable virtual environment, and verify the installed module path/version independently of the checkout. Do not replace modules inside a live environment or point scheduled tasks at disposable worktrees. The Windows task should own the long-lived Python process directly with restart-on-failure settings, not launch a detached child and immediately report success. Record the old action, active inventory and exact package before handover; re-read `/health` and `/watches` afterward.
+
+Tests include isolated process kill/restart, offline restoration, completion receipts, store ownership, withdrawal races, failure isolation and control responsiveness. They never send prompts to real ChatGPT conversations. Browser/Sidecar live acceptance and an external independent audit remain separate gates, not consequences of passing pytest.
+
+When extension reload is actually needed, use the verified `chatgpt-conversation extension-update` workflow. Do not close the browser, clear pending operations or equate a reload ACK with readiness. Re-read the same extension/build, new instance and restored exact bindings afterward.
 
 ## Repository and recovery
 

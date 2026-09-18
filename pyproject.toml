@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "chat-watchdog"
-version = "0.1.0"
+dynamic = ["version"]
 description = "Private watchdog for exact ChatGPT work conversations"
 requires-python = ">=3.11"
 dependencies = ["websocket-client>=1.8"]
@@ -18,6 +18,9 @@ chat-watchdog-registry = "chat_watchdog.registry_cli:main"
 
 [tool.setuptools]
 packages = ["chat_watchdog"]
+
+[tool.setuptools.dynamic]
+version = {attr = "chat_watchdog.__version__"}
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -70,10 +70,16 @@ class RegistryHttpTests(unittest.TestCase):
         self.assertEqual(len(self.created), 1)
 
         _, listing = self.request("GET", "/watches")
+        self.assertEqual(len(listing["watches"]), 1)
+        entry = listing["watches"][0]
+        # The original identity/state contract is preserved; diagnostics are additive.
         self.assertEqual(
-            listing,
-            {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL, "state": "active"}]},
+            {key: entry[key] for key in ("conversation_id", "target_url", "state")},
+            {"conversation_id": CHAT_ID, "target_url": CHAT_URL, "state": "active"},
         )
+        self.assertTrue(entry["connected"])
+        self.assertEqual(entry["consecutive_failures"], 0)
+        self.assertIsNone(entry["last_error"])
 
         self.created[0].state = "need_input"
         _, paused = self.request("GET", "/watches")

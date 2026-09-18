@@ -1,12 +1,21 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
-from http.server import BaseHTTPRequestHandler, HTTPServer
 import json
-from threading import RLock
-from typing import Callable, Protocol
+import logging
+import os
+import time
+from collections.abc import Callable
+from dataclasses import asdict, dataclass, field
+from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
+from pathlib import Path
+from threading import Lock, RLock
+from typing import Protocol
 from urllib.parse import urlsplit
-from uuid import UUID
+from uuid import UUID, uuid4
+
+from .registry_store import RegistryStore
+
+_LOG = logging.getLogger(__name__)
 
 
 class Watcher(Protocol):
@@ -34,6 +43,13 @@ class WatchRegistration:
     conversation_id: str
     target_url: str
     state: str = "active"
+    connected: bool = False
+    registered_at: float | None = None
+    last_poll_at: float | None = None
+    last_success_at: float | None = None
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    diagnostics: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -47,7 +63,13 @@ class WatchCompletion:
 class _WatchEntry:
     conversation_id: str
     target_url: str
-    watcher: Watcher
+    watcher: Watcher | None = None
+    registered_at: float | None = None
+    last_poll_at: float | None = None
+    last_success_at: float | None = None
+    consecutive_failures: int = 0
+    last_error: str | None = None
+    lock: object = field(default_factory=RLock)
 
 
 def conversation_id_from_url(value: str) -> str:
@@ -89,35 +111,112 @@ def _conversation_id(value: str) -> str:
 
 
 class WatchRegistry:
-    """Thread-safe in-memory map from ChatGPT conversation UUID to watcher."""
+    """Durable desired watches with disposable, independently recoverable bindings.
 
-    def __init__(self, watcher_factory: Callable[[str], Watcher]) -> None:
+    The registry lock protects identity and storage only, never network I/O.
+    Per-conversation locks fence stale poll snapshots and serialize withdrawal
+    with in-flight work. The Sidecar remains the sole managed browser writer.
+    """
+
+    def __init__(self, watcher_factory: Callable[[str], Watcher], *,
+                 store_path: str | Path | None = None, clock=time.time,
+                 connect_on_register: bool = True) -> None:
         self._watcher_factory = watcher_factory
+        self._connect_on_register = connect_on_register
+        self._clock = clock
         self._watchers: dict[str, _WatchEntry] = {}
         self._completed: dict[str, WatchCompletion] = {}
         self._lock = RLock()
+        self._poll_lock = Lock()
+        self._entry_locks: dict[str, object] = {}
+        self._closed = False
+        self._last_poll_started_at: float | None = None
+        self._last_poll_completed_at: float | None = None
+        self._last_poll_error: str | None = None
+        self.instance_id = str(uuid4())
+        self._store = RegistryStore(store_path)
+        try:
+            for row in self._store.load():
+                conversation_id = conversation_id_from_url(row["target_url"])
+                if conversation_id != row["conversation_id"]:
+                    raise RuntimeError("stored conversation identity mismatch")
+                if row["status"] == "completed":
+                    self._completed[conversation_id] = WatchCompletion(
+                        conversation_id, row["target_url"], row["result"])
+                else:
+                    lock = self._entry_locks.setdefault(conversation_id, RLock())
+                    self._watchers[conversation_id] = _WatchEntry(
+                        conversation_id, row["target_url"], lock=lock,
+                        registered_at=row["registered_at"],
+                        last_poll_at=row["last_poll_at"],
+                        last_success_at=row["last_success_at"],
+                        consecutive_failures=row["consecutive_failures"],
+                        last_error=row["last_error"],
+                    )
+        except BaseException:
+            self._store.close()
+            raise
+
+    def _current(self, entry: _WatchEntry) -> bool:
+        return not self._closed and self._watchers.get(entry.conversation_id) is entry
+
+    def _record_error(self, entry: _WatchEntry, error: Exception) -> None:
+        with self._lock:
+            if not self._current(entry):
+                return
+            entry.consecutive_failures += 1
+            entry.last_error = f"{type(error).__name__}: {error}"[:1000]
+            self._store.observe(entry)
+        _LOG.warning("watchdog %s retained for retry: %s", entry.conversation_id, entry.last_error)
+
+    def _bind(self, entry: _WatchEntry) -> bool:
+        try:
+            entry.watcher = self._watcher_factory(entry.target_url)
+            return True
+        except Exception as error:  # noqa: BLE001 - isolate arbitrary transport plugins
+            self._record_error(entry, error)
+            return False
+
+    @staticmethod
+    def _close_watcher(entry: _WatchEntry) -> None:
+        if entry.watcher is not None:
+            try:
+                entry.watcher.close()
+            except Exception:
+                _LOG.exception("watchdog transport cleanup failed: %s", entry.conversation_id)
 
     def register(self, target_url: str) -> RegisterResult:
         conversation_id = conversation_id_from_url(target_url)
         with self._lock:
+            if self._closed:
+                raise RuntimeError("watch registry is closed")
             if conversation_id in self._watchers:
                 return RegisterResult(conversation_id=conversation_id, created=False)
+            at = self._clock()
+            self._store.register(conversation_id, target_url, at)
             self._completed.pop(conversation_id, None)
-            watcher = self._watcher_factory(target_url)
-            self._watchers[conversation_id] = _WatchEntry(
-                conversation_id=conversation_id,
-                target_url=target_url,
-                watcher=watcher,
-            )
+            lock = self._entry_locks.setdefault(conversation_id, RLock())
+            entry = _WatchEntry(conversation_id, target_url, registered_at=at, lock=lock)
+            self._watchers[conversation_id] = entry
+        if self._connect_on_register:
+            with entry.lock:
+                with self._lock:
+                    current = self._current(entry)
+                if current and entry.watcher is None:
+                    self._bind(entry)
         return RegisterResult(conversation_id=conversation_id, created=True)
 
     def unregister(self, conversation: str) -> bool:
         conversation_id = _conversation_id(conversation)
         with self._lock:
-            entry = self._watchers.pop(conversation_id, None)
-        if entry is None:
-            return False
-        entry.watcher.close()
+            entry = self._watchers.get(conversation_id)
+            if entry is None:
+                return False
+            self._store.remove(conversation_id, status="active")
+            self._watchers.pop(conversation_id)
+        # Once this returns, no operation from the withdrawn generation is live.
+        with entry.lock:
+            self._close_watcher(entry)
         return True
 
     def list_ids(self) -> list[str]:
@@ -137,63 +236,134 @@ class WatchRegistry:
     def ack_completion(self, conversation: str) -> bool:
         conversation_id = _conversation_id(conversation)
         with self._lock:
-            return self._completed.pop(conversation_id, None) is not None
+            if conversation_id not in self._completed:
+                return False
+            self._store.remove(conversation_id, status="completed")
+            self._completed.pop(conversation_id)
+            return True
 
     def list(self) -> list[WatchRegistration]:
         with self._lock:
             return [
                 WatchRegistration(
-                    entry.conversation_id,
-                    entry.target_url,
-                    getattr(entry.watcher, "state", "active"),
+                    conversation_id=entry.conversation_id,
+                    target_url=entry.target_url,
+                    state=("reconnecting" if entry.watcher is None else
+                           "degraded" if entry.last_error else
+                           getattr(entry.watcher, "state", "active")),
+                    connected=entry.watcher is not None,
+                    registered_at=entry.registered_at,
+                    last_poll_at=entry.last_poll_at,
+                    last_success_at=entry.last_success_at,
+                    consecutive_failures=entry.consecutive_failures,
+                    last_error=entry.last_error,
+                    diagnostics=getattr(entry.watcher, "diagnostics", None),
                 )
-                for entry in sorted(
-                    self._watchers.values(),
-                    key=lambda item: item.conversation_id,
-                )
+                for entry in sorted(self._watchers.values(), key=lambda item: item.conversation_id)
             ]
 
-    def step_all(self) -> None:
+    def health(self, *, stale_after: float = 120.0) -> dict:
         with self._lock:
-            snapshot = list(self._watchers.items())
+            last = self._last_poll_completed_at
+            fresh = (self._last_poll_error is None and last is not None
+                     and 0 <= self._clock() - last <= stale_after)
+            return {
+                "ready": not self._closed and fresh,
+                "instance_id": self.instance_id,
+                "pid": os.getpid(),
+                "module_path": str(Path(__file__).resolve()),
+                "protocol_version": 2,
+                "last_poll_error": self._last_poll_error,
+                "durable": self._store.path is not None,
+                "store_path": self._store.path,
+                "polling_fresh": fresh,
+                "last_poll_started_at": self._last_poll_started_at,
+                "last_poll_completed_at": last,
+                "active_count": len(self._watchers),
+                "degraded_count": sum(e.watcher is None or e.last_error is not None
+                                      for e in self._watchers.values()),
+            }
 
-        completed: list[tuple[str, Watcher]] = []
-        for conversation_id, entry in snapshot:
-            entry.watcher.step()
-            if entry.watcher.should_stop:
-                completed.append((conversation_id, entry.watcher))
-
-        for conversation_id, watcher in completed:
+    def _step_entry(self, entry: _WatchEntry) -> None:
+        with entry.lock:
             with self._lock:
-                current = self._watchers.get(conversation_id)
-                if current is None or current.watcher is not watcher:
-                    continue
-                self._completed[conversation_id] = WatchCompletion(
-                    conversation_id=conversation_id,
-                    target_url=current.target_url,
-                    result=watcher.completion_text,
-                )
-                self._watchers.pop(conversation_id)
-            watcher.close()
+                if not self._current(entry):
+                    return
+                entry.last_poll_at = self._clock()
+                # A broken durable store closes the side-effect gate, not just logging.
+                self._store.observe(entry)
+            if entry.watcher is None and not self._bind(entry):
+                return
+            try:
+                entry.watcher.step()
+                completed = entry.watcher.should_stop
+                result = entry.watcher.completion_text if completed else None
+            except Exception as error:  # noqa: BLE001 - one watcher must not kill its siblings
+                self._record_error(entry, error)
+                return
+            with self._lock:
+                if not self._current(entry):
+                    return
+                entry.last_success_at = self._clock()
+                entry.consecutive_failures = 0
+                entry.last_error = None
+                self._store.observe(entry)
+                if completed:
+                    self._store.complete(entry.conversation_id, result)
+                    self._completed[entry.conversation_id] = WatchCompletion(
+                        entry.conversation_id, entry.target_url, result)
+                    self._watchers.pop(entry.conversation_id)
+            if completed:
+                self._close_watcher(entry)
+
+    def step_all(self) -> None:
+        with self._poll_lock:
+            with self._lock:
+                if self._closed:
+                    return
+                self._last_poll_started_at = self._clock()
+                snapshot = list(self._watchers.values())
+            try:
+                for entry in snapshot:
+                    self._step_entry(entry)
+            except Exception as error:
+                with self._lock:
+                    self._last_poll_error = f"{type(error).__name__}: {error}"[:1000]
+                raise
+            with self._lock:
+                self._last_poll_error = None
+                self._last_poll_completed_at = self._clock()
 
     def close(self) -> None:
         with self._lock:
+            if self._closed:
+                return
+            self._closed = True
             entries = list(self._watchers.values())
             self._watchers.clear()
             self._completed.clear()
         for entry in entries:
-            entry.watcher.close()
+            with entry.lock:
+                self._close_watcher(entry)
+        with self._lock:
+            self._store.close()
 
 
 def create_control_server(
     registry: WatchRegistry,
     host: str = "127.0.0.1",
     port: int = 9235,
+    *,
+    stale_after: float = 120.0,
 ) -> HTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("watchdog control server must bind to localhost")
 
     class ControlHandler(BaseHTTPRequestHandler):
+        def setup(self) -> None:
+            super().setup()
+            self.connection.settimeout(5.0)
+
         def log_message(self, _format: str, *_args: object) -> None:
             return None
 
@@ -203,7 +373,11 @@ def create_control_server(
             self.send_header("content-type", "application/json")
             self.send_header("content-length", str(len(encoded)))
             self.end_headers()
-            self.wfile.write(encoded)
+            try:
+                self.wfile.write(encoded)
+            except (ConnectionError, TimeoutError):
+                # A lost ACK is not permission to undo its already-committed effect.
+                self.close_connection = True
 
         def _read_json(self) -> dict[str, object]:
             try:
@@ -221,20 +395,16 @@ def create_control_server(
             return payload
 
         def do_GET(self) -> None:
+            if self.path == "/health":
+                self._send_json(200, registry.health(stale_after=stale_after))
+                return
             if self.path != "/watches":
                 self._send_json(404, {"error": "not found"})
                 return
             self._send_json(
                 200,
                 {
-                    "watches": [
-                        {
-                            "conversation_id": entry.conversation_id,
-                            "target_url": entry.target_url,
-                            "state": entry.state,
-                        }
-                        for entry in registry.list()
-                    ]
+                    "watches": [asdict(entry) for entry in registry.list()]
                 },
             )
 
@@ -302,4 +472,4 @@ def create_control_server(
             except RuntimeError as error:
                 self._send_json(409, {"error": str(error)})
 
-    return HTTPServer((host, port), ControlHandler)
+    return ThreadingHTTPServer((host, port), ControlHandler)

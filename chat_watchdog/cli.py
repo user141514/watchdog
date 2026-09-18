@@ -3,9 +3,11 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+from pathlib import Path
 import shlex
 import socket
 import sys
+from threading import Thread
 import time
 
 from .agent_runner import AgentPool, AgentSpec
@@ -118,6 +120,10 @@ class _SupervisorWatcher:
         return self._state
 
     @property
+    def diagnostics(self) -> dict:
+        return dict(self.supervisor.diagnostics)
+
+    @property
     def completion_text(self) -> str | None:
         try:
             return self.page.snapshot().assistant_text
@@ -162,28 +168,50 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
         )
         return _SupervisorWatcher(page, supervisor)
 
-    registry = WatchRegistry(create_watcher)
-    server = create_control_server(registry, args.registry_host, args.registry_port)
-    server.timeout = min(0.5, args.poll_seconds)
-    logging.info(
-        "watch registry listening on http://%s:%d; register exact ChatGPT conversation URLs",
-        args.registry_host,
-        server.server_address[1],
-    )
-    next_poll = time.monotonic()
+    registry = WatchRegistry(create_watcher, store_path=args.registry_store, connect_on_register=False)
     try:
-        while True:
-            server.handle_request()
-            now = time.monotonic()
-            if now >= next_poll:
+        server = create_control_server(
+            registry, args.registry_host, args.registry_port,
+            stale_after=max(30.0, args.poll_seconds * 3),
+        )
+    except BaseException:
+        registry.close()
+        raise
+    control = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1},
+                     name="watchdog-control", daemon=True)
+    control.start()
+    logging.info(
+        "durable watch registry on http://%s:%d; store=%s instance=%s",
+        args.registry_host, server.server_address[1], args.registry_store, registry.instance_id,
+    )
+    try:
+        while control.is_alive():
+            started = time.monotonic()
+            try:
                 registry.step_all()
-                next_poll = now + args.poll_seconds
+            except Exception:
+                # Storage failure stays observable and closes the send gate; retry
+                # storage on the next poll without losing desired registrations.
+                logging.exception("watch registry polling failed; retaining desired watches")
+            time.sleep(max(0.01, args.poll_seconds - (time.monotonic() - started)))
+        raise RuntimeError("watchdog control server unexpectedly stopped")
     except KeyboardInterrupt:
         logging.info("stopped by user")
         return 130
     finally:
+        server.shutdown()
+        control.join(timeout=5)
         server.server_close()
         registry.close()
+
+
+def default_registry_store() -> str:
+    if os.name == "nt":
+        root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    else:
+        root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+    # Deliberately separate from the incompatible pre-registry compatibility DB.
+    return str(root / "chat-watchdog" / "registry-v2.sqlite3")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -213,6 +241,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="enable dynamic watch registry on localhost at this port",
+    )
+    parser.add_argument(
+        "--registry-store",
+        default=os.environ.get("CHAT_WATCHDOG_REGISTRY_STORE") or default_registry_store(),
+        help="durable desired registrations and receipts; exactly one process owns this SQLite file",
     )
     parser.add_argument(
         "--registry-host",
