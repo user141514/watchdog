@@ -342,6 +342,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--reanchor-heartbeat-seconds must be > 0")
     if args.registry_port is not None and not 1 <= args.registry_port <= 65535:
         raise SystemExit("--registry-port must be between 1 and 65535")
+    if args.registry_port is not None and args.legacy_direct_send:
+        raise SystemExit(
+            "durable registry requires Sidecar; --legacy-direct-send is single-conversation only"
+        )
 
     try:
         intent_client = build_intent_client(args)

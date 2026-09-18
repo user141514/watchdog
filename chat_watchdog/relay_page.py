@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import suppress
 from dataclasses import dataclass
 import json
 import time
@@ -152,7 +153,13 @@ class RelayChatGPTPage:
             websocket_factory = websocket.create_connection
         socket = websocket_factory(ws_url, timeout=3.0, suppress_origin=True)
         protocol = RelayCdpProtocol(socket)
-        session_id = protocol.attach_target(target_id)
+        try:
+            session_id = protocol.attach_target(target_id)
+        except BaseException:
+            # Preserve the attach failure while releasing its unpublished transport.
+            with suppress(Exception):
+                socket.close()
+            raise
         return cls(
             target_id=target_id,
             target_url=target_url,
@@ -193,7 +200,9 @@ class RelayChatGPTPage:
                 close()
             return False
 
-        self.close()
+        # A stale socket cleanup failure must not discard a verified replacement.
+        with suppress(Exception):
+            self.close()
         self.target_id = target_id
         self.target_url = str(target["url"])
         self.session_id = session_id

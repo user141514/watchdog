@@ -307,7 +307,9 @@ class Supervisor:
 
     def _step_authoritative(self, snapshot: PageSnapshot | None) -> StepResult:
         self.diagnostics = {
-            'observed_at': time.time(), 'snapshot_available': snapshot is not None,
+            'observed_at': time.time(),
+            'snapshot_available': (snapshot is not None and snapshot.assistant_turn_id not in
+                                   {'relay-unavailable', 'invalid-snapshot', 'navigated-away'}),
             'state_available': False, 'reason': None, 'error': None,
         }
         try:

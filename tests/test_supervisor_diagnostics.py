@@ -24,6 +24,13 @@ def test_owner_outage_is_distinguishable_from_an_alive_idle_watcher():
         registry.close()
 
 
+def test_relay_unavailable_sentinel_is_not_a_real_snapshot():
+    sup = Supervisor(Page(assistant="relay-unavailable"), Pool(), intent_client=Intents(),
+                     state_client=States(result=state(delivery="uncertain", progress="unknown", body="unknown")))
+    assert sup.step() is StepResult.DELIVERY_UNCERTAIN
+    assert sup.diagnostics["snapshot_available"] is False
+
+
 def test_uncertain_delivery_remains_visible_and_never_forces_a_send():
     intents = Intents()
     sup = Supervisor(Page(), Pool(), intent_client=intents,

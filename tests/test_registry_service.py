@@ -20,6 +20,14 @@ def test_cli_registry_is_durable_by_default_and_path_can_be_pinned(tmp_path):
     assert args.registry_store == explicit
 
 
+def test_durable_registry_refuses_unbrokered_automatic_replay(monkeypatch):
+    from chat_watchdog import cli
+
+    monkeypatch.setattr(cli, "_run_registry_mode", lambda *args: pytest.fail("unsafe legacy registry started"))
+    with pytest.raises(SystemExit, match="single-conversation"):
+        cli.main(["--registry-port", "9235", "--legacy-direct-send"])
+
+
 def test_health_http_includes_runtime_identity_and_polling_evidence():
     registry = WatchRegistry(lambda url: Watcher())
     registry.step_all()
