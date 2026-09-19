@@ -12,10 +12,10 @@ import time
 
 from .agent_runner import AgentPool, AgentSpec
 from .reanchor_bridge import ReanchorBridge, ReanchorCli
-from .registry import WatchRegistry, conversation_id_from_url, create_control_server
+from .registry import RegistrationRejected, WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
-from .state_client import SidecarStateClient, sibling_state_endpoint
+from .state_client import SidecarStateClient, StateProtocolError, StateUnavailable, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
 
 
@@ -105,6 +105,16 @@ def build_state_client(args):
     return None if endpoint is None else SidecarStateClient(sibling_state_endpoint(endpoint))
 
 
+def validate_managed_registration(state_client, target_url: str) -> None:
+    try:
+        state = state_client.read(target_url)
+    except (StateUnavailable, StateProtocolError) as error:
+        raise RegistrationRejected("NOT_MOUNTABLE_MANAGED", str(error)) from error
+    writer = state.to_dict().get("writer") or {}
+    if writer.get("mode") != "managed":
+        raise RegistrationRejected("NOT_MOUNTABLE_MANAGED", "writer_mode_mismatch")
+
+
 class _SupervisorWatcher:
     def __init__(self, page: RelayChatGPTPage, supervisor: Supervisor) -> None:
         self.page = page
@@ -168,7 +178,15 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
         )
         return _SupervisorWatcher(page, supervisor)
 
-    registry = WatchRegistry(create_watcher, store_path=args.registry_store, connect_on_register=False)
+    registration_preflight = None
+    if state_client is not None:
+        registration_preflight = lambda target_url: validate_managed_registration(state_client, target_url)
+    registry = WatchRegistry(
+        create_watcher,
+        store_path=args.registry_store,
+        connect_on_register=False,
+        registration_preflight=registration_preflight,
+    )
     try:
         server = create_control_server(
             registry, args.registry_host, args.registry_port,

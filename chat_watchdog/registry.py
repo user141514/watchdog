@@ -18,6 +18,13 @@ from .registry_store import RegistryStore
 _LOG = logging.getLogger(__name__)
 
 
+class RegistrationRejected(RuntimeError):
+    def __init__(self, code: str, reason: str) -> None:
+        self.code = code
+        self.reason = reason
+        super().__init__(f"{code}: {reason}")
+
+
 class Watcher(Protocol):
     should_stop: bool
 
@@ -120,9 +127,11 @@ class WatchRegistry:
 
     def __init__(self, watcher_factory: Callable[[str], Watcher], *,
                  store_path: str | Path | None = None, clock=time.time,
-                 connect_on_register: bool = True) -> None:
+                 connect_on_register: bool = True,
+                 registration_preflight: Callable[[str], None] | None = None) -> None:
         self._watcher_factory = watcher_factory
         self._connect_on_register = connect_on_register
+        self._registration_preflight = registration_preflight
         self._clock = clock
         self._watchers: dict[str, _WatchEntry] = {}
         self._completed: dict[str, WatchCompletion] = {}
@@ -187,6 +196,11 @@ class WatchRegistry:
 
     def register(self, target_url: str) -> RegisterResult:
         conversation_id = conversation_id_from_url(target_url)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("watch registry is closed")
+        if self._registration_preflight is not None:
+            self._registration_preflight(target_url)
         with self._lock:
             if self._closed:
                 raise RuntimeError("watch registry is closed")
@@ -469,6 +483,8 @@ def create_control_server(
                 self._send_json(404, {"error": "not found"})
             except ValueError as error:
                 self._send_json(400, {"error": str(error)})
+            except RegistrationRejected as error:
+                self._send_json(409, {"error": error.code, "reason": error.reason})
             except RuntimeError as error:
                 self._send_json(409, {"error": str(error)})
 

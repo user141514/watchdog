@@ -5,7 +5,7 @@ from threading import Event, Thread
 
 import pytest
 
-from chat_watchdog.registry import WatchRegistry
+from chat_watchdog.registry import RegistrationRejected, WatchRegistry
 
 
 ID_A = "10000000-0000-4000-8000-000000000001"
@@ -281,6 +281,81 @@ def test_health_reports_poll_freshness_and_not_just_process_existence():
         assert registry.health(stale_after=30)["active_count"] == 1
     finally:
         registry.close()
+
+
+def test_registration_preflight_failure_has_no_memory_or_durable_effect(tmp_path):
+    store = tmp_path / "registry.sqlite3"
+    attempts = []
+
+    def reject(url):
+        attempts.append(url)
+        raise RegistrationRejected("NOT_MOUNTABLE_MANAGED", "target_unavailable")
+
+    registry = WatchRegistry(
+        lambda _url: pytest.fail("watcher must not be created"),
+        store_path=store,
+        registration_preflight=reject,
+    )
+    try:
+        with pytest.raises(RegistrationRejected, match="NOT_MOUNTABLE_MANAGED"):
+            registry.register(URL_A)
+        assert attempts == [URL_A]
+        assert registry.list() == []
+        assert not registry.is_active(ID_A)
+    finally:
+        registry.close()
+
+    reopened = WatchRegistry(lambda _url: Watcher(), store_path=store)
+    try:
+        assert reopened.list() == []
+        assert not reopened.is_active(ID_A)
+    finally:
+        reopened.close()
+
+
+def test_registration_preflight_is_lock_free_and_rechecks_closed_before_commit(tmp_path):
+    store = tmp_path / "registry.sqlite3"
+    entered, release, read_done = Event(), Event(), Event()
+    errors = []
+
+    def preflight(_url):
+        entered.set()
+        assert release.wait(2)
+
+    registry = WatchRegistry(
+        lambda _url: Watcher(),
+        store_path=store,
+        registration_preflight=preflight,
+    )
+
+    def register():
+        try:
+            registry.register(URL_A)
+        except Exception as error:  # captured for assertion in the owner thread
+            errors.append(error)
+
+    registering = Thread(target=register)
+    registering.start()
+    assert entered.wait(1)
+
+    reader = Thread(target=lambda: (registry.list(), read_done.set()))
+    reader.start()
+    assert read_done.wait(0.5), "registration preflight held the registry lock"
+    reader.join(timeout=1)
+
+    registry.close()
+    release.set()
+    registering.join(timeout=2)
+    assert not registering.is_alive()
+    assert len(errors) == 1
+    assert isinstance(errors[0], RuntimeError)
+    assert "closed" in str(errors[0])
+
+    reopened = WatchRegistry(lambda _url: Watcher(), store_path=store)
+    try:
+        assert reopened.list() == []
+    finally:
+        reopened.close()
 
 
 def test_deferred_registration_ack_does_not_wait_for_transport():

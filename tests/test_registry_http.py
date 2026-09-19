@@ -4,9 +4,10 @@ from dataclasses import dataclass
 import json
 from threading import Thread
 import unittest
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
-from chat_watchdog.registry import WatchRegistry, create_control_server
+from chat_watchdog.registry import RegistrationRejected, WatchRegistry, create_control_server
 
 
 CHAT_ID = "6aa542fd-708c-83ea-869a-721efd83d7f3"
@@ -36,7 +37,11 @@ class RegistryHttpTests(unittest.TestCase):
             self.created.append(watcher)
             return watcher
 
-        self.registry = WatchRegistry(factory)
+        self.preflight = lambda _url: None
+        self.registry = WatchRegistry(
+            factory,
+            registration_preflight=lambda url: self.preflight(url),
+        )
         self.server = create_control_server(self.registry, "127.0.0.1", 0)
         self.thread = Thread(target=self.server.serve_forever, daemon=True)
         self.thread.start()
@@ -84,6 +89,23 @@ class RegistryHttpTests(unittest.TestCase):
         self.created[0].state = "need_input"
         _, paused = self.request("GET", "/watches")
         self.assertEqual(paused["watches"][0]["state"], "need_input")
+
+    def test_register_rejects_unmountable_managed_target_without_registry_effect(self) -> None:
+        def reject(_url: str) -> None:
+            raise RegistrationRejected("NOT_MOUNTABLE_MANAGED", "target_unavailable")
+
+        self.preflight = reject
+        with self.assertRaises(HTTPError) as raised:
+            self.request("POST", "/register", {"url": CHAT_URL})
+        self.assertEqual(raised.exception.code, 409)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(
+            payload,
+            {"error": "NOT_MOUNTABLE_MANAGED", "reason": "target_unavailable"},
+        )
+        _, listing = self.request("GET", "/watches")
+        self.assertEqual(listing, {"watches": []})
+        self.assertEqual(self.created, [])
 
     def test_unregister_closes_registered_watcher(self) -> None:
         self.request("POST", "/register", {"url": CHAT_URL})
