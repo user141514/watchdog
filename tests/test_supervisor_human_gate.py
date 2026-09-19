@@ -42,7 +42,15 @@ class FakeAdmission:
         return type("Result", (), {"admitted": True, "retry_after_ms": None})()
 
 
-def finished(*, text: str, assistant_count: int = 1, user_count: int = 1, turn_id: str = "assistant-1") -> PageSnapshot:
+def finished(
+    *,
+    text: str,
+    assistant_count: int = 1,
+    user_count: int = 1,
+    turn_id: str = "assistant-1",
+    user_turn_id: str = "user-1",
+    user_turn_pending: bool = False,
+) -> PageSnapshot:
     return PageSnapshot(
         phase=Phase.FINISHED,
         assistant_turn_id=turn_id,
@@ -50,6 +58,8 @@ def finished(*, text: str, assistant_count: int = 1, user_count: int = 1, turn_i
         assistant_text=text,
         assistant_count=assistant_count,
         user_count=user_count,
+        user_turn_id=user_turn_id,
+        user_turn_pending=user_turn_pending,
     )
 
 
@@ -127,6 +137,46 @@ class HumanGateTests(unittest.TestCase):
         watcher.step()
         self.assertEqual(watcher.state, "active")
 
+    def test_human_gate_resumes_by_stable_user_message_id_despite_virtualized_counts(self) -> None:
+        page = FakePage(finished(
+            text="Choose backend.\n[SUPERVISOR_STATE: NEED_INPUT]",
+            assistant_count=17,
+            user_count=17,
+            turn_id="assistant-old",
+            user_turn_id="user-old",
+        ))
+        supervisor = Supervisor(page, FakeAgentPool(), send_admission=FakeAdmission())
+        self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
+
+        # ChatGPT virtualizes old DOM turns: counts shrink instead of growing.
+        page.current = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-visible-old",
+            assistant_text_signature="sig-visible-old",
+            assistant_text="previous visible assistant content",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_text="I am back",
+            user_turn_pending=True,
+        )
+        self.assertEqual(supervisor.step(), StepResult.USER_TURN_PENDING)
+        self.assertEqual(page.sent, 0)
+
+        page.current = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-new",
+            assistant_text_signature="sig-assistant-new",
+            assistant_text="Continuing current work",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_text="I am back",
+            user_turn_pending=False,
+        )
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        self.assertEqual(page.sent, 0)
+
     def test_dom_interaction_gate_resumes_only_after_external_ui_state_changes(self) -> None:
         page = FakePage(PageSnapshot(
             phase=Phase.BLOCKED,
@@ -154,6 +204,8 @@ class HumanGateTests(unittest.TestCase):
             assistant_count=1,
             user_count=2,
             turn_id="assistant-1",
+            user_turn_id="user-2",
+            user_turn_pending=True,
         )
         self.assertEqual(supervisor.step(), StepResult.USER_TURN_PENDING)
         self.assertEqual(page.sent, 0)
@@ -165,6 +217,7 @@ class HumanGateTests(unittest.TestCase):
             assistant_text="Continuing after the user action",
             assistant_count=1,
             user_count=2,
+            user_turn_id="user-2",
         )
         self.assertEqual(supervisor.step(), StepResult.ACTIVE)
         self.assertEqual(page.sent, 0)

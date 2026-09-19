@@ -37,6 +37,7 @@ class PageSnapshot:
     user_count: int
     user_turn_id: str = ""
     user_text: str = ""
+    user_turn_pending: bool = False
     interaction_required: bool = False
     send_timeout: bool = False
     stream_interrupted: bool = False

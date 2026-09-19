@@ -48,10 +48,16 @@ def _build_retry_fault_expression() -> str:
 """.strip()
 
 
-def _build_submit_expression(prompt: str) -> str:
+def _build_submit_expression(
+    prompt: str,
+    *,
+    allow_generation_active: bool = False,
+) -> str:
     text = json.dumps(prompt)
+    allow_active = "true" if allow_generation_active else "false"
     return f"""
 (async () => {{
+  const allowGenerationActive = {allow_active};
   const visible = (el) => {{
     if (!el) return false;
     const style = window.getComputedStyle(el);
@@ -72,7 +78,7 @@ def _build_submit_expression(prompt: str) -> str:
     : null;
   const stop = document.querySelector('[data-testid="stop-button"]');
   const busy = !!(turn && (turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')));
-  if (visible(stop) || busy) return {{ submitted: false, reason: 'generation-active' }};
+  if (!allowGenerationActive && (visible(stop) || busy)) return {{ submitted: false, reason: 'generation-active' }};
   if (userTurnPending) return {{ submitted: false, reason: 'user-turn-pending' }};
 
   const editor = document.querySelector('#prompt-textarea') ||
@@ -273,6 +279,7 @@ class RelayChatGPTPage:
             user_count=int(payload.get("userCount", 0)),
             user_turn_id=str(payload.get("userTurnId", "")),
             user_text=str(payload.get("userText", "")),
+            user_turn_pending=bool(payload.get("userTurnPending", False)),
             interaction_required=bool(payload.get("interactionRequired", False)),
             send_timeout=bool(payload.get("sendTimeout", False)),
             stream_interrupted=bool(payload.get("streamInterrupted", False)),
@@ -287,12 +294,18 @@ class RelayChatGPTPage:
         acceptance_timeout: float,
         require_message_id: bool,
         allow_blocked: bool = False,
+        allow_active: bool = False,
     ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
             return PromptDelivery(accepted=True)
-        if before.phase is not Phase.FINISHED and not (
-            allow_blocked and before.phase is Phase.BLOCKED
+        if (
+            before.phase is not Phase.FINISHED
+            and not (allow_blocked and before.phase is Phase.BLOCKED)
+            and not (
+                allow_active
+                and before.phase in (Phase.THINKING, Phase.RESPONDING)
+            )
         ):
             return PromptDelivery(
                 accepted=before.phase in (Phase.THINKING, Phase.RESPONDING)
@@ -301,7 +314,10 @@ class RelayChatGPTPage:
         try:
             result = self.protocol.evaluate(
                 self.session_id,
-                _build_submit_expression(prompt),
+                _build_submit_expression(
+                    prompt,
+                    allow_generation_active=allow_active,
+                ),
                 await_promise=True,
             )
         except RelayCdpError:
@@ -355,6 +371,27 @@ class RelayChatGPTPage:
             acceptance_timeout=acceptance_timeout,
             require_message_id=False,
             allow_blocked=True,
+        ).accepted
+
+    def send_liveness_continue(
+        self,
+        prompt: str,
+        expected_turn_key: tuple[int, str],
+        acceptance_timeout: float = 3.0,
+    ) -> bool:
+        """Send a continuation after verified visible-output liveness timeout.
+
+        Unlike ordinary continuation delivery, this path may submit while the
+        DOM still reports THINKING/RESPONDING. It is intentionally exposed only
+        to the supervisor's one-shot 360s liveness recovery path.
+        """
+        return self._send_prompt(
+            prompt,
+            expected_turn_key,
+            acceptance_timeout=acceptance_timeout,
+            require_message_id=False,
+            allow_blocked=True,
+            allow_active=True,
         ).accepted
 
     def retry_fault(

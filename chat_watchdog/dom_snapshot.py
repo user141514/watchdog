@@ -108,9 +108,19 @@ DOM_SNAPSHOT_JS = r"""
     return (clone.textContent || '').trim();
   };
 
-  const text = contentRoot
+  const contentText = contentRoot
     ? (contentRoot.innerText || contentRoot.textContent || '')
-    : sanitizedTurnText();
+    : '';
+  const fullTurnText = sanitizedTurnText();
+  // Long assistant responses can be rendered as multiple markdown/prose
+  // content blocks. querySelector() intentionally keeps ordinary progress
+  // tracking cheap, but a terminal supervisor marker may live in a later
+  // block. Scan the sanitized whole turn for terminal protocol lines so a
+  // visible NEED_INPUT/DONE marker cannot be lost by first-block selection.
+  const terminalProtocolPattern = /(?:^|\n)(?:SUPERVISOR_DONE|\[SUPERVISOR_STATE\s*:\s*(?:NEED_INPUT|DONE)\])\s*$/i;
+  const text = terminalProtocolPattern.test(fullTurnText)
+    ? fullTurnText
+    : (contentText || fullTurnText);
   const signatureRoot = contentRoot || turn || assistant;
   const htmlLength = signatureRoot ? signatureRoot.innerHTML.length : 0;
   const childCount = signatureRoot ? signatureRoot.childElementCount : 0;

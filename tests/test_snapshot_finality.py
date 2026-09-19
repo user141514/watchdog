@@ -21,8 +21,9 @@ const element = () => ({
   getAttribute: () => null
 });
 const finalButton = element();
-const content = {...element(), innerText: config.final ? 'complete response' : 'partial',
-  textContent: config.final ? 'complete response' : 'partial', innerHTML: '<p>text</p>', childElementCount: 1};
+const contentValue = config.contentText || (config.final ? 'complete response' : 'partial');
+const content = {...element(), innerText: contentValue,
+  textContent: contentValue, innerHTML: '<p>text</p>', childElementCount: 1};
 const assistantTurn = {
   getAttribute(name) {
     if (name === 'data-testid') return 'conversation-turn-4';
@@ -36,6 +37,12 @@ const assistantTurn = {
   },
   querySelectorAll(selector) {
     return selector.includes('turn-action-button') && config.final ? [finalButton] : [];
+  },
+  cloneNode() {
+    return {
+      textContent: config.fullText || contentValue,
+      querySelectorAll() { return []; }
+    };
   }
 };
 const userTurn = {getAttribute: name => name === 'data-testid' ? 'conversation-turn-3' : null};
@@ -110,6 +117,16 @@ class SnapshotFinalityTests(unittest.TestCase):
 
     def test_active_generation_remains_active(self):
         self.assertEqual(self.snapshot(self.payload(final=False, active=True)).phase, Phase.RESPONDING)
+
+    def test_terminal_protocol_marker_can_come_from_later_content_block(self):
+        full = 'first rendered block\nsecond rendered block\n[SUPERVISOR_STATE: NEED_INPUT]'
+        payload = self.payload(
+            final=True,
+            contentText='first rendered block',
+            fullText=full,
+        )
+        self.assertEqual(payload['assistantText'], full)
+        self.assertTrue(payload['assistantText'].endswith('[SUPERVISOR_STATE: NEED_INPUT]'))
 
     def test_persistent_message_ids_replace_dom_position_numbers(self):
         payload = self.payload(final=True)

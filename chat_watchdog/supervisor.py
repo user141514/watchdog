@@ -24,6 +24,8 @@ RECOVERY_PROMPT = (
     "如果只是当前 turn 已结束，触发下一 turn 继续；主 ChatGPT turn 恢复工作后保持退出等待被 watchdog 回收。"
 )
 
+LIVENESS_TIMEOUT_SECONDS = 360.0
+
 
 class PagePort(Protocol):
     def snapshot(self) -> PageSnapshot: ...
@@ -127,10 +129,21 @@ class Supervisor:
             raise ValueError('authoritative state requires managed intent ownership')
         self._intent_client = intent_client
         self._state_client = state_client
-        self._last_progress_key: tuple[tuple[int, str], str, int] | None = None
+        self._last_progress_key: tuple[
+            tuple[int, str],
+            str,
+            int,
+            str,
+        ] | None = None
         self._last_progress_at: float | None = None
+        self._liveness_attempted_for: tuple[
+            tuple[int, str],
+            str,
+            int,
+            str,
+        ] | None = None
         self._pending_reanchor_reason: str | None = None
-        self._human_gate: tuple[tuple[int, str], int, int] | None = None
+        self._human_gate: tuple[str, int] | None = None
         self.should_stop = False
         self.diagnostics: dict[str, object] = {}
 
@@ -240,24 +253,120 @@ class Supervisor:
     def _suspend_for_human(self, snapshot: PageSnapshot) -> None:
         self._close_recovery(reset_failures=True)
         self._human_gate = (
-            snapshot.turn_key,
-            snapshot.assistant_count,
+            snapshot.user_turn_id,
             snapshot.user_count,
+        )
+
+    def _has_authoritative_identity(self, snapshot: PageSnapshot) -> bool:
+        target_url = str(getattr(self._page, "target_url", "") or "")
+        if "/c/" not in target_url:
+            return False
+        assistant_turn_id = snapshot.assistant_turn_id.strip()
+        if snapshot.assistant_count <= 0 or not assistant_turn_id:
+            return False
+        return assistant_turn_id not in {
+            "assistant-0",
+            "invalid-snapshot",
+            "navigated-away",
+            "relay-unavailable",
+        }
+
+    def _verified_progress_key(
+        self,
+        snapshot: PageSnapshot,
+    ) -> tuple[tuple[int, str], str, int, str] | None:
+        if snapshot.send_timeout or snapshot.stream_interrupted:
+            return None
+        if not self._has_authoritative_identity(snapshot):
+            return None
+        return (
+            snapshot.turn_key,
+            snapshot.assistant_text_signature,
+            snapshot.user_count,
+            snapshot.user_turn_id,
+        )
+
+    def _same_liveness_assistant_state(self, snapshot: PageSnapshot) -> bool:
+        if self._liveness_attempted_for is None:
+            return False
+        attempted_turn_key, attempted_signature, _, _ = self._liveness_attempted_for
+        return (
+            snapshot.turn_key == attempted_turn_key
+            and snapshot.assistant_text_signature == attempted_signature
         )
 
     def _observe_progress(self, snapshot: PageSnapshot) -> float:
         now = self._clock()
-        progress_key = (
-            snapshot.turn_key,
-            snapshot.assistant_text_signature,
-            snapshot.user_count,
-        )
-        if progress_key != self._last_progress_key:
+        progress_key = self._verified_progress_key(snapshot)
+        if progress_key is not None and progress_key != self._last_progress_key:
+            if self._same_liveness_assistant_state(snapshot):
+                return now
             self._last_progress_key = progress_key
             self._last_progress_at = now
-        elif self._last_progress_at is None:
-            self._last_progress_at = now
+            self._liveness_attempted_for = None
         return now
+
+    def _liveness_due(self, snapshot: PageSnapshot, *, now: float) -> bool:
+        progress_key = self._verified_progress_key(snapshot)
+        return bool(
+            progress_key is not None
+            and not snapshot.user_turn_pending
+            and snapshot.assistant_text.strip()
+            and progress_key == self._last_progress_key
+            and self._last_progress_at is not None
+            and now - self._last_progress_at >= LIVENESS_TIMEOUT_SECONDS
+            and self._liveness_attempted_for != progress_key
+        )
+
+    def _try_liveness_continue(
+        self,
+        snapshot: PageSnapshot,
+        *,
+        now: float,
+    ) -> StepResult:
+        # Reanchor and authoritative Sidecar modes own their delivery path. A
+        # time threshold is never permission to create a second writer.
+        if self._reanchor is not None:
+            return StepResult.BLOCKED
+
+        progress_key = self._verified_progress_key(snapshot)
+        if not self._liveness_due(snapshot, now=now):
+            return StepResult.BLOCKED
+        assert progress_key is not None
+
+        # Admission/intent ownership still applies. Consume the liveness epoch
+        # before any potentially ambiguous delivery so a lost ACK cannot cause
+        # a timeout resend on the same assistant state.
+        self._liveness_attempted_for = progress_key
+        if self._intent_client is not None:
+            return self._publish_intent(snapshot)
+
+        key = snapshot.turn_key
+        if self._send_admission is not None:
+            target_url = getattr(self._page, "target_url", "")
+            if not target_url:
+                return StepResult.WAITING
+            try:
+                admission = self._send_admission.admit(target_url)
+            except Exception:
+                return StepResult.WAITING
+            if getattr(admission, "admitted", False) is not True:
+                return StepResult.WAITING
+
+        self._direct_attempted.add(key)
+        try:
+            sender = getattr(
+                self._page,
+                "send_liveness_continue",
+                self._page.send_continue,
+            )
+            accepted = sender(CONTINUE_PROMPT, key)
+        except Exception:
+            accepted = False
+        if accepted:
+            self._continued.add(key)
+            return StepResult.CONTINUED
+        return StepResult.BLOCKED
 
     def _publish_intent(self, snapshot, *, kind: str = 'continue', authoritative_state=None) -> StepResult:
         if snapshot.turn_key in self._continued:
@@ -422,15 +531,20 @@ class Supervisor:
         now = self._observe_progress(snapshot)
 
         if self._human_gate is not None:
-            gate_turn_key, gate_assistant_count, gate_user_count = self._human_gate
-            if snapshot.user_count <= gate_user_count:
+            gate_user_turn_id, gate_user_count = self._human_gate
+            if gate_user_turn_id and snapshot.user_turn_id:
+                if snapshot.user_turn_id == gate_user_turn_id:
+                    return StepResult.NEED_INPUT
+            elif snapshot.user_count <= gate_user_count:
+                # Legacy/fallback path when a stable message id is unavailable.
                 return StepResult.NEED_INPUT
-            if (
-                snapshot.assistant_count < gate_assistant_count
-                or snapshot.turn_key == gate_turn_key
-            ):
-                return StepResult.USER_TURN_PENDING
+            # A distinct stable user message is sufficient evidence that the
+            # human has resumed the conversation. DOM virtualization makes
+            # assistant_count/user_count non-monotonic, so never require those
+            # counts to advance before clearing the gate.
             self._human_gate = None
+            if snapshot.user_turn_pending:
+                return StepResult.USER_TURN_PENDING
 
         recovery_closed = False
         if self.recovery_lease is not None and self._conversation_advanced(snapshot):
@@ -440,6 +554,18 @@ class Supervisor:
             self._drop_failed_recovery()
 
         if snapshot.phase in (Phase.THINKING, Phase.RESPONDING):
+            # Human-gate protocol markers preempt liveness recovery even if the
+            # frontend still reports an active generation phase. This is a
+            # fail-closed guard against stale/broken UI generation state after
+            # the assistant has already emitted its terminal NEED_INPUT line.
+            if is_need_input(snapshot.assistant_text):
+                self._suspend_for_human(snapshot)
+                return StepResult.NEED_INPUT
+            if (
+                self._reanchor is None
+                and self._liveness_due(snapshot, now=now)
+            ):
+                return self._try_liveness_continue(snapshot, now=now)
             if (
                 self._reanchor is not None
                 and self._last_progress_at is not None
@@ -453,6 +579,11 @@ class Supervisor:
             self._suspend_for_human(snapshot)
             return StepResult.NEED_INPUT
 
+        if self._reanchor is None and is_done(snapshot.assistant_text):
+            self._close_recovery(reset_failures=True)
+            self.should_stop = True
+            return StepResult.DONE
+
         if snapshot.phase is Phase.BLOCKED:
             if snapshot.interaction_required:
                 return StepResult.NEED_INPUT
@@ -462,6 +593,10 @@ class Supervisor:
             if snapshot.stream_interrupted:
                 self._remember_frontend_fault(snapshot)
                 return self._try_fault_recovery(snapshot)
+            # A BLOCKED turn has already stopped; preserve the upstream
+            # configurable recovery timeout and retry semantics. The fixed
+            # 360-second one-shot liveness path is only for a frontend that
+            # still reports THINKING/RESPONDING while visible output is stale.
             if (
                 snapshot.assistant_text.strip()
                 and self._last_progress_at is not None
@@ -502,6 +637,9 @@ class Supervisor:
             self._close_recovery(reset_failures=True)
             self.should_stop = True
             return StepResult.DONE
+
+        if self._same_liveness_assistant_state(snapshot):
+            return StepResult.ALREADY_HANDLED
 
         direct = self._attempt_direct_continue(snapshot)
         if direct is not None:
