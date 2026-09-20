@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 from urllib.request import urlopen
 
 from .dom_snapshot import DOM_SNAPSHOT_JS
-from .model import DomSignals, PageSnapshot, Phase, PromptDelivery, classify_phase
+from .model import DomSignals, PageSnapshot, Phase, PromptDelivery, TurnKey, classify_phase
 from .relay_cdp import RelayCdpError, RelayCdpProtocol
 
 
@@ -263,7 +263,7 @@ class RelayChatGPTPage:
             thinking_visible=bool(payload.get("thinkingVisible")),
             composer_ready=bool(payload.get("composerReady")),
             composer_has_draft=bool(payload.get("composerHasDraft", False)),
-            assistant_present=int(payload.get("assistantCount", 0)) > 0,
+            assistant_present=bool(payload.get("assistantTurnId")),
             assistant_finalized=bool(payload.get("assistantFinalized", False)),
             user_turn_pending=bool(payload.get("userTurnPending", False)),
             interaction_required=bool(payload.get("interactionRequired", False)),
@@ -272,13 +272,19 @@ class RelayChatGPTPage:
         )
         return PageSnapshot(
             phase=classify_phase(signals),
-            assistant_turn_id=str(payload.get("assistantTurnId", "assistant-0")),
+            assistant_turn_id=str(payload.get("assistantTurnId", "")),
             assistant_text_signature=str(payload.get("assistantTextSignature", "")),
             assistant_text=str(payload.get("assistantText", "")),
             assistant_count=int(payload.get("assistantCount", 0)),
             user_count=int(payload.get("userCount", 0)),
             user_turn_id=str(payload.get("userTurnId", "")),
             user_text=str(payload.get("userText", "")),
+            submission_seq=int(payload.get("submissionSeq", 0)),
+            submission_receipt_seq=int(payload.get("submissionReceiptSeq", 0)),
+            submission_receipt_id=str(payload.get("submissionReceiptId", "")),
+            submission_receipt_text=str(payload.get("submissionReceiptText", "")),
+            trusted_submission_receipt_seq=int(payload.get("trustedSubmissionReceiptSeq", 0)),
+            trusted_submission_receipt_id=str(payload.get("trustedSubmissionReceiptId", "")),
             user_turn_pending=bool(payload.get("userTurnPending", False)),
             interaction_required=bool(payload.get("interactionRequired", False)),
             send_timeout=bool(payload.get("sendTimeout", False)),
@@ -289,7 +295,7 @@ class RelayChatGPTPage:
     def _send_prompt(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
         *,
         acceptance_timeout: float,
         require_message_id: bool,
@@ -298,7 +304,8 @@ class RelayChatGPTPage:
     ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
-            return PromptDelivery(accepted=True)
+            # The caller's precondition changed before we performed an effect.
+            return PromptDelivery(accepted=False, stale=True)
         if (
             before.phase is not Phase.FINISHED
             and not (allow_blocked and before.phase is Phase.BLOCKED)
@@ -307,10 +314,15 @@ class RelayChatGPTPage:
                 and before.phase in (Phase.THINKING, Phase.RESPONDING)
             )
         ):
+            # No effect was attempted. If the page is already active, the
+            # caller's blocked/finished precondition has simply gone stale;
+            # never report this as acceptance of the prompt we did not send.
             return PromptDelivery(
-                accepted=before.phase in (Phase.THINKING, Phase.RESPONDING)
+                accepted=False,
+                stale=before.phase in (Phase.THINKING, Phase.RESPONDING),
             )
 
+        effect_unknown = False
         try:
             result = self.protocol.evaluate(
                 self.session_id,
@@ -321,35 +333,41 @@ class RelayChatGPTPage:
                 await_promise=True,
             )
         except RelayCdpError:
+            # The transport can fail after the browser effect. Reconcile the
+            # causal receipt before deciding; never translate this into a safe
+            # rejection that an upper layer could retry.
+            result = None
+            effect_unknown = True
+        if isinstance(result, Mapping) and result.get("submitted") is not True:
             return PromptDelivery(accepted=False)
-        if not isinstance(result, Mapping) or result.get("submitted") is not True:
-            return PromptDelivery(accepted=False)
+        if not isinstance(result, Mapping):
+            effect_unknown = True
 
+        expected_text = prompt.replace("\r\n", "\n").strip()
+        baseline_receipt_seq = before.submission_receipt_seq
         deadline = time.monotonic() + acceptance_timeout
-        message_id = ""
-        accepted_observed = False
         while time.monotonic() < deadline:
             current = self.snapshot()
+            receipt_text = current.submission_receipt_text.replace("\r\n", "\n").strip()
             if (
-                current.user_count > before.user_count
-                and current.user_turn_id
-                and current.user_turn_id != before.user_turn_id
+                current.submission_receipt_seq > baseline_receipt_seq
+                and current.submission_receipt_id
+                and receipt_text == expected_text
             ):
-                message_id = current.user_turn_id
-            if (
-                current.turn_key != before.turn_key
-                or current.phase in (Phase.THINKING, Phase.RESPONDING)
-            ):
-                accepted_observed = True
-            if accepted_observed and (message_id or not require_message_id):
-                return PromptDelivery(accepted=True, message_id=message_id)
+                return PromptDelivery(
+                    accepted=True,
+                    message_id=current.submission_receipt_id,
+                )
             time.sleep(0.1)
-        return PromptDelivery(accepted=accepted_observed, message_id=message_id)
+        # We know a submit may have happened (explicit submitted=true or a
+        # transport failure with unknown effects), but no causal receipt bound
+        # it to this prompt. Freeze retries and surface uncertainty.
+        return PromptDelivery(accepted=False, uncertain=True)
 
     def send_prompt(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
         acceptance_timeout: float = 3.0,
     ) -> PromptDelivery:
         return self._send_prompt(
@@ -362,23 +380,23 @@ class RelayChatGPTPage:
     def send_continue(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
         acceptance_timeout: float = 3.0,
-    ) -> bool:
+    ) -> PromptDelivery:
         return self._send_prompt(
             prompt,
             expected_turn_key,
             acceptance_timeout=acceptance_timeout,
             require_message_id=False,
             allow_blocked=True,
-        ).accepted
+        )
 
     def send_liveness_continue(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
         acceptance_timeout: float = 3.0,
-    ) -> bool:
+    ) -> PromptDelivery:
         """Send a continuation after verified visible-output liveness timeout.
 
         Unlike ordinary continuation delivery, this path may submit while the
@@ -392,35 +410,39 @@ class RelayChatGPTPage:
             require_message_id=False,
             allow_blocked=True,
             allow_active=True,
-        ).accepted
+        )
 
     def retry_fault(
         self,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
         acceptance_timeout: float = 3.0,
-    ) -> bool:
+    ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
-            return True
+            return PromptDelivery(accepted=False, stale=True)
         if not before.send_timeout and not before.stream_interrupted:
-            return before.phase in (Phase.THINKING, Phase.RESPONDING)
+            return PromptDelivery(
+                accepted=before.phase in (Phase.THINKING, Phase.RESPONDING)
+            )
         try:
             result = self.protocol.evaluate(
                 self.session_id,
                 _build_retry_fault_expression(),
             )
         except RelayCdpError:
-            return False
-        if not isinstance(result, Mapping) or result.get("retried") is not True:
-            return False
+            return PromptDelivery(accepted=False, uncertain=True)
+        if not isinstance(result, Mapping):
+            return PromptDelivery(accepted=False, uncertain=True)
+        if result.get("retried") is not True:
+            return PromptDelivery(accepted=False)
 
         deadline = time.monotonic() + acceptance_timeout
         while time.monotonic() < deadline:
             current = self.snapshot()
-            if current.turn_key != before.turn_key or current.phase in (Phase.THINKING, Phase.RESPONDING):
-                return True
+            if current.phase in (Phase.THINKING, Phase.RESPONDING):
+                return PromptDelivery(accepted=True)
             time.sleep(0.1)
-        return False
+        return PromptDelivery(accepted=False, uncertain=True)
 
     def close(self) -> None:
         close = getattr(self.socket, "close", None)

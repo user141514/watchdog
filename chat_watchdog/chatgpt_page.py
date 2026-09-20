@@ -52,7 +52,9 @@ def select_unique_page(pages: Iterable[P], match_url: str) -> P:
 
 
 def continuation_was_accepted(before: PageSnapshot, current: PageSnapshot) -> bool:
+    if current.user_turn_id and current.user_turn_id != before.user_turn_id:
+        return True
     return (
-        current.turn_key != before.turn_key
-        or current.phase in (Phase.THINKING, Phase.RESPONDING)
+        before.phase not in (Phase.THINKING, Phase.RESPONDING)
+        and current.phase in (Phase.THINKING, Phase.RESPONDING)
     )

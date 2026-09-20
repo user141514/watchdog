@@ -56,6 +56,9 @@ class BlockedRelayContinueTests(unittest.TestCase):
             assistant_count=7,
             user_count=4,
             user_turn_id="user-4",
+            submission_receipt_seq=1,
+            submission_receipt_id="user-4",
+            submission_receipt_text="continue",
         )
         snapshots = iter([before, after])
         page.snapshot = lambda: next(snapshots)
@@ -64,7 +67,175 @@ class BlockedRelayContinueTests(unittest.TestCase):
         self.assertEqual(protocol.evaluate_calls, 1)
         self.assertIn("const allowGenerationActive = true;", protocol.expressions[0])
 
-    def test_ordinary_continue_still_does_not_submit_during_active_generation(self) -> None:
+    def test_send_prompt_accepts_new_user_message_id_despite_virtualized_counts(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.FINISHED,
+            assistant_turn_id="assistant-old",
+            assistant_text_signature="stable-output",
+            assistant_text="finished",
+            assistant_count=17,
+            user_count=17,
+            user_turn_id="user-old",
+        )
+        after = PageSnapshot(
+            phase=Phase.THINKING,
+            assistant_turn_id="assistant-old",
+            assistant_text_signature="stable-output",
+            assistant_text="finished",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_turn_pending=True,
+            submission_receipt_seq=1,
+            submission_receipt_id="user-new",
+            submission_receipt_text="new prompt",
+        )
+        page.snapshot = lambda: before if protocol.evaluate_calls == 0 else after
+
+        delivery = page.send_prompt("new prompt", before.turn_key, acceptance_timeout=0.2)
+        self.assertTrue(delivery.accepted)
+        self.assertEqual(delivery.message_id, "user-new")
+        self.assertEqual(protocol.evaluate_calls, 1)
+
+    def test_reordered_user_id_without_submission_receipt_is_uncertain_not_accepted(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.FINISHED,
+            assistant_turn_id="assistant-current",
+            assistant_text_signature="sig-current",
+            assistant_text="done",
+            assistant_count=17,
+            user_count=17,
+            user_turn_id="user-current",
+            submission_receipt_seq=7,
+        )
+        reordered = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-older",
+            assistant_text_signature="sig-older",
+            assistant_text="older",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-older",
+            user_turn_pending=True,
+            submission_receipt_seq=7,
+        )
+        page.snapshot = lambda: before if protocol.evaluate_calls == 0 else reordered
+
+        delivery = page.send_prompt("new prompt", before.turn_key, acceptance_timeout=0.02)
+        self.assertFalse(delivery.accepted)
+        self.assertTrue(delivery.uncertain)
+        self.assertEqual(delivery.message_id, "")
+        self.assertEqual(protocol.evaluate_calls, 1)
+
+    def test_submission_receipt_acknowledges_exact_prompt_delivery(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.FINISHED,
+            assistant_turn_id="assistant-current",
+            assistant_text_signature="sig-current",
+            assistant_text="done",
+            assistant_count=1,
+            user_count=1,
+            user_turn_id="user-current",
+            submission_receipt_seq=7,
+        )
+        after = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-current",
+            assistant_text_signature="sig-current",
+            assistant_text="done",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_turn_pending=True,
+            submission_receipt_seq=8,
+            submission_receipt_id="user-new",
+            submission_receipt_text="new prompt",
+        )
+        page.snapshot = lambda: before if protocol.evaluate_calls == 0 else after
+
+        delivery = page.send_prompt("new prompt", before.turn_key, acceptance_timeout=0.2)
+        self.assertTrue(delivery.accepted)
+        self.assertFalse(delivery.uncertain)
+        self.assertEqual(delivery.message_id, "user-new")
+
+    def test_liveness_active_to_same_active_state_is_not_delivery_ack(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        active = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-stable",
+            assistant_text_signature="stable-output",
+            assistant_text="still generating but unchanged",
+            assistant_count=1,
+            user_count=1,
+            user_turn_id="user-stable",
+        )
+        page.snapshot = lambda: active
+
+        self.assertFalse(page.send_liveness_continue("continue", active.turn_key, acceptance_timeout=0.02))
+        self.assertEqual(protocol.evaluate_calls, 1)
+
+    def test_pre_send_turn_mismatch_is_stale_not_accepted(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        current = PageSnapshot(
+            phase=Phase.FINISHED,
+            assistant_turn_id="assistant-other",
+            assistant_text_signature="sig-other",
+            assistant_text="other visible turn",
+            assistant_count=1,
+            user_count=1,
+            user_turn_id="user-other",
+        )
+        page.snapshot = lambda: current
+
+        delivery = page.send_prompt("new prompt", "assistant-expected", acceptance_timeout=0.02)
+        self.assertFalse(delivery.accepted)
+        self.assertEqual(delivery.message_id, "")
+        self.assertEqual(protocol.evaluate_calls, 0)
+
+    def test_ordinary_continue_active_race_is_stale_not_accepted(self) -> None:
         protocol = FakeProtocol()
         page = RelayChatGPTPage(
             target_id="page-1",
@@ -85,7 +256,10 @@ class BlockedRelayContinueTests(unittest.TestCase):
         )
         page.snapshot = lambda: active
 
-        self.assertTrue(page.send_continue("continue", active.turn_key, acceptance_timeout=0.2))
+        delivery = page.send_continue("continue", active.turn_key, acceptance_timeout=0.2)
+        self.assertFalse(delivery.accepted)
+        self.assertTrue(delivery.stale)
+        self.assertFalse(delivery.uncertain)
         self.assertEqual(protocol.evaluate_calls, 0)
 
     def test_send_continue_runs_dom_guard_for_blocked_snapshot(self) -> None:
@@ -107,6 +281,9 @@ class BlockedRelayContinueTests(unittest.TestCase):
             assistant_count=7,
             user_count=4,
             user_turn_id="user-4",
+            submission_receipt_seq=1,
+            submission_receipt_id="user-4",
+            submission_receipt_text="continue",
         )
         snapshots = iter([before, after])
         page.snapshot = lambda: next(snapshots)

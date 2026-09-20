@@ -26,6 +26,7 @@ const content = {...element(), innerText: contentValue,
   textContent: contentValue, innerHTML: '<p>text</p>', childElementCount: 1};
 const assistantTurn = {
   getAttribute(name) {
+    if (config.noStableIds) return null;
     if (name === 'data-testid') return 'conversation-turn-4';
     if (name === 'data-turn-id') return config.final && !config.provisional ? 'persisted-turn-uuid' : 'request-WEB:pending';
     return null;
@@ -45,13 +46,13 @@ const assistantTurn = {
     };
   }
 };
-const userTurn = {getAttribute: name => name === 'data-testid' ? 'conversation-turn-3' : null};
-const pendingUser = {getAttribute: name => name === 'data-message-id' ? 'pending-user-message-uuid' : null,
+const userTurn = {getAttribute: name => !config.noStableIds && name === 'data-testid' ? 'conversation-turn-3' : null};
+const pendingUser = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'pending-user-message-uuid' : null,
   closest: () => userTurn, innerText: 'new coordinator prompt', textContent: 'new coordinator prompt'};
-const assistant = {getAttribute: name => name === 'data-message-id' ? 'assistant-message-uuid' : null,
+const assistant = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'assistant-message-uuid' : null,
   closest: () => assistantTurn,
   compareDocumentPosition(other) { return config.pendingUser && other === pendingUser ? 4 : 0; }};
-const user = {getAttribute: name => name === 'data-message-id' ? 'user-message-uuid' : null,
+const user = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'user-message-uuid' : null,
   closest: () => userTurn, innerText: 'fixture prompt', textContent: 'fixture prompt'};
 const composer = {...element(), innerText: '', textContent: ''};
 const context = {
@@ -118,6 +119,23 @@ class SnapshotFinalityTests(unittest.TestCase):
     def test_active_generation_remains_active(self):
         self.assertEqual(self.snapshot(self.payload(final=False, active=True)).phase, Phase.RESPONDING)
 
+    def test_liveness_signature_tracks_later_content_blocks(self):
+        first = self.payload(
+            final=False,
+            active=True,
+            contentText='first rendered block',
+            fullText='first rendered block\nsecond block v1',
+        )
+        second = self.payload(
+            final=False,
+            active=True,
+            contentText='first rendered block',
+            fullText='first rendered block\nsecond block v2 expanded',
+        )
+        self.assertEqual(first['assistantText'], 'first rendered block')
+        self.assertEqual(second['assistantText'], 'first rendered block')
+        self.assertNotEqual(first['assistantTextSignature'], second['assistantTextSignature'])
+
     def test_terminal_protocol_marker_can_come_from_later_content_block(self):
         full = 'first rendered block\nsecond rendered block\n[SUPERVISOR_STATE: NEED_INPUT]'
         payload = self.payload(
@@ -132,6 +150,32 @@ class SnapshotFinalityTests(unittest.TestCase):
         payload = self.payload(final=True)
         self.assertEqual(payload['assistantTurnId'], 'assistant-message-uuid')
         self.assertEqual(payload['userTurnId'], 'user-message-uuid')
+
+    def test_missing_stable_message_identity_never_falls_back_to_dom_counts(self):
+        payload = self.payload(final=True, noStableIds=True)
+        self.assertEqual(payload['assistantTurnId'], '')
+        self.assertEqual(payload['userTurnId'], '')
+        self.assertEqual(self.snapshot(payload).phase, Phase.BLOCKED)
+
+    def test_stable_data_turn_id_remains_a_compatible_identity_fallback(self):
+        payload = self.payload(final=True, noMessageIds=True)
+        self.assertEqual(payload['assistantTurnId'], 'persisted-turn-uuid')
+        self.assertEqual(payload['userTurnId'], '')
+        self.assertEqual(self.snapshot(payload).phase, Phase.FINISHED)
+
+    def test_positional_or_provisional_container_ids_are_not_semantic_identity(self):
+        payload = self.payload(final=True, noMessageIds=True, provisional=True)
+        self.assertEqual(payload['assistantTurnId'], '')
+        self.assertEqual(payload['userTurnId'], '')
+        self.assertEqual(self.snapshot(payload).phase, Phase.BLOCKED)
+
+    def test_turn_key_is_stable_when_virtualized_dom_counts_change(self):
+        before = self.snapshot(self.payload(final=True))
+        after_payload = self.payload(final=True)
+        after_payload['assistantCount'] = 1
+        after_payload['userCount'] = 2
+        after = self.snapshot(after_payload)
+        self.assertEqual(before.turn_key, after.turn_key)
 
 
 if __name__ == '__main__':

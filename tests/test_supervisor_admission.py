@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from chat_watchdog.model import PageSnapshot, Phase
+from chat_watchdog.model import PageSnapshot, Phase, TurnKey
 from chat_watchdog.supervisor import StepResult, Supervisor
 
 
@@ -38,11 +38,11 @@ class FakePage:
             fault_text="frontend delivery fault" if faulted else "",
         )
 
-    def send_continue(self, prompt: str, expected_turn_key: tuple[int, str]) -> bool:
+    def send_continue(self, prompt: str, expected_turn_key: TurnKey) -> bool:
         self.sent += 1
         return self.send_result
 
-    def retry_fault(self, expected_turn_key: tuple[int, str]) -> bool:
+    def retry_fault(self, expected_turn_key: TurnKey) -> bool:
         self.retried += 1
         return self.retry_result
 
@@ -86,7 +86,7 @@ class SupervisorAdmissionTests(unittest.TestCase):
         admission = Admission(admitted=True)
         supervisor = Supervisor(page, agents, send_admission=admission)
         supervisor.recovery_lease = FakeLease()
-        supervisor._recovery_baseline = (page.snapshot().turn_key, page.snapshot().user_count)
+        supervisor._recovery_baseline = (page.snapshot().submission_receipt_seq, page.snapshot().assistant_turn_id)
 
         self.assertEqual(supervisor.step(), StepResult.RECOVERY_RUNNING)
         self.assertEqual(admission.calls, [])

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from chat_watchdog.model import PageSnapshot, Phase
+from chat_watchdog.model import PageSnapshot, Phase, TurnKey
 from chat_watchdog.supervisor import CONTINUE_PROMPT, StepResult, Supervisor
 
 
@@ -19,13 +19,13 @@ class FakePage:
 
     def __init__(self, snapshot: PageSnapshot, outcomes: list[bool] | None = None) -> None:
         self.current = snapshot
-        self.sent: list[tuple[str, tuple[int, str]]] = []
+        self.sent: list[tuple[str, TurnKey]] = []
         self.outcomes = None if outcomes is None else list(outcomes)
 
     def snapshot(self) -> PageSnapshot:
         return self.current
 
-    def send_continue(self, prompt: str, expected_turn_key: tuple[int, str]) -> bool:
+    def send_continue(self, prompt: str, expected_turn_key: TurnKey) -> bool:
         self.sent.append((prompt, expected_turn_key))
         if self.outcomes is None:
             return True
@@ -168,6 +168,30 @@ class BlockedRecoveryTests(unittest.TestCase):
                 self.assertEqual(supervisor.step(), expected)
                 self.assertEqual(page.sent, [])
 
+    def test_identity_loss_after_prior_progress_never_reuses_old_liveness_time(self) -> None:
+        clock = FakeClock()
+        page = FakePage(active_snapshot(
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+            signature="sig-stable",
+        ))
+        supervisor = Supervisor(page, NoAgentPool(), recovery_timeout_seconds=120.0, clock=clock)
+
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        self.assertIsNotNone(supervisor._last_progress_at)
+
+        clock.now = 500.0
+        page.current = blocked_snapshot(
+            assistant_turn_id="",
+            user_turn_id="",
+            assistant_count=1,
+            user_count=1,
+            signature="missing-identity",
+            text="visible stale body",
+        )
+        self.assertEqual(supervisor.step(), StepResult.BLOCKED)
+        self.assertEqual(page.sent, [])
+
     def test_empty_or_invalid_identity_never_auto_continues(self) -> None:
         cases = (
             blocked_snapshot(text=""),
@@ -229,6 +253,162 @@ class BlockedRecoveryTests(unittest.TestCase):
         clock.now = 1200.0
         self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
         self.assertEqual(page.sent, [])
+
+    def test_identity_observation_gap_restarts_liveness_window(self) -> None:
+        clock = FakeClock()
+        page = FakePage(active_snapshot(
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+            signature="sig-stable",
+        ))
+        supervisor = Supervisor(page, NoAgentPool(), clock=clock)
+
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        clock.now = 200.0
+        page.current = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="",
+            assistant_text_signature="",
+            assistant_text="",
+            assistant_count=0,
+            user_count=0,
+            user_turn_id="",
+        )
+        self.assertEqual(supervisor.step(), StepResult.BLOCKED)
+
+        clock.now = 500.0
+        page.current = active_snapshot(
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+            signature="sig-stable",
+        )
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        self.assertEqual(page.sent, [])
+
+        clock.now = 860.0
+        self.assertEqual(supervisor.step(), StepResult.CONTINUED)
+        self.assertEqual(len(page.sent), 1)
+
+    def test_dom_count_virtualization_does_not_reset_liveness_deadline(self) -> None:
+        clock = FakeClock()
+        page = FakePage(active_snapshot(
+            assistant_count=17,
+            user_count=17,
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+            signature="sig-stable",
+        ))
+        supervisor = Supervisor(page, NoAgentPool(), clock=clock)
+
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        clock.now = 359.0
+        page.current = active_snapshot(
+            assistant_count=1,
+            user_count=2,
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+            signature="sig-stable",
+        )
+        self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        self.assertEqual(page.sent, [])
+
+        clock.now = 360.0
+        self.assertEqual(supervisor.step(), StepResult.CONTINUED)
+        self.assertEqual(len(page.sent), 1)
+
+    def test_recovery_advancement_requires_post_baseline_submission_receipt(self) -> None:
+        page = FakePage(active_snapshot(
+            assistant_turn_id="assistant-current",
+            user_turn_id="user-current",
+        ))
+        supervisor = Supervisor(page, NoAgentPool())
+        supervisor._recovery_baseline = (10, "assistant-current")
+
+        reordered_pending = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-older",
+            assistant_text_signature="older",
+            assistant_text="older assistant",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-older",
+            user_turn_pending=True,
+            submission_receipt_seq=10,
+        )
+        self.assertFalse(supervisor._conversation_advanced(reordered_pending))
+
+        causal_pending = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-current",
+            assistant_text_signature="pending",
+            assistant_text="",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_turn_pending=True,
+            submission_receipt_seq=11,
+            submission_receipt_id="user-new",
+            submission_receipt_text="recovery prompt",
+        )
+        self.assertTrue(supervisor._conversation_advanced(causal_pending))
+
+    def test_finished_reordered_identity_does_not_close_recovery(self) -> None:
+        page = FakePage(active_snapshot(
+            assistant_turn_id="assistant-current",
+            user_turn_id="user-current",
+        ))
+        supervisor = Supervisor(page, NoAgentPool())
+        supervisor._recovery_baseline = (0, "assistant-current")
+
+        reordered = PageSnapshot(
+            phase=Phase.FINISHED,
+            assistant_turn_id="assistant-older",
+            assistant_text_signature="older",
+            assistant_text="older finished content",
+            assistant_count=1,
+            user_count=1,
+            user_turn_id="user-older",
+        )
+        self.assertFalse(supervisor._conversation_advanced(reordered))
+
+    def test_recovery_advancement_ignores_dom_count_changes(self) -> None:
+        page = FakePage(active_snapshot(
+            assistant_count=17,
+            user_count=17,
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+        ))
+        supervisor = Supervisor(page, NoAgentPool())
+        supervisor._recovery_baseline = (0, "assistant-stable")
+
+        virtualized = active_snapshot(
+            assistant_count=1,
+            user_count=2,
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-stable",
+        )
+        self.assertFalse(supervisor._conversation_advanced(virtualized))
+        self.assertFalse(supervisor._conversation_advanced(active_snapshot(
+            assistant_count=1,
+            user_count=2,
+            assistant_turn_id="assistant-new",
+            user_turn_id="user-stable",
+        )))
+        causal = active_snapshot(
+            assistant_count=1,
+            user_count=2,
+            assistant_turn_id="assistant-stable",
+            user_turn_id="user-new",
+        )
+        causal = PageSnapshot(
+            **{
+                **causal.__dict__,
+                "submission_receipt_seq": 1,
+                "submission_receipt_id": "user-new",
+                "submission_receipt_text": "recovery prompt",
+            }
+        )
+        self.assertTrue(supervisor._conversation_advanced(causal))
 
     def test_active_assistant_progress_resets_liveness_deadline(self) -> None:
         clock = FakeClock()

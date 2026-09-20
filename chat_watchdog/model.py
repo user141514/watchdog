@@ -5,6 +5,9 @@ from enum import Enum
 import re
 
 
+TurnKey = str
+
+
 class Phase(str, Enum):
     THINKING = "thinking"
     RESPONDING = "responding"
@@ -37,6 +40,12 @@ class PageSnapshot:
     user_count: int
     user_turn_id: str = ""
     user_text: str = ""
+    submission_seq: int = 0
+    submission_receipt_seq: int = 0
+    submission_receipt_id: str = ""
+    submission_receipt_text: str = ""
+    trusted_submission_receipt_seq: int = 0
+    trusted_submission_receipt_id: str = ""
     user_turn_pending: bool = False
     interaction_required: bool = False
     send_timeout: bool = False
@@ -44,17 +53,24 @@ class PageSnapshot:
     fault_text: str = ""
 
     @property
-    def turn_key(self) -> tuple[int, str]:
-        return (
-            self.assistant_count,
-            self.assistant_turn_id,
-        )
+    def turn_key(self) -> TurnKey:
+        """Stable assistant-turn identity used by semantic control paths.
+
+        DOM message cardinality is viewport metadata: ChatGPT virtualizes old
+        turns, so assistant_count/user_count are deliberately excluded.
+        """
+        return self.assistant_turn_id
 
 
 @dataclass(frozen=True)
 class PromptDelivery:
     accepted: bool
     message_id: str = ""
+    stale: bool = False
+    uncertain: bool = False
+
+    def __bool__(self) -> bool:
+        return self.accepted
 
 
 def classify_phase(signals: DomSignals) -> Phase:

@@ -8,7 +8,7 @@ from pathlib import Path
 import subprocess
 from typing import Mapping, Protocol
 
-from .model import PageSnapshot, PromptDelivery
+from .model import PageSnapshot, Phase, PromptDelivery, TurnKey
 
 
 class ReanchorBridgeError(RuntimeError):
@@ -36,7 +36,7 @@ class ReanchorPagePort(Protocol):
     def send_prompt(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
+        expected_turn_key: TurnKey,
     ) -> PromptDelivery: ...
 
 
@@ -255,7 +255,7 @@ class ReanchorBridge:
             return None
         if snapshot.user_turn_id != message_id:
             return None
-        if snapshot.assistant_count < snapshot.user_count:
+        if snapshot.user_turn_pending or snapshot.phase is not Phase.FINISHED:
             return None
         if not snapshot.assistant_turn_id or not snapshot.assistant_text.strip():
             return None

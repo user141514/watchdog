@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 
 from chat_watchdog.cli import _SupervisorWatcher
-from chat_watchdog.model import PageSnapshot, Phase, is_need_input
+from chat_watchdog.model import PageSnapshot, Phase, TurnKey, is_need_input
 from chat_watchdog.supervisor import CONTINUE_PROMPT, StepResult, Supervisor
 
 
@@ -17,7 +17,7 @@ class FakePage:
     def snapshot(self) -> PageSnapshot:
         return self.current
 
-    def send_continue(self, prompt: str, expected_turn_key: tuple[int, str]) -> bool:
+    def send_continue(self, prompt: str, expected_turn_key: TurnKey) -> bool:
         self.sent += 1
         return True
 
@@ -50,6 +50,8 @@ def finished(
     turn_id: str = "assistant-1",
     user_turn_id: str = "user-1",
     user_turn_pending: bool = False,
+    trusted_submission_receipt_seq: int = 0,
+    trusted_submission_receipt_id: str = "",
 ) -> PageSnapshot:
     return PageSnapshot(
         phase=Phase.FINISHED,
@@ -60,6 +62,8 @@ def finished(
         user_count=user_count,
         user_turn_id=user_turn_id,
         user_turn_pending=user_turn_pending,
+        trusted_submission_receipt_seq=trusted_submission_receipt_seq,
+        trusted_submission_receipt_id=trusted_submission_receipt_id,
     )
 
 
@@ -158,6 +162,8 @@ class HumanGateTests(unittest.TestCase):
             user_count=2,
             user_turn_id="user-new",
             user_text="I am back",
+            trusted_submission_receipt_seq=1,
+            trusted_submission_receipt_id="user-new",
             user_turn_pending=True,
         )
         self.assertEqual(supervisor.step(), StepResult.USER_TURN_PENDING)
@@ -175,6 +181,69 @@ class HumanGateTests(unittest.TestCase):
             user_turn_pending=False,
         )
         self.assertEqual(supervisor.step(), StepResult.ACTIVE)
+        self.assertEqual(page.sent, 0)
+
+    def test_human_gate_requires_post_gate_trusted_submission_receipt(self) -> None:
+        page = FakePage(finished(
+            text="Choose backend.\n[SUPERVISOR_STATE: NEED_INPUT]",
+            turn_id="assistant-current",
+            user_turn_id="user-current",
+        ))
+        page.current = PageSnapshot(
+            **{**page.current.__dict__, "trusted_submission_receipt_seq": 10}
+        )
+        supervisor = Supervisor(page, FakeAgentPool(), send_admission=FakeAdmission())
+        self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
+
+        # A reordered virtualized window can expose different stable IDs and
+        # pending state without any real user submission after the gate.
+        page.current = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-older",
+            assistant_text_signature="older",
+            assistant_text="older assistant",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-older",
+            user_turn_pending=True,
+            trusted_submission_receipt_seq=10,
+        )
+        self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
+
+        # Only a trusted submit receipt created after the gate can release it.
+        page.current = PageSnapshot(
+            phase=Phase.BLOCKED,
+            assistant_turn_id="assistant-current",
+            assistant_text_signature="pending",
+            assistant_text="",
+            assistant_count=1,
+            user_count=2,
+            user_turn_id="user-new",
+            user_turn_pending=True,
+            submission_receipt_seq=11,
+            submission_receipt_id="user-new",
+            submission_receipt_text="I am back",
+            trusted_submission_receipt_seq=11,
+            trusted_submission_receipt_id="user-new",
+        )
+        self.assertEqual(supervisor.step(), StepResult.USER_TURN_PENDING)
+
+    def test_finished_reordered_identity_does_not_release_human_gate(self) -> None:
+        page = FakePage(finished(
+            text="Choose backend.\n[SUPERVISOR_STATE: NEED_INPUT]",
+            turn_id="assistant-current",
+            user_turn_id="user-current",
+        ))
+        supervisor = Supervisor(page, FakeAgentPool(), send_admission=FakeAdmission())
+        self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
+
+        page.current = finished(
+            text="SUPERVISOR_DONE",
+            turn_id="assistant-older",
+            user_turn_id="user-older",
+        )
+        self.assertEqual(supervisor.step(), StepResult.NEED_INPUT)
+        self.assertFalse(supervisor.should_stop)
         self.assertEqual(page.sent, 0)
 
     def test_dom_interaction_gate_resumes_only_after_external_ui_state_changes(self) -> None:
@@ -206,6 +275,8 @@ class HumanGateTests(unittest.TestCase):
             turn_id="assistant-1",
             user_turn_id="user-2",
             user_turn_pending=True,
+            trusted_submission_receipt_seq=1,
+            trusted_submission_receipt_id="user-2",
         )
         self.assertEqual(supervisor.step(), StepResult.USER_TURN_PENDING)
         self.assertEqual(page.sent, 0)

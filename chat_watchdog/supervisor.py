@@ -6,7 +6,7 @@ import time
 from typing import Collection, Protocol
 
 from .agent_runner import AgentLease
-from .model import PageSnapshot, Phase, is_done, is_need_input
+from .model import PageSnapshot, Phase, PromptDelivery, TurnKey, is_done, is_need_input
 from .reanchor_bridge import ReanchorBridgeError, ReanchorOutcome
 from .state_client import StateProtocolError, StateUnavailable
 
@@ -33,10 +33,10 @@ class PagePort(Protocol):
     def send_continue(
         self,
         prompt: str,
-        expected_turn_key: tuple[int, str],
-    ) -> bool: ...
+        expected_turn_key: TurnKey,
+    ) -> bool | PromptDelivery: ...
 
-    def retry_fault(self, expected_turn_key: tuple[int, str]) -> bool: ...
+    def retry_fault(self, expected_turn_key: TurnKey) -> bool | PromptDelivery: ...
 
 
 class ReanchorPort(Protocol):
@@ -88,12 +88,10 @@ class StepResult(str, Enum):
 class _AuthoritativeIntentSnapshot:
     user_turn_id: str
     assistant_turn_id: str
-    assistant_count: int = 0
-    user_count: int = 0
 
     @property
-    def turn_key(self) -> tuple[int, str]:
-        return (0, self.assistant_turn_id)
+    def turn_key(self) -> TurnKey:
+        return self.assistant_turn_id
 
 
 class Supervisor:
@@ -112,10 +110,10 @@ class Supervisor:
     ) -> None:
         self._page = page
         self._agent_pool = agent_pool
-        self._direct_attempted: set[tuple[int, str]] = set()
-        self._continued: set[tuple[int, str]] = set()
+        self._direct_attempted: set[TurnKey] = set()
+        self._continued: set[TurnKey] = set()
         self.recovery_lease: AgentLease | None = None
-        self._recovery_baseline: tuple[tuple[int, str], int] | None = None
+        self._recovery_baseline: tuple[int, str] | None = None
         self._recovery_started_at: float | None = None
         self._failed_recovery_agents: set[str] = set()
         self._recovery_timeout_seconds = recovery_timeout_seconds
@@ -129,29 +127,25 @@ class Supervisor:
             raise ValueError('authoritative state requires managed intent ownership')
         self._intent_client = intent_client
         self._state_client = state_client
-        self._last_progress_key: tuple[
-            tuple[int, str],
-            str,
-            int,
-            str,
-        ] | None = None
+        self._last_progress_key: tuple[TurnKey, str] | None = None
         self._last_progress_at: float | None = None
-        self._liveness_attempted_for: tuple[
-            tuple[int, str],
-            str,
-            int,
-            str,
-        ] | None = None
+        self._liveness_attempted_for: tuple[TurnKey, str] | None = None
         self._pending_reanchor_reason: str | None = None
-        self._human_gate: tuple[str, int] | None = None
+        self._human_gate: tuple[int, str, str] | None = None
         self.should_stop = False
         self.diagnostics: dict[str, object] = {}
 
     def _conversation_advanced(self, snapshot: PageSnapshot) -> bool:
         if self._recovery_baseline is None:
             return False
-        turn_key, user_count = self._recovery_baseline
-        return snapshot.turn_key != turn_key or snapshot.user_count > user_count
+        baseline_receipt_seq, _baseline_assistant_id = self._recovery_baseline
+        # A causal submission receipt is created only from a send UI event that
+        # occurred after the baseline and was then bound to a newly mounted
+        # stable user message. Mounted-tail ID inequality alone is never order.
+        return bool(
+            snapshot.submission_receipt_seq > baseline_receipt_seq
+            and snapshot.submission_receipt_id
+        )
 
     def _close_recovery(self, *, reset_failures: bool) -> None:
         if self.recovery_lease is not None:
@@ -203,9 +197,22 @@ class Supervisor:
             self._failed_recovery_agents.clear()
             return StepResult.RECOVERY_UNAVAILABLE
         self.recovery_lease = lease
-        self._recovery_baseline = (snapshot.turn_key, snapshot.user_count)
+        self._recovery_baseline = (
+            snapshot.submission_receipt_seq,
+            snapshot.assistant_turn_id,
+        )
         self._recovery_started_at = self._clock()
         return StepResult.RECOVERY_STARTED
+
+    @staticmethod
+    def _delivery_status(value: bool | PromptDelivery) -> str:
+        if isinstance(value, PromptDelivery):
+            if value.uncertain:
+                return "uncertain"
+            if value.stale:
+                return "stale"
+            return "accepted" if value.accepted else "rejected"
+        return "accepted" if value else "rejected"
 
     def _remember_frontend_fault(self, snapshot: PageSnapshot) -> None:
         if self._reanchor is None:
@@ -237,12 +244,17 @@ class Supervisor:
         retry_fault = getattr(self._page, "retry_fault", None)
         if callable(retry_fault):
             try:
-                retried = retry_fault(snapshot.turn_key)
+                delivery = retry_fault(snapshot.turn_key)
             except Exception:
-                retried = False
-            if retried:
+                delivery = False
+            status = self._delivery_status(delivery)
+            if status == "accepted":
                 self._continued.add(snapshot.turn_key)
                 return StepResult.CONTINUED
+            if status == "uncertain":
+                return StepResult.DELIVERY_UNCERTAIN
+            if status == "stale":
+                return StepResult.WAITING
             if self._send_admission is not None:
                 return StepResult.BLOCKED
         elif self._send_admission is not None:
@@ -253,8 +265,9 @@ class Supervisor:
     def _suspend_for_human(self, snapshot: PageSnapshot) -> None:
         self._close_recovery(reset_failures=True)
         self._human_gate = (
-            snapshot.user_turn_id,
-            snapshot.user_count,
+            snapshot.trusted_submission_receipt_seq,
+            snapshot.assistant_turn_id.strip(),
+            "",
         )
 
     def _has_authoritative_identity(self, snapshot: PageSnapshot) -> bool:
@@ -262,7 +275,7 @@ class Supervisor:
         if "/c/" not in target_url:
             return False
         assistant_turn_id = snapshot.assistant_turn_id.strip()
-        if snapshot.assistant_count <= 0 or not assistant_turn_id:
+        if not assistant_turn_id:
             return False
         return assistant_turn_id not in {
             "assistant-0",
@@ -274,7 +287,7 @@ class Supervisor:
     def _verified_progress_key(
         self,
         snapshot: PageSnapshot,
-    ) -> tuple[tuple[int, str], str, int, str] | None:
+    ) -> tuple[TurnKey, str] | None:
         if snapshot.send_timeout or snapshot.stream_interrupted:
             return None
         if not self._has_authoritative_identity(snapshot):
@@ -282,14 +295,12 @@ class Supervisor:
         return (
             snapshot.turn_key,
             snapshot.assistant_text_signature,
-            snapshot.user_count,
-            snapshot.user_turn_id,
         )
 
     def _same_liveness_assistant_state(self, snapshot: PageSnapshot) -> bool:
         if self._liveness_attempted_for is None:
             return False
-        attempted_turn_key, attempted_signature, _, _ = self._liveness_attempted_for
+        attempted_turn_key, attempted_signature = self._liveness_attempted_for
         return (
             snapshot.turn_key == attempted_turn_key
             and snapshot.assistant_text_signature == attempted_signature
@@ -298,7 +309,14 @@ class Supervisor:
     def _observe_progress(self, snapshot: PageSnapshot) -> float:
         now = self._clock()
         progress_key = self._verified_progress_key(snapshot)
-        if progress_key is not None and progress_key != self._last_progress_key:
+        if progress_key is None:
+            # Liveness requires one continuous observable identity window. An
+            # identity/fault gap invalidates the previous deadline rather than
+            # letting an old timestamp survive across unobservable progress.
+            self._last_progress_key = None
+            self._last_progress_at = None
+            return now
+        if progress_key != self._last_progress_key:
             if self._same_liveness_assistant_state(snapshot):
                 return now
             self._last_progress_key = progress_key
@@ -360,12 +378,17 @@ class Supervisor:
                 "send_liveness_continue",
                 self._page.send_continue,
             )
-            accepted = sender(CONTINUE_PROMPT, key)
+            delivery = sender(CONTINUE_PROMPT, key)
         except Exception:
-            accepted = False
-        if accepted:
+            delivery = False
+        status = self._delivery_status(delivery)
+        if status == "accepted":
             self._continued.add(key)
             return StepResult.CONTINUED
+        if status == "uncertain":
+            return StepResult.DELIVERY_UNCERTAIN
+        if status == "stale":
+            return StepResult.WAITING
         return StepResult.BLOCKED
 
     def _publish_intent(self, snapshot, *, kind: str = 'continue', authoritative_state=None) -> StepResult:
@@ -508,10 +531,15 @@ class Supervisor:
 
         self._direct_attempted.add(key)
         try:
-            accepted = self._page.send_continue(CONTINUE_PROMPT, key)
+            delivery = self._page.send_continue(CONTINUE_PROMPT, key)
         except Exception:
-            accepted = False
-        if not accepted:
+            delivery = False
+        status = self._delivery_status(delivery)
+        if status == "uncertain":
+            return StepResult.DELIVERY_UNCERTAIN
+        if status == "stale":
+            return StepResult.WAITING
+        if status != "accepted":
             self._direct_attempted.discard(key)
             return StepResult.BLOCKED if self._send_admission is not None else None
 
@@ -531,20 +559,34 @@ class Supervisor:
         now = self._observe_progress(snapshot)
 
         if self._human_gate is not None:
-            gate_user_turn_id, gate_user_count = self._human_gate
-            if gate_user_turn_id and snapshot.user_turn_id:
-                if snapshot.user_turn_id == gate_user_turn_id:
+            baseline_trusted_seq, gate_assistant_turn_id, expected_user_turn_id = self._human_gate
+            if not expected_user_turn_id:
+                if (
+                    snapshot.trusted_submission_receipt_seq <= baseline_trusted_seq
+                    or not snapshot.trusted_submission_receipt_id
+                ):
                     return StepResult.NEED_INPUT
-            elif snapshot.user_count <= gate_user_count:
-                # Legacy/fallback path when a stable message id is unavailable.
-                return StepResult.NEED_INPUT
-            # A distinct stable user message is sufficient evidence that the
-            # human has resumed the conversation. DOM virtualization makes
-            # assistant_count/user_count non-monotonic, so never require those
-            # counts to advance before clearing the gate.
-            self._human_gate = None
+                expected_user_turn_id = snapshot.trusted_submission_receipt_id
+                self._human_gate = (
+                    baseline_trusted_seq,
+                    gate_assistant_turn_id,
+                    expected_user_turn_id,
+                )
+
+            # The trusted receipt proves the human submitted after the gate;
+            # wait until the mounted conversation catches up to that exact user
+            # message and a new assistant turn exists before releasing policy.
+            if snapshot.user_turn_id != expected_user_turn_id:
+                return StepResult.USER_TURN_PENDING
             if snapshot.user_turn_pending:
                 return StepResult.USER_TURN_PENDING
+            current_assistant_turn_id = snapshot.assistant_turn_id.strip()
+            if (
+                not current_assistant_turn_id
+                or current_assistant_turn_id == gate_assistant_turn_id
+            ):
+                return StepResult.USER_TURN_PENDING
+            self._human_gate = None
 
         recovery_closed = False
         if self.recovery_lease is not None and self._conversation_advanced(snapshot):
@@ -598,7 +640,8 @@ class Supervisor:
             # 360-second one-shot liveness path is only for a frontend that
             # still reports THINKING/RESPONDING while visible output is stale.
             if (
-                snapshot.assistant_text.strip()
+                self._has_authoritative_identity(snapshot)
+                and snapshot.assistant_text.strip()
                 and self._last_progress_at is not None
                 and now - self._last_progress_at >= self._recovery_timeout_seconds
             ):

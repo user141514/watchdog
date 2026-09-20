@@ -1,6 +1,6 @@
 import unittest
 
-from chat_watchdog.model import PageSnapshot, Phase
+from chat_watchdog.model import PageSnapshot, Phase, TurnKey
 from chat_watchdog.relay_page import RelayChatGPTPage
 from chat_watchdog.supervisor import StepResult, Supervisor
 
@@ -27,7 +27,7 @@ class FakePage:
     def snapshot(self) -> PageSnapshot:
         return self.current
 
-    def send_continue(self, prompt: str, expected_turn_key: tuple[int, str]) -> bool:
+    def send_continue(self, prompt: str, expected_turn_key: TurnKey) -> bool:
         self.continue_calls += 1
         return self.outcomes.pop(0) if self.outcomes else False
 
@@ -116,6 +116,9 @@ class BlockedRelayContinueTests(unittest.TestCase):
             assistant_count=7,
             user_count=4,
             user_turn_id="user-4",
+            submission_receipt_seq=1,
+            submission_receipt_id="user-4",
+            submission_receipt_text="continue",
         )
         snapshots = iter([before, after])
         page.snapshot = lambda: next(snapshots)

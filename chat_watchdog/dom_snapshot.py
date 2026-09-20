@@ -9,14 +9,136 @@ DOM_SNAPSHOT_JS = r"""
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   };
+  const normalizeText = (value) => String(value || '').replace(/\r\n/g, '\n').trim();
 
-  let assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-  if (!assistants.length) {
-    assistants = Array.from(document.querySelectorAll(
-      '[data-testid^="conversation-turn-"][data-turn="assistant"], article[data-turn="assistant"]'
-    ));
+  // Causal submission receipt. DOM cardinality and mounted-tail identity are
+  // observations, not ordering. Record the UI send event first; only later
+  // bind it to a newly mounted stable user message whose text matches the
+  // submitted composer text and whose id was not mounted before the event.
+  const receiptKey = '__chatWatchdogSubmissionReceiptV1';
+  let submission = window[receiptKey];
+  if (!submission || typeof submission !== 'object') {
+    submission = {
+      seq: 0,
+      pendingSeq: 0,
+      pendingText: '',
+      pendingKnownIds: [],
+      pendingAnchorAssistantId: '',
+      pendingTrusted: false,
+      receiptSeq: 0,
+      receiptId: '',
+      receiptText: '',
+      trustedReceiptSeq: 0,
+      trustedReceiptId: '',
+      lastSignalAt: 0,
+      installed: false,
+    };
+    window[receiptKey] = submission;
   }
-  const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const messageUsers = () => Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const messageAssistants = () => {
+    let nodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll(
+        '[data-testid^="conversation-turn-"][data-turn="assistant"], article[data-turn="assistant"]'
+      ));
+    }
+    return nodes;
+  };
+  const readComposerText = () => {
+    const editor = document.querySelector('#prompt-textarea') ||
+      document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
+      document.querySelector('div[contenteditable="true"]');
+    return editor
+      ? normalizeText(typeof editor.value === 'string' ? editor.value : (editor.innerText || editor.textContent || ''))
+      : '';
+  };
+  const recordSubmission = (trusted) => {
+    const text = readComposerText();
+    if (!text) return;
+    const now = Date.now();
+    if (
+      submission.pendingSeq
+      && submission.pendingText === text
+      && now - Number(submission.lastSignalAt || 0) < 250
+    ) {
+      if (trusted) submission.pendingTrusted = true;
+      submission.lastSignalAt = now;
+      return;
+    }
+    const currentAssistants = messageAssistants();
+    const anchorAssistant = currentAssistants.length
+      ? currentAssistants[currentAssistants.length - 1]
+      : null;
+    const anchorAssistantId = anchorAssistant?.getAttribute?.('data-message-id') || '';
+    // Without an exact stable anchor, the mounted window cannot prove that a
+    // later user node is causally after this submission event. Fail closed.
+    if (!anchorAssistantId) return;
+    submission.seq = Number(submission.seq || 0) + 1;
+    submission.pendingSeq = submission.seq;
+    submission.pendingText = text;
+    submission.pendingKnownIds = messageUsers()
+      .map((node) => node.getAttribute?.('data-message-id') || '')
+      .filter(Boolean);
+    submission.pendingAnchorAssistantId = anchorAssistantId;
+    submission.pendingTrusted = trusted === true;
+    submission.lastSignalAt = now;
+  };
+  if (!submission.installed && typeof document.addEventListener === 'function') {
+    document.addEventListener('click', (event) => {
+      const target = event?.target;
+      const button = target?.closest?.('button') || (target?.tagName === 'BUTTON' ? target : null);
+      if (!button) return;
+      const label = normalizeText(button.getAttribute?.('aria-label') || button.textContent || '').toLowerCase();
+      if (button.getAttribute?.('data-testid') === 'send-button' || label === 'send' || label.includes('send message') || label.includes('发送')) {
+        recordSubmission(event?.isTrusted === true);
+      }
+    }, true);
+    document.addEventListener('keydown', (event) => {
+      if (
+        event?.key !== 'Enter'
+        || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing
+      ) return;
+      const target = event.target;
+      const inComposer = target?.matches?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"]')
+        || target?.closest?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"]');
+      if (inComposer) recordSubmission(event?.isTrusted === true);
+    }, true);
+    submission.installed = true;
+  }
+
+  const assistants = messageAssistants();
+  const users = messageUsers();
+  if (submission.pendingSeq && submission.pendingText && submission.pendingAnchorAssistantId) {
+    const knownIds = new Set(Array.isArray(submission.pendingKnownIds) ? submission.pendingKnownIds : []);
+    const anchorAssistant = assistants.find(
+      (node) => (node.getAttribute?.('data-message-id') || '') === submission.pendingAnchorAssistantId
+    );
+    const receiptNode = anchorAssistant
+      ? [...users].reverse().find((node) => {
+          const id = node.getAttribute?.('data-message-id') || '';
+          const text = normalizeText(node.innerText || node.textContent || '');
+          const followsAnchor = typeof anchorAssistant.compareDocumentPosition === 'function'
+            && (anchorAssistant.compareDocumentPosition(node) & 4) !== 0;
+          return id && !knownIds.has(id) && text === submission.pendingText && followsAnchor;
+        })
+      : null;
+    if (receiptNode) {
+      const id = receiptNode.getAttribute?.('data-message-id') || '';
+      submission.receiptSeq = Number(submission.pendingSeq || 0);
+      submission.receiptId = id;
+      submission.receiptText = submission.pendingText;
+      if (submission.pendingTrusted) {
+        submission.trustedReceiptSeq = submission.receiptSeq;
+        submission.trustedReceiptId = id;
+      }
+      submission.pendingSeq = 0;
+      submission.pendingText = '';
+      submission.pendingKnownIds = [];
+      submission.pendingAnchorAssistantId = '';
+      submission.pendingTrusted = false;
+    }
+  }
   const assistant = assistants.length ? assistants[assistants.length - 1] : null;
   const user = users.length ? users[users.length - 1] : null;
   const userTurnPending = !!(user && (
@@ -121,17 +243,23 @@ DOM_SNAPSHOT_JS = r"""
   const text = terminalProtocolPattern.test(fullTurnText)
     ? fullTurnText
     : (contentText || fullTurnText);
-  const signatureRoot = contentRoot || turn || assistant;
-  const htmlLength = signatureRoot ? signatureRoot.innerHTML.length : 0;
-  const childCount = signatureRoot ? signatureRoot.childElementCount : 0;
-  const tail = text.slice(-160);
-  const signature = `${text.length}:${htmlLength}:${childCount}:${tail}`;
-  const turnId = assistant?.getAttribute('data-message-id') || (turn
-    ? (turn.getAttribute('data-turn-id') || turn.getAttribute('data-testid') || turn.id || `assistant-${assistants.length}`)
-    : 'assistant-0');
-  const userTurnId = user?.getAttribute('data-message-id') || (userTurn
-    ? (userTurn.getAttribute('data-turn-id') || userTurn.getAttribute('data-testid') || userTurn.id || `user-${users.length}`)
-    : 'user-0');
+  // Progress must cover the whole assistant turn. ChatGPT may split a long
+  // response across multiple markdown/prose blocks; tracking only the first
+  // block can falsely look stalled while later blocks are still growing.
+  const signatureText = fullTurnText || text;
+  const signatureRoot = turn || contentRoot || assistant;
+  const htmlLength = signatureRoot ? String(signatureRoot.innerHTML || '').length : 0;
+  const childCount = signatureRoot ? Number(signatureRoot.childElementCount || 0) : 0;
+  const tail = signatureText.slice(-160);
+  const signature = `${signatureText.length}:${htmlLength}:${childCount}:${tail}`;
+  const stableTurnId = (node) => {
+    if (!node) return '';
+    const candidate = (node.getAttribute?.('data-turn-id') || '').trim();
+    if (!candidate || /^request[-_:]/i.test(candidate) || /^conversation-turn-\d+$/i.test(candidate)) return '';
+    return candidate;
+  };
+  const turnId = assistant?.getAttribute('data-message-id') || stableTurnId(turn);
+  const userTurnId = user?.getAttribute('data-message-id') || stableTurnId(userTurn);
   const userText = user
     ? (user.innerText || user.textContent || userTurn?.textContent || '')
     : '';
@@ -155,6 +283,12 @@ DOM_SNAPSHOT_JS = r"""
     userCount: users.length,
     userTurnId,
     userText,
+    submissionSeq: Number(submission.seq || 0),
+    submissionReceiptSeq: Number(submission.receiptSeq || 0),
+    submissionReceiptId: String(submission.receiptId || ''),
+    submissionReceiptText: String(submission.receiptText || ''),
+    trustedSubmissionReceiptSeq: Number(submission.trustedReceiptSeq || 0),
+    trustedSubmissionReceiptId: String(submission.trustedReceiptId || ''),
   };
 }
 """
