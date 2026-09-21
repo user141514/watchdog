@@ -85,6 +85,12 @@ class SubmitGuardTests(unittest.TestCase):
         self.assertEqual(actual['draft'], 'user draft')
         self.assertEqual(actual['clicks'], 0)
 
+    def test_exact_existing_watchdog_draft_is_resumed_and_sent(self):
+        actual = self.run_expression(draft='fixture-only')
+        self.assertTrue(actual['result']['submitted'])
+        self.assertEqual(actual['draft'], 'fixture-only')
+        self.assertEqual(actual['clicks'], 1)
+
     def test_active_generation_is_not_interrupted(self):
         actual = self.run_expression(active=True)
         self.assertEqual(actual['result']['reason'], 'generation-active')

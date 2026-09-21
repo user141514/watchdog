@@ -90,25 +90,31 @@ def _build_submit_expression(
   if (!editor || !visible(editor) || editor.getAttribute('aria-disabled') === 'true') {{
     return {{ submitted: false, reason: 'composer-unavailable' }};
   }}
+  const text = {text};
   const existing = typeof editor.value === 'string'
     ? editor.value
     : (editor.innerText || editor.textContent || '');
-  if (existing.trim()) return {{ submitted: false, reason: 'composer-not-empty' }};
+  const normalizedExisting = existing.replace(/\\r\\n/g, '\\n').trim();
+  const normalizedText = text.replace(/\\r\\n/g, '\\n').trim();
+  if (normalizedExisting && normalizedExisting !== normalizedText) {{
+    return {{ submitted: false, reason: 'composer-not-empty' }};
+  }}
 
-  const text = {text};
-  editor.focus();
-  if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {{
-    const prototype = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
-    const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-    if (setter) setter.call(editor, text);
-    else editor.value = text;
-    editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
-  }} else {{
-    document.execCommand('selectAll', false);
-    const inserted = document.execCommand('insertText', false, text);
-    if (!inserted) {{
-      editor.textContent = text;
+  if (!normalizedExisting) {{
+    editor.focus();
+    if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {{
+      const prototype = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+      const setter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+      if (setter) setter.call(editor, text);
+      else editor.value = text;
       editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
+    }} else {{
+      document.execCommand('selectAll', false);
+      const inserted = document.execCommand('insertText', false, text);
+      if (!inserted) {{
+        editor.textContent = text;
+        editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
+      }}
     }}
   }}
 
