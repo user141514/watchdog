@@ -29,6 +29,94 @@ class FakeProtocol:
 
 
 class BlockedRelayContinueTests(unittest.TestCase):
+    def test_simple_continue_rejects_optimistic_user_dom_without_frontend_acceptance(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=4,
+            user_turn_id="user-pending",
+            user_turn_pending=True,
+        )
+        optimistic = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=5,
+            user_turn_id="user-watchdog",
+            user_text="continue",
+            user_turn_pending=True,
+            submission_receipt_seq=1,
+            submission_receipt_id="user-watchdog",
+            submission_receipt_text="continue",
+            stop_visible=False,
+            composer_has_draft=False,
+        )
+        page.snapshot = lambda: before if protocol.evaluate_calls == 0 else optimistic
+
+        delivery = page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.02)
+        self.assertFalse(delivery.accepted)
+        self.assertTrue(delivery.uncertain)
+
+    def test_simple_continue_requires_all_frontend_acceptance_signals(self) -> None:
+        cases = [
+            {"user_text": "wrong prompt", "stop_visible": True, "composer_has_draft": False},
+            {"user_text": "continue", "stop_visible": True, "composer_has_draft": True},
+            {"user_text": "continue", "stop_visible": False, "composer_has_draft": False},
+        ]
+        for fields in cases:
+            with self.subTest(fields=fields):
+                protocol = FakeProtocol()
+                page = RelayChatGPTPage(
+                    target_id="page-1",
+                    target_url="https://chatgpt.com/c/test",
+                    session_id="session-1",
+                    socket=object(),
+                    protocol=protocol,
+                    match_url="/c/test",
+                )
+                before = PageSnapshot(
+                    phase=Phase.RESPONDING,
+                    assistant_turn_id="assistant-7",
+                    assistant_text_signature="stable-output",
+                    assistant_text="stale old assistant",
+                    assistant_count=7,
+                    user_count=4,
+                    user_turn_id="user-pending",
+                    user_turn_pending=True,
+                )
+                after = PageSnapshot(
+                    phase=Phase.RESPONDING,
+                    assistant_turn_id="assistant-7",
+                    assistant_text_signature="stable-output",
+                    assistant_text="stale old assistant",
+                    assistant_count=7,
+                    user_count=5,
+                    user_turn_id="user-watchdog",
+                    user_turn_pending=True,
+                    submission_receipt_seq=1,
+                    submission_receipt_id="user-watchdog",
+                    submission_receipt_text="continue",
+                    **fields,
+                )
+                page.snapshot = lambda: before if protocol.evaluate_calls == 0 else after
+                delivery = page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.02)
+                self.assertFalse(delivery.accepted)
+                self.assertTrue(delivery.uncertain)
+
     def test_send_simple_continue_allows_pending_user_turn_and_active_ui(self) -> None:
         protocol = FakeProtocol()
         page = RelayChatGPTPage(
@@ -61,6 +149,9 @@ class BlockedRelayContinueTests(unittest.TestCase):
             submission_receipt_seq=1,
             submission_receipt_id="user-watchdog",
             submission_receipt_text="continue",
+            user_text="continue",
+            stop_visible=True,
+            composer_has_draft=False,
         )
         snapshots = iter([before, after])
         page.snapshot = lambda: next(snapshots)

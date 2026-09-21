@@ -40,6 +40,8 @@ class PageSnapshot:
     user_count: int
     user_turn_id: str = ""
     user_text: str = ""
+    stop_visible: bool = False
+    composer_has_draft: bool = False
     submission_seq: int = 0
     submission_receipt_seq: int = 0
     submission_receipt_id: str = ""

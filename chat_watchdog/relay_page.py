@@ -282,6 +282,8 @@ class RelayChatGPTPage:
             user_count=int(payload.get("userCount", 0)),
             user_turn_id=str(payload.get("userTurnId", "")),
             user_text=str(payload.get("userText", "")),
+            stop_visible=bool(payload.get("stopVisible", False)),
+            composer_has_draft=bool(payload.get("composerHasDraft", False)),
             submission_seq=int(payload.get("submissionSeq", 0)),
             submission_receipt_seq=int(payload.get("submissionReceiptSeq", 0)),
             submission_receipt_id=str(payload.get("submissionReceiptId", "")),
@@ -305,6 +307,7 @@ class RelayChatGPTPage:
         allow_blocked: bool = False,
         allow_active: bool = False,
         allow_user_turn_pending: bool = False,
+        require_frontend_acceptance: bool = False,
     ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
@@ -354,10 +357,16 @@ class RelayChatGPTPage:
         while time.monotonic() < deadline:
             current = self.snapshot()
             receipt_text = current.submission_receipt_text.replace("\r\n", "\n").strip()
+            frontend_accepted = (
+                current.user_text.replace("\r\n", "\n").strip() == expected_text
+                and not current.composer_has_draft
+                and current.stop_visible
+            )
             if (
                 current.submission_receipt_seq > baseline_receipt_seq
                 and current.submission_receipt_id
                 and receipt_text == expected_text
+                and (not require_frontend_acceptance or frontend_accepted)
             ):
                 return PromptDelivery(
                     accepted=True,
@@ -410,6 +419,7 @@ class RelayChatGPTPage:
             allow_blocked=True,
             allow_active=True,
             allow_user_turn_pending=True,
+            require_frontend_acceptance=True,
         )
 
     def send_liveness_continue(
