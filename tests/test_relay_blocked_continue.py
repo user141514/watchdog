@@ -146,9 +146,6 @@ class BlockedRelayContinueTests(unittest.TestCase):
             user_count=5,
             user_turn_id="user-watchdog",
             user_turn_pending=True,
-            submission_receipt_seq=1,
-            submission_receipt_id="user-watchdog",
-            submission_receipt_text="continue",
             user_text="continue",
             stop_visible=True,
             composer_has_draft=False,
@@ -156,9 +153,51 @@ class BlockedRelayContinueTests(unittest.TestCase):
         snapshots = iter([before, after])
         page.snapshot = lambda: next(snapshots)
 
-        self.assertTrue(page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.2))
+        delivery = page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.2)
+        self.assertTrue(delivery)
+        self.assertEqual(delivery.message_id, "user-watchdog")
         self.assertIn("const allowGenerationActive = true;", protocol.expressions[0])
         self.assertIn("const allowUserTurnPending = true;", protocol.expressions[0])
+
+    def test_simple_continue_requires_new_user_turn_identity(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=4,
+            user_turn_id="same-user",
+            user_text="continue",
+            user_turn_pending=True,
+        )
+        unchanged = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=4,
+            user_turn_id="same-user",
+            user_text="continue",
+            user_turn_pending=True,
+            stop_visible=True,
+            composer_has_draft=False,
+        )
+        page.snapshot = lambda: before if protocol.evaluate_calls == 0 else unchanged
+
+        delivery = page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.02)
+        self.assertFalse(delivery.accepted)
+        self.assertTrue(delivery.uncertain)
 
     def test_send_liveness_continue_runs_dom_submit_for_active_snapshot(self) -> None:
         protocol = FakeProtocol()

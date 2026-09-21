@@ -353,20 +353,29 @@ class RelayChatGPTPage:
 
         expected_text = prompt.replace("\r\n", "\n").strip()
         baseline_receipt_seq = before.submission_receipt_seq
+        explicit_submit = isinstance(result, Mapping) and result.get("submitted") is True
         deadline = time.monotonic() + acceptance_timeout
         while time.monotonic() < deadline:
             current = self.snapshot()
             receipt_text = current.submission_receipt_text.replace("\r\n", "\n").strip()
             frontend_accepted = (
-                current.user_text.replace("\r\n", "\n").strip() == expected_text
+                explicit_submit
+                and bool(current.user_turn_id)
+                and current.user_turn_id != before.user_turn_id
+                and current.user_text.replace("\r\n", "\n").strip() == expected_text
                 and not current.composer_has_draft
                 and current.stop_visible
             )
+            if require_frontend_acceptance and frontend_accepted:
+                return PromptDelivery(
+                    accepted=True,
+                    message_id=current.user_turn_id,
+                )
             if (
-                current.submission_receipt_seq > baseline_receipt_seq
+                not require_frontend_acceptance
+                and current.submission_receipt_seq > baseline_receipt_seq
                 and current.submission_receipt_id
                 and receipt_text == expected_text
-                and (not require_frontend_acceptance or frontend_accepted)
             ):
                 return PromptDelivery(
                     accepted=True,
