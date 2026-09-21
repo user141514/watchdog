@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
+import tempfile
 import unittest
 
 from chat_watchdog.registry import WatchRegistry, conversation_id_from_url
@@ -43,6 +45,22 @@ class ConversationIdentityTests(unittest.TestCase):
                 conversation_id_from_url(url)
 
 
+class FakeProgressStore:
+    def __init__(self) -> None:
+        self.ensured = []
+        self.suspended = []
+        self.removed = []
+
+    def ensure(self, conversation_id: str, target_url: str):
+        self.ensured.append((conversation_id, target_url))
+
+    def suspend(self, conversation_id: str):
+        self.suspended.append(conversation_id)
+
+    def remove(self, conversation_id: str):
+        self.removed.append(conversation_id)
+
+
 class WatchRegistryTests(unittest.TestCase):
     def test_deduplicates_same_conversation_across_url_shapes(self) -> None:
         created: list[FakeWatcher] = []
@@ -65,6 +83,28 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(registry.list_ids(), [CHAT_ID])
         self.assertEqual(registry.list()[0].state, "active")
 
+    def test_restart_suspends_persisted_progress_window(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store_path = Path(root) / "registry.sqlite3"
+            first_progress = FakeProgressStore()
+            first = WatchRegistry(
+                lambda url: FakeWatcher(url),
+                store_path=store_path,
+                progress_store=first_progress,
+            )
+            first.register(PROJECT_URL)
+            first.close()
+
+            second_progress = FakeProgressStore()
+            second = WatchRegistry(
+                lambda url: FakeWatcher(url),
+                store_path=store_path,
+                progress_store=second_progress,
+            )
+            self.assertEqual(second_progress.ensured, [(CHAT_ID, PROJECT_URL)])
+            self.assertEqual(second_progress.suspended, [CHAT_ID])
+            second.close()
+
     def test_unregister_closes_watcher(self) -> None:
         watcher = FakeWatcher(PROJECT_URL)
         registry = WatchRegistry(lambda _url: watcher)
@@ -75,9 +115,22 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(registry.list_ids(), [])
         self.assertFalse(registry.unregister(CHAT_ID))
 
+    def test_mymem_lite_follows_watch_registration_lifecycle(self) -> None:
+        watcher = FakeWatcher(PROJECT_URL)
+        progress = FakeProgressStore()
+        registry = WatchRegistry(lambda _url: watcher, progress_store=progress)
+
+        registry.register(PROJECT_URL)
+        self.assertEqual(progress.ensured, [(CHAT_ID, PROJECT_URL)])
+        self.assertEqual(progress.removed, [])
+
+        self.assertTrue(registry.unregister(CHAT_ID))
+        self.assertEqual(progress.removed, [CHAT_ID])
+
     def test_step_removes_completed_watcher(self) -> None:
         watcher = FakeWatcher(PROJECT_URL)
-        registry = WatchRegistry(lambda _url: watcher)
+        progress = FakeProgressStore()
+        registry = WatchRegistry(lambda _url: watcher, progress_store=progress)
         registry.register(PROJECT_URL)
 
         registry.step_all()
@@ -95,6 +148,7 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(watcher.steps, 3)
         self.assertTrue(watcher.closed)
         self.assertEqual(registry.list_ids(), [])
+        self.assertEqual(progress.removed, [CHAT_ID])
         completion = registry.completion(CHAT_ID)
         self.assertIsNotNone(completion)
         self.assertEqual(completion.result, "final watchdog result")

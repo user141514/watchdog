@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import json
 import time
 from typing import Collection, Protocol
 
@@ -66,6 +67,26 @@ class AgentPoolPort(Protocol):
     ) -> AgentLease | None: ...
 
 
+class ProgressStorePort(Protocol):
+    def observe(
+        self,
+        conversation_id: str,
+        target_url: str,
+        fingerprint: str | None,
+        *,
+        observable: bool,
+    ): ...
+
+    def claim_stall(
+        self,
+        conversation_id: str,
+        *,
+        timeout_seconds: float,
+        state_version: int,
+        writer_epoch: int,
+    ) -> bool: ...
+
+
 class StepResult(str, Enum):
     ACTIVE = "active"
     CONTINUED = "continued"
@@ -107,6 +128,9 @@ class Supervisor:
         send_admission=None,
         intent_client=None,
         state_client=None,
+        progress_store: ProgressStorePort | None = None,
+        progress_id: str | None = None,
+        active_stall_seconds: float = 300.0,
     ) -> None:
         self._page = page
         self._agent_pool = agent_pool
@@ -125,8 +149,17 @@ class Supervisor:
             raise ValueError('managed intents cannot share a direct-write reanchor path')
         if state_client is not None and intent_client is None:
             raise ValueError('authoritative state requires managed intent ownership')
+        if progress_store is not None and (state_client is None or intent_client is None):
+            raise ValueError('mymem_lite progress requires authoritative managed mode')
+        if progress_store is not None and not progress_id:
+            raise ValueError('mymem_lite progress requires a conversation id')
+        if active_stall_seconds <= 0:
+            raise ValueError('active_stall_seconds must be positive')
         self._intent_client = intent_client
         self._state_client = state_client
+        self._progress_store = progress_store
+        self._progress_id = progress_id
+        self._active_stall_seconds = active_stall_seconds
         self._last_progress_key: tuple[TurnKey, str] | None = None
         self._last_progress_at: float | None = None
         self._liveness_attempted_for: tuple[TurnKey, str] | None = None
@@ -437,11 +470,106 @@ class Supervisor:
             return None
         return _AuthoritativeIntentSnapshot(user_id, assistant_id)
 
+    @staticmethod
+    def _snapshot_available(snapshot: PageSnapshot | None) -> bool:
+        return bool(
+            snapshot is not None
+            and snapshot.assistant_turn_id not in {
+                'relay-unavailable', 'invalid-snapshot', 'navigated-away'
+            }
+        )
+
+    def _observe_managed_progress(self, state: dict, snapshot: PageSnapshot | None) -> bool:
+        if self._progress_store is None or self._progress_id is None:
+            return False
+        turn = state.get('turn') or {}
+        user_id = turn.get('userMessageId')
+        assistant_id = turn.get('assistantMessageId')
+        observable = bool(
+            self._snapshot_available(snapshot)
+            and isinstance(user_id, str)
+            and user_id
+            and snapshot is not None
+            and snapshot.user_turn_id == user_id
+            and (not assistant_id or snapshot.assistant_turn_id == assistant_id)
+        )
+        fingerprint = None
+        if observable and snapshot is not None:
+            fingerprint = json.dumps([
+                state.get('stateVersion'),
+                state.get('progress'),
+                state.get('body'),
+                state.get('delivery'),
+                state.get('gate'),
+                turn.get('turnId'),
+                user_id,
+                assistant_id,
+                snapshot.phase.value,
+                snapshot.assistant_turn_id,
+                snapshot.assistant_text_signature,
+                snapshot.user_turn_pending,
+            ], ensure_ascii=False, separators=(',', ':'))
+        try:
+            pulse = self._progress_store.observe(
+                self._progress_id,
+                self._page.target_url,
+                fingerprint,
+                observable=observable,
+            )
+        except Exception as error:
+            self.diagnostics.update(
+                progress_observable=False,
+                progress_error=f'{type(error).__name__}: {error}'[:1000],
+            )
+            return False
+        self.diagnostics.update(
+            progress_observable=observable,
+            progress_seq=getattr(pulse, 'progress_seq', None),
+            progress_last_at=getattr(pulse, 'last_progress_at', None),
+            progress_file_bytes=getattr(pulse, 'file_bytes', None),
+        )
+        return observable
+
+    def _publish_stop(self, authoritative_state) -> StepResult:
+        try:
+            result = self._intent_client.submit_v1(
+                authoritative_state,
+                None,
+                action='stop',
+            )
+        except Exception as error:
+            self.diagnostics.update(
+                intent_accepted=None,
+                intent_reason='delivery_uncertain',
+                error=f'{type(error).__name__}: {error}'[:1000],
+            )
+            return StepResult.DELIVERY_UNCERTAIN
+        self.diagnostics.update(
+            intent_accepted=result.get('accepted'),
+            intent_reason=result.get('reason'),
+            recovery_action='stop',
+        )
+        if result.get('accepted') is True:
+            return StepResult.RECOVERY_STARTED
+        reason = result.get('reason')
+        if reason == 'delivery_uncertain':
+            return StepResult.DELIVERY_UNCERTAIN
+        if reason == 'need_input':
+            return StepResult.NEED_INPUT
+        if reason in {
+            'stale_state', 'stale_intent', 'writer_epoch_mismatch',
+            'state_delivery_uncertain', 'state_not_stoppable',
+            'busy', 'user_turn_pending', 'target_unavailable',
+        }:
+            return StepResult.WAITING
+        if reason == 'writer_mode_mismatch':
+            return StepResult.BLOCKED
+        return StepResult.BLOCKED
+
     def _step_authoritative(self, snapshot: PageSnapshot | None) -> StepResult:
         self.diagnostics = {
             'observed_at': time.time(),
-            'snapshot_available': (snapshot is not None and snapshot.assistant_turn_id not in
-                                   {'relay-unavailable', 'invalid-snapshot', 'navigated-away'}),
+            'snapshot_available': self._snapshot_available(snapshot),
             'state_available': False, 'reason': None, 'error': None,
         }
         try:
@@ -464,6 +592,7 @@ class Supervisor:
             delivery=state.get('delivery'), gate=state.get('gate'),
             writer_mode=writer.get('mode'), writer_epoch=writer.get('epoch'),
         )
+        progress_observable = self._observe_managed_progress(state, snapshot)
         if writer.get('mode') != 'managed':
             return StepResult.BLOCKED
 
@@ -477,6 +606,27 @@ class Supervisor:
         progress = state.get('progress')
         body = state.get('body')
         if progress == 'active':
+            if (
+                self._progress_store is not None
+                and self._progress_id is not None
+                and progress_observable
+                and delivery == 'delivered'
+            ):
+                try:
+                    stalled = self._progress_store.claim_stall(
+                        self._progress_id,
+                        timeout_seconds=self._active_stall_seconds,
+                        state_version=int(state.get('stateVersion', 0)),
+                        writer_epoch=int(writer.get('epoch', 0)),
+                    )
+                except Exception as error:
+                    self.diagnostics.update(
+                        progress_error=f'{type(error).__name__}: {error}'[:1000]
+                    )
+                    stalled = False
+                self.diagnostics['active_stall_claimed'] = stalled
+                if stalled:
+                    return self._publish_stop(value)
             return StepResult.ACTIVE
         if progress in {'unknown', 'idle'}:
             return StepResult.WAITING

@@ -10,6 +10,12 @@ from chat_watchdog.registry import RegistrationRejected
 from chat_watchdog.state_client import StateProtocolError, StateUnavailable
 
 
+def test_registry_liveness_defaults_are_explicit_and_positive():
+    args = build_parser().parse_args([])
+    assert args.active_stall_seconds == 300.0
+    assert args.mymem_lite_dir
+
+
 def test_managed_cli_derives_state_and_intent_clients_from_one_sidecar_owner():
     parser = build_parser()
     args = parser.parse_args([

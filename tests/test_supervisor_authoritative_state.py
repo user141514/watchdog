@@ -92,6 +92,24 @@ class Intents:
         return self.response
 
 
+class ProgressStore:
+    def __init__(self, *, stalled=False):
+        self.stalled = stalled
+        self.observations = []
+        self.claims = []
+
+    def observe(self, conversation_id, target_url, fingerprint, *, observable):
+        self.observations.append((conversation_id, target_url, fingerprint, observable))
+        return type("Pulse", (), {"progress_seq": 1, "last_progress_at": 1000.0})()
+
+    def claim_stall(self, conversation_id, *, timeout_seconds, state_version, writer_epoch):
+        self.claims.append((conversation_id, timeout_seconds, state_version, writer_epoch))
+        if self.stalled:
+            self.stalled = False
+            return True
+        return False
+
+
 class States:
     def __init__(self, result=None, error=None):
         self.result = result
@@ -106,11 +124,19 @@ class States:
 
 
 class AuthoritativeStateSupervisorTests(unittest.TestCase):
-    def supervisor(self, authoritative, *, page=None, intent_response=None):
+    def supervisor(self, authoritative, *, page=None, intent_response=None, progress_store=None):
         page = page or Page()
         intents = Intents(intent_response)
         pool = Pool()
-        sup = Supervisor(page, pool, intent_client=intents, state_client=States(result=authoritative))
+        sup = Supervisor(
+            page,
+            pool,
+            intent_client=intents,
+            state_client=States(result=authoritative),
+            progress_store=progress_store,
+            progress_id="00000000-0000-0000-0000-000000000011" if progress_store else None,
+            active_stall_seconds=300.0,
+        )
         return sup, page, intents, pool
 
     def test_blocked_incomplete_uses_sidecar_identity_for_one_continuation(self):
@@ -126,6 +152,52 @@ class AuthoritativeStateSupervisorTests(unittest.TestCase):
         self.assertEqual(page.current.phase, Phase.FINISHED)
         self.assertEqual(sup.step(), StepResult.ACTIVE)
         self.assertEqual(intents.calls, [])
+
+    def test_active_stall_uses_versioned_stop_once_without_relay_write(self):
+        progress_store = ProgressStore(stalled=True)
+        authoritative = state(
+            progress="active",
+            body="empty",
+            turn={"assistantMessageId": None},
+        )
+        page = Page(phase=Phase.RESPONDING, user="user-auth", assistant="", text="Thinking")
+        sup, page, intents, pool = self.supervisor(
+            authoritative,
+            page=page,
+            progress_store=progress_store,
+        )
+
+        self.assertEqual(sup.step(), StepResult.RECOVERY_STARTED)
+        self.assertEqual(intents.calls, [(TARGET, "user-auth", None, "stop")])
+        self.assertEqual(page.effects, 0)
+        self.assertEqual(pool.calls, 0)
+        self.assertEqual(progress_store.claims, [
+            ("00000000-0000-0000-0000-000000000011", 300.0, 9, 3)
+        ])
+
+        # The stall epoch is consumed before the stop effect, so a repeated poll
+        # over the same observable state cannot issue a second stop.
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        self.assertEqual(len(intents.calls), 1)
+
+    def test_active_liveness_suspends_when_relay_snapshot_is_unavailable(self):
+        progress_store = ProgressStore(stalled=True)
+        authoritative = state(
+            progress="active",
+            body="empty",
+            turn={"assistantMessageId": None},
+        )
+        page = Page(snapshot_error=RuntimeError("relay down"))
+        sup, _, intents, _ = self.supervisor(
+            authoritative,
+            page=page,
+            progress_store=progress_store,
+        )
+
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        self.assertEqual(intents.calls, [])
+        self.assertEqual(progress_store.observations[-1][-1], False)
+        self.assertEqual(progress_store.claims, [])
 
     def test_unknown_human_gate_and_uncertain_delivery_fail_closed(self):
         cases = [

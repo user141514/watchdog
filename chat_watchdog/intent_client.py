@@ -40,9 +40,9 @@ class SidecarIntentClient:
             raise RuntimeError('invalid intent owner receipt')
         return result
 
-    def submit_v1(self, state, text, *, source='watchdog', action='continue'):
-        if action != 'continue':
-            raise ValueError('Watchdog v1 intent client only supports continue')
+    def submit_v1(self, state, text=None, *, source='watchdog', action='continue'):
+        if action not in {'continue', 'stop'}:
+            raise ValueError('Watchdog v1 intent client only supports continue or stop')
         raw_state = state.to_dict() if hasattr(state, 'to_dict') else state
         authoritative = parse_conversation_state(raw_state).to_dict()
         turn = authoritative['turn']

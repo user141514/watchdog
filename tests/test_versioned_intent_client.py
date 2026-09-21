@@ -36,17 +36,17 @@ def state(**overrides):
     return parse_conversation_state(value)
 
 
-def expected_intent_id(text):
+def expected_intent_id(text, *, action="continue", assistant_id="assistant-9"):
     material = [
         "conversation-runtime/v1",
         "watchdog",
-        "continue",
+        action,
         TARGET,
         "conv-state",
         9,
         3,
         "user-9",
-        "assistant-9",
+        assistant_id,
         text,
     ]
     encoded = json.dumps(material, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
@@ -107,6 +107,37 @@ def test_submit_v1_rejects_missing_authoritative_message_identity_before_post():
     client = SidecarIntentClient(request_json=lambda *_: pytest.fail("must not post invalid intent"))
     with pytest.raises(ValueError):
         client.submit_v1(state(turn={"assistantMessageId": None}), "continue bounded task")
+
+
+def test_submit_v1_stop_allows_active_turn_without_assistant_message_id():
+    calls = []
+
+    def request(endpoint, payload):
+        calls.append((endpoint, payload))
+        return {"accepted": True, "conversationId": "conv-state", "turnId": "turn-9"}
+
+    client = SidecarIntentClient(request_json=request)
+    active = state(progress="active", body="empty", turn={"assistantMessageId": None})
+    result = client.submit_v1(active, None, action="stop")
+
+    assert result["accepted"] is True
+    _, payload = calls[0]
+    assert payload == {
+        "contractVersion": 1,
+        "intentId": expected_intent_id(None, action="stop", assistant_id=None),
+        "source": "watchdog",
+        "conversationId": "conv-state",
+        "target": TARGET,
+        "expectedStateVersion": 9,
+        "expectedWriterEpoch": 3,
+        "action": "stop",
+        "allocation": None,
+        "text": None,
+        "expected": {
+            "userMessageId": "user-9",
+            "assistantMessageId": None,
+        },
+    }
 
 
 def test_submit_v1_rejects_invalid_owner_response():

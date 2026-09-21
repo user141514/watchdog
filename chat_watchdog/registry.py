@@ -128,10 +128,12 @@ class WatchRegistry:
     def __init__(self, watcher_factory: Callable[[str], Watcher], *,
                  store_path: str | Path | None = None, clock=time.time,
                  connect_on_register: bool = True,
-                 registration_preflight: Callable[[str], None] | None = None) -> None:
+                 registration_preflight: Callable[[str], None] | None = None,
+                 progress_store=None) -> None:
         self._watcher_factory = watcher_factory
         self._connect_on_register = connect_on_register
         self._registration_preflight = registration_preflight
+        self._progress_store = progress_store
         self._clock = clock
         self._watchers: dict[str, _WatchEntry] = {}
         self._completed: dict[str, WatchCompletion] = {}
@@ -162,6 +164,11 @@ class WatchRegistry:
                         consecutive_failures=row["consecutive_failures"],
                         last_error=row["last_error"],
                     )
+                    if self._progress_store is not None:
+                        self._progress_store.ensure(conversation_id, row["target_url"])
+                        # A daemon restart breaks the continuous observation
+                        # window. Never carry an old stall deadline across it.
+                        self._progress_store.suspend(conversation_id)
         except BaseException:
             self._store.close()
             raise
@@ -207,7 +214,14 @@ class WatchRegistry:
             if conversation_id in self._watchers:
                 return RegisterResult(conversation_id=conversation_id, created=False)
             at = self._clock()
-            self._store.register(conversation_id, target_url, at)
+            if self._progress_store is not None:
+                self._progress_store.ensure(conversation_id, target_url)
+            try:
+                self._store.register(conversation_id, target_url, at)
+            except BaseException:
+                if self._progress_store is not None:
+                    self._progress_store.remove(conversation_id)
+                raise
             self._completed.pop(conversation_id, None)
             lock = self._entry_locks.setdefault(conversation_id, RLock())
             entry = _WatchEntry(conversation_id, target_url, registered_at=at, lock=lock)
@@ -231,6 +245,11 @@ class WatchRegistry:
         # Once this returns, no operation from the withdrawn generation is live.
         with entry.lock:
             self._close_watcher(entry)
+        if self._progress_store is not None:
+            try:
+                self._progress_store.remove(conversation_id)
+            except Exception:
+                _LOG.exception("mymem_lite cleanup failed: %s", conversation_id)
         return True
 
     def list_ids(self) -> list[str]:
@@ -329,6 +348,11 @@ class WatchRegistry:
                     self._watchers.pop(entry.conversation_id)
             if completed:
                 self._close_watcher(entry)
+                if self._progress_store is not None:
+                    try:
+                        self._progress_store.remove(entry.conversation_id)
+                    except Exception:
+                        _LOG.exception("mymem_lite completion cleanup failed: %s", entry.conversation_id)
 
     def step_all(self) -> None:
         with self._poll_lock:

@@ -15,6 +15,7 @@ from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import RegistrationRejected, WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
+from .progress_liveness import MymemLiteStore
 from .state_client import SidecarStateClient, StateProtocolError, StateUnavailable, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
 
@@ -164,6 +165,8 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
     if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
         raise SystemExit("registry mode does not share one reanchor scope across multiple conversations")
 
+    progress_store = MymemLiteStore(args.mymem_lite_dir)
+
     def create_watcher(target_url: str) -> _SupervisorWatcher:
         conversation_id = conversation_id_from_url(target_url)
         page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
@@ -175,6 +178,9 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
             reanchor=None,
             intent_client=intent_client,
             state_client=state_client,
+            progress_store=progress_store,
+            progress_id=conversation_id,
+            active_stall_seconds=args.active_stall_seconds,
         )
         return _SupervisorWatcher(page, supervisor)
 
@@ -186,6 +192,7 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
         store_path=args.registry_store,
         connect_on_register=False,
         registration_preflight=registration_preflight,
+        progress_store=progress_store,
     )
     try:
         server = create_control_server(
@@ -223,13 +230,19 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
         registry.close()
 
 
-def default_registry_store() -> str:
+def _default_state_root() -> Path:
     if os.name == "nt":
-        root = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
-    else:
-        root = Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+        return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+    return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+
+
+def default_registry_store() -> str:
     # Deliberately separate from the incompatible pre-registry compatibility DB.
-    return str(root / "chat-watchdog" / "registry-v2.sqlite3")
+    return str(_default_state_root() / "chat-watchdog" / "registry-v2.sqlite3")
+
+
+def default_mymem_lite_dir() -> str:
+    return str(_default_state_root() / "chat-watchdog" / "mymem-lite")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -275,6 +288,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=60.0,
         help="poll interval; default: 60",
+    )
+    parser.add_argument(
+        "--active-stall-seconds",
+        type=float,
+        default=float(os.environ.get("CHAT_WATCHDOG_ACTIVE_STALL_SECONDS", "300")),
+        help="continuous observable active period without progress before one stop recovery; default: 300",
+    )
+    parser.add_argument(
+        "--mymem-lite-dir",
+        default=os.environ.get("CHAT_WATCHDOG_MYMEM_LITE_DIR") or default_mymem_lite_dir(),
+        help="ephemeral append-only progress pulse directory",
     )
     parser.add_argument(
         "--agent",
@@ -352,6 +376,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     if args.poll_seconds <= 0:
         raise SystemExit("--poll-seconds must be > 0")
+    if args.active_stall_seconds <= 0:
+        raise SystemExit("--active-stall-seconds must be > 0")
     if args.agent_probe_seconds < 0:
         raise SystemExit("--agent-probe-seconds must be >= 0")
     if args.recovery_timeout_seconds <= 0:
