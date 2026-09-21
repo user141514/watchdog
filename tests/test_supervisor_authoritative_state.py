@@ -159,6 +159,84 @@ class AuthoritativeStateSupervisorTests(unittest.TestCase):
         self.assertEqual(sup.step(), StepResult.ACTIVE)
         self.assertEqual(intents.calls, [])
 
+    def test_managed_progress_ignores_activity_only_changes_for_pending_user_turn(self):
+        progress_store = ProgressStore(stalled=False)
+        authoritative = state(
+            progress="active",
+            body="empty",
+            turn={"assistantMessageId": None},
+        )
+        page = Page(phase=Phase.RESPONDING, user="user-auth", assistant="assistant-old", text="old answer")
+        page.current = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-old",
+            assistant_text_signature="semantic-old-dom-a",
+            assistant_text="old answer",
+            assistant_count=4,
+            user_count=5,
+            user_turn_id="user-auth",
+            user_turn_pending=True,
+        )
+        sup, _, _, _ = self.supervisor(
+            authoritative,
+            page=page,
+            progress_store=progress_store,
+        )
+
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        first = progress_store.observations[-1][2]
+
+        page.current = PageSnapshot(
+            phase=Phase.THINKING,
+            assistant_turn_id="assistant-old",
+            assistant_text_signature="semantic-old-dom-b",
+            assistant_text="old answer",
+            assistant_count=4,
+            user_count=5,
+            user_turn_id="user-auth",
+            user_turn_pending=True,
+        )
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        second = progress_store.observations[-1][2]
+
+        self.assertEqual(first, second)
+
+    def test_managed_progress_changes_when_current_turn_semantic_text_changes(self):
+        progress_store = ProgressStore(stalled=False)
+        authoritative = state(progress="active", body="incomplete")
+        page = Page(phase=Phase.RESPONDING, user="user-auth", assistant="assistant-auth", text="part a")
+        page.current = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-auth",
+            assistant_text_signature="semantic-a",
+            assistant_text="part a",
+            assistant_count=4,
+            user_count=4,
+            user_turn_id="user-auth",
+            user_turn_pending=False,
+        )
+        sup, _, _, _ = self.supervisor(
+            authoritative,
+            page=page,
+            progress_store=progress_store,
+        )
+
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        first = progress_store.observations[-1][2]
+        page.current = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-auth",
+            assistant_text_signature="semantic-b",
+            assistant_text="part a plus real progress",
+            assistant_count=4,
+            user_count=4,
+            user_turn_id="user-auth",
+            user_turn_pending=False,
+        )
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        second = progress_store.observations[-1][2]
+        self.assertNotEqual(first, second)
+
     def test_active_stall_uses_versioned_stop_once_without_relay_write(self):
         progress_store = ProgressStore(stalled=True)
         authoritative = state(

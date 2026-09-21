@@ -487,29 +487,35 @@ class Supervisor:
         turn = state.get('turn') or {}
         user_id = turn.get('userMessageId')
         assistant_id = turn.get('assistantMessageId')
-        observable = bool(
+        exact_user = bool(
             self._snapshot_available(snapshot)
             and isinstance(user_id, str)
             and user_id
             and snapshot is not None
             and snapshot.user_turn_id == user_id
-            and (not assistant_id or snapshot.assistant_turn_id == assistant_id)
         )
+        if assistant_id:
+            observable = bool(
+                exact_user
+                and snapshot is not None
+                and not snapshot.user_turn_pending
+                and snapshot.assistant_turn_id == assistant_id
+            )
+        else:
+            # An adopted/user-pending turn may not have a stable assistant id yet.
+            # The older mounted assistant is presentation history, not progress.
+            observable = exact_user
+
         fingerprint = None
         if observable and snapshot is not None:
+            semantic_signature = (
+                '' if (not assistant_id and snapshot.user_turn_pending)
+                else snapshot.assistant_text_signature
+            )
             fingerprint = json.dumps([
-                state.get('stateVersion'),
-                state.get('progress'),
-                state.get('body'),
-                state.get('delivery'),
-                state.get('gate'),
                 turn.get('turnId'),
                 user_id,
-                assistant_id,
-                snapshot.phase.value,
-                snapshot.assistant_turn_id,
-                snapshot.assistant_text_signature,
-                snapshot.user_turn_pending,
+                semantic_signature,
             ], ensure_ascii=False, separators=(',', ':'))
         try:
             pulse = self._progress_store.observe(

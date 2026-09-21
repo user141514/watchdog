@@ -225,7 +225,7 @@ DOM_SNAPSHOT_JS = r"""
     if (!turn) return '';
     const clone = turn.cloneNode(true);
     clone.querySelectorAll(
-      'button, textarea, [role="button"], [contenteditable="true"], [data-testid*="turn-action" i], [data-testid*="copy" i], [aria-label*="copy" i], [aria-label*="feedback" i]'
+      'button, textarea, [role="button"], [contenteditable="true"], [data-testid*="turn-action" i], [data-testid*="copy" i], [aria-label*="copy" i], [aria-label*="feedback" i], [data-testid*="reasoning" i], [data-testid*="thinking" i], [aria-label*="thinking" i], [aria-label*="reasoning" i]'
     ).forEach((node) => node.remove());
     return (clone.textContent || '').trim();
   };
@@ -247,11 +247,13 @@ DOM_SNAPSHOT_JS = r"""
   // response across multiple markdown/prose blocks; tracking only the first
   // block can falsely look stalled while later blocks are still growing.
   const signatureText = fullTurnText || text;
-  const signatureRoot = turn || contentRoot || assistant;
-  const htmlLength = signatureRoot ? String(signatureRoot.innerHTML || '').length : 0;
-  const childCount = signatureRoot ? Number(signatureRoot.childElementCount || 0) : 0;
+  let semanticHash = 2166136261;
+  for (let index = 0; index < signatureText.length; index += 1) {
+    semanticHash ^= signatureText.charCodeAt(index);
+    semanticHash = Math.imul(semanticHash, 16777619);
+  }
   const tail = signatureText.slice(-160);
-  const signature = `${signatureText.length}:${htmlLength}:${childCount}:${tail}`;
+  const signature = `${signatureText.length}:${(semanticHash >>> 0).toString(16)}:${tail}`;
   const stableTurnId = (node) => {
     if (!node) return '';
     const candidate = (node.getAttribute?.('data-turn-id') || '').trim();

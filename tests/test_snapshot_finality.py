@@ -25,6 +25,8 @@ const contentValue = config.contentText || (config.final ? 'complete response' :
 const content = {...element(), innerText: contentValue,
   textContent: contentValue, innerHTML: '<p>text</p>', childElementCount: 1};
 const assistantTurn = {
+  innerHTML: config.turnHtml || '<div>stable shell</div>',
+  childElementCount: config.turnChildren === undefined ? 1 : config.turnChildren,
   getAttribute(name) {
     if (config.noStableIds) return null;
     if (name === 'data-testid') return 'conversation-turn-4';
@@ -40,10 +42,18 @@ const assistantTurn = {
     return selector.includes('turn-action-button') && config.final ? [finalButton] : [];
   },
   cloneNode() {
-    return {
-      textContent: config.fullText || contentValue,
-      querySelectorAll() { return []; }
+    const clone = {
+      textContent: config.reasoningText
+        ? `${config.reasoningText}\n${config.fullText || contentValue}`
+        : (config.fullText || contentValue),
+      querySelectorAll(selector) {
+        if (config.reasoningText && /(reasoning|thinking)/i.test(selector)) {
+          return [{remove() { clone.textContent = config.fullText || contentValue; }}];
+        }
+        return [];
+      }
     };
+    return clone;
   }
 };
 const userTurn = {getAttribute: name => !config.noStableIds && name === 'data-testid' ? 'conversation-turn-3' : null};
@@ -118,6 +128,43 @@ class SnapshotFinalityTests(unittest.TestCase):
 
     def test_active_generation_remains_active(self):
         self.assertEqual(self.snapshot(self.payload(final=False, active=True)).phase, Phase.RESPONDING)
+
+    def test_liveness_signature_ignores_dom_only_churn(self):
+        before = self.payload(
+            final=False,
+            active=True,
+            contentText='same semantic response',
+            fullText='same semantic response',
+            turnHtml='<div><span>shell a</span></div>',
+            turnChildren=1,
+        )
+        after = self.payload(
+            final=False,
+            active=True,
+            contentText='same semantic response',
+            fullText='same semantic response',
+            turnHtml='<section><div><span>shell b</span><button>x</button></div></section>',
+            turnChildren=4,
+        )
+        self.assertEqual(before['assistantText'], after['assistantText'])
+        self.assertEqual(before['assistantTextSignature'], after['assistantTextSignature'])
+
+    def test_liveness_signature_ignores_reasoning_ui_text(self):
+        before = self.payload(
+            final=False,
+            active=True,
+            contentText='visible answer',
+            fullText='visible answer',
+            reasoningText='Thinking step 1',
+        )
+        after = self.payload(
+            final=False,
+            active=True,
+            contentText='visible answer',
+            fullText='visible answer',
+            reasoningText='Thinking step 999 with more internal text',
+        )
+        self.assertEqual(before['assistantTextSignature'], after['assistantTextSignature'])
 
     def test_liveness_signature_tracks_later_content_blocks(self):
         first = self.payload(
