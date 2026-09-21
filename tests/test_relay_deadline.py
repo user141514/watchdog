@@ -53,6 +53,34 @@ def test_unrelated_event_stream_cannot_keep_a_request_alive_forever(method):
     assert len(socket.messages) == 1, "a timeout must not resend a CDP operation"
 
 
+def test_generic_cdp_command_supports_target_create_and_page_reload():
+    class CommandSocket:
+        def __init__(self):
+            self.messages = []
+            self.timeout = None
+
+        def settimeout(self, timeout):
+            self.timeout = timeout
+
+        def send(self, payload):
+            self.messages.append(json.loads(payload))
+
+        def recv(self):
+            message = self.messages[-1]
+            if message["method"] == "Target.createTarget":
+                return json.dumps({"id": message["id"], "result": {"targetId": "PAGE-NEW"}})
+            return json.dumps({"id": message["id"], "result": {}})
+
+    socket = CommandSocket()
+    protocol = RelayCdpProtocol(socket)
+    assert protocol.create_target("https://chatgpt.com/c/10000000-0000-4000-8000-000000000001") == "PAGE-NEW"
+    protocol.reload_page("session-1")
+
+    assert socket.messages[0]["method"] == "Target.createTarget"
+    assert socket.messages[1]["method"] == "Page.reload"
+    assert socket.messages[1]["sessionId"] == "session-1"
+
+
 def test_next_request_gets_a_fresh_socket_budget_without_replaying_prior_send():
     clock = Clock()
     socket = EventStream(clock)

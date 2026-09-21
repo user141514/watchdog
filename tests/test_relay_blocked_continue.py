@@ -29,6 +29,46 @@ class FakeProtocol:
 
 
 class BlockedRelayContinueTests(unittest.TestCase):
+    def test_send_simple_continue_allows_pending_user_turn_and_active_ui(self) -> None:
+        protocol = FakeProtocol()
+        page = RelayChatGPTPage(
+            target_id="page-1",
+            target_url="https://chatgpt.com/c/test",
+            session_id="session-1",
+            socket=object(),
+            protocol=protocol,
+            match_url="/c/test",
+        )
+        before = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=4,
+            user_turn_id="user-pending",
+            user_turn_pending=True,
+        )
+        after = PageSnapshot(
+            phase=Phase.RESPONDING,
+            assistant_turn_id="assistant-7",
+            assistant_text_signature="stable-output",
+            assistant_text="stale old assistant",
+            assistant_count=7,
+            user_count=5,
+            user_turn_id="user-watchdog",
+            user_turn_pending=True,
+            submission_receipt_seq=1,
+            submission_receipt_id="user-watchdog",
+            submission_receipt_text="continue",
+        )
+        snapshots = iter([before, after])
+        page.snapshot = lambda: next(snapshots)
+
+        self.assertTrue(page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.2))
+        self.assertIn("const allowGenerationActive = true;", protocol.expressions[0])
+        self.assertIn("const allowUserTurnPending = true;", protocol.expressions[0])
+
     def test_send_liveness_continue_runs_dom_submit_for_active_snapshot(self) -> None:
         protocol = FakeProtocol()
         page = RelayChatGPTPage(

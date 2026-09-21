@@ -105,6 +105,33 @@ class RelayCdpProtocol:
                 if target.get("targetId") == target_id and params.get("sessionId"):
                     return str(params["sessionId"])
 
+    def command(self, method: str, params: dict | None = None, *, session_id: str | None = None):
+        if not isinstance(method, str) or not method:
+            raise ValueError("CDP method is required")
+        request_id = self._request_id()
+        deadline = self._start_request()
+        message = {"id": request_id, "method": method, "params": params or {}}
+        if session_id:
+            message["sessionId"] = session_id
+        self._send(message)
+        while True:
+            response = self._recv(deadline)
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise RelayCdpError(str(response["error"]))
+            return response.get("result", {})
+
+    def create_target(self, url: str) -> str:
+        result = self.command("Target.createTarget", {"url": url})
+        target_id = result.get("targetId") if isinstance(result, dict) else None
+        if not isinstance(target_id, str) or not target_id:
+            raise RelayCdpError("Target.createTarget did not return targetId")
+        return target_id
+
+    def reload_page(self, session_id: str) -> None:
+        self.command("Page.reload", {"ignoreCache": True}, session_id=session_id)
+
     def evaluate(
         self,
         session_id: str,

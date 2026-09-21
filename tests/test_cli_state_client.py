@@ -10,6 +10,12 @@ from chat_watchdog.registry import RegistrationRejected
 from chat_watchdog.state_client import StateProtocolError, StateUnavailable
 
 
+def test_simple_registry_defaults_to_fifteen_minutes_and_no_sidecar_owner():
+    args = build_parser().parse_args(["--simple", "--registry-port", "9235"])
+    assert args.simple is True
+    assert args.simple_interval_seconds == 900
+
+
 def test_registry_liveness_defaults_are_explicit_and_positive():
     args = build_parser().parse_args([])
     assert args.active_stall_seconds == 300.0

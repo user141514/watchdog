@@ -18,6 +18,7 @@ from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
 from .progress_liveness import MymemLiteStore
 from .state_client import SidecarStateClient, StateProtocolError, StateUnavailable, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
+from .simple_watchdog import DEFAULT_SIMPLE_INTERVAL_SECONDS, SimpleWatcher
 
 
 def parse_agent_command(value: str) -> AgentSpec:
@@ -161,32 +162,44 @@ class _SupervisorWatcher:
         self.page.close()
 
 
-def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> int:
+def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client) -> int:
     if args.reanchor_store or args.reanchor_scope or args.reanchor_cli or args.reanchor_epoch:
         raise SystemExit("registry mode does not share one reanchor scope across multiple conversations")
 
-    progress_store = MymemLiteStore(args.mymem_lite_dir)
+    if args.simple:
+        progress_store = None
+        poll_seconds = args.simple_interval_seconds
 
-    def create_watcher(target_url: str) -> _SupervisorWatcher:
-        conversation_id = conversation_id_from_url(target_url)
-        page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
-        supervisor = Supervisor(
-            _ObservationPage(page) if intent_client else page,
-            pool,
-            recovery_timeout_seconds=args.recovery_timeout_seconds,
-            heartbeat_seconds=args.reanchor_heartbeat_seconds,
-            reanchor=None,
-            intent_client=intent_client,
-            state_client=state_client,
-            progress_store=progress_store,
-            progress_id=conversation_id,
-            active_stall_seconds=args.active_stall_seconds,
-        )
-        return _SupervisorWatcher(page, supervisor)
+        def create_watcher(target_url: str) -> SimpleWatcher:
+            return SimpleWatcher(target_url, relay_url=args.relay_url)
 
-    registration_preflight = None
-    if state_client is not None:
-        registration_preflight = lambda target_url: validate_managed_registration(state_client, target_url)
+        registration_preflight = None
+    else:
+        if pool is None:
+            raise RuntimeError("managed registry requires an agent pool")
+        progress_store = MymemLiteStore(args.mymem_lite_dir)
+        poll_seconds = args.poll_seconds
+
+        def create_watcher(target_url: str) -> _SupervisorWatcher:
+            conversation_id = conversation_id_from_url(target_url)
+            page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
+            supervisor = Supervisor(
+                _ObservationPage(page) if intent_client else page,
+                pool,
+                recovery_timeout_seconds=args.recovery_timeout_seconds,
+                heartbeat_seconds=args.reanchor_heartbeat_seconds,
+                reanchor=None,
+                intent_client=intent_client,
+                state_client=state_client,
+                progress_store=progress_store,
+                progress_id=conversation_id,
+                active_stall_seconds=args.active_stall_seconds,
+            )
+            return _SupervisorWatcher(page, supervisor)
+
+        registration_preflight = None
+        if state_client is not None:
+            registration_preflight = lambda target_url: validate_managed_registration(state_client, target_url)
     registry = WatchRegistry(
         create_watcher,
         store_path=args.registry_store,
@@ -197,7 +210,7 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
     try:
         server = create_control_server(
             registry, args.registry_host, args.registry_port,
-            stale_after=max(30.0, args.poll_seconds * 3),
+            stale_after=max(30.0, poll_seconds * 3),
         )
     except BaseException:
         registry.close()
@@ -218,7 +231,7 @@ def _run_registry_mode(args, pool: AgentPool, intent_client, state_client) -> in
                 # Storage failure stays observable and closes the send gate; retry
                 # storage on the next poll without losing desired registrations.
                 logging.exception("watch registry polling failed; retaining desired watches")
-            time.sleep(max(0.01, args.poll_seconds - (time.monotonic() - started)))
+            time.sleep(max(0.01, poll_seconds - (time.monotonic() - started)))
         raise RuntimeError("watchdog control server unexpectedly stopped")
     except KeyboardInterrupt:
         logging.info("stopped by user")
@@ -272,6 +285,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="enable dynamic watch registry on localhost at this port",
+    )
+    parser.add_argument(
+        "--simple",
+        action="store_true",
+        help="use the minimal refresh/check/nudge watchdog; registry mode only",
+    )
+    parser.add_argument(
+        "--simple-interval-seconds",
+        type=float,
+        default=DEFAULT_SIMPLE_INTERVAL_SECONDS,
+        help="simple watchdog interval; default: 900",
     )
     parser.add_argument(
         "--registry-store",
@@ -390,6 +414,15 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit(
             "durable registry requires Sidecar; --legacy-direct-send is single-conversation only"
         )
+    if args.simple_interval_seconds <= 0:
+        raise SystemExit("--simple-interval-seconds must be > 0")
+    if args.simple:
+        if args.registry_port is None:
+            raise SystemExit("--simple requires --registry-port")
+        if any((args.intent_url, args.send_admission_url, args.legacy_direct_send,
+                args.reanchor_store, args.reanchor_scope, args.reanchor_cli, args.reanchor_epoch)):
+            raise SystemExit("--simple is a standalone registry mode; do not combine managed/legacy/reanchor writers")
+        return _run_registry_mode(args, None, None, None)
 
     try:
         intent_client = build_intent_client(args)

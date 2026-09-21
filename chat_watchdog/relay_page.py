@@ -52,12 +52,15 @@ def _build_submit_expression(
     prompt: str,
     *,
     allow_generation_active: bool = False,
+    allow_user_turn_pending: bool = False,
 ) -> str:
     text = json.dumps(prompt)
     allow_active = "true" if allow_generation_active else "false"
+    allow_pending = "true" if allow_user_turn_pending else "false"
     return f"""
 (async () => {{
   const allowGenerationActive = {allow_active};
+  const allowUserTurnPending = {allow_pending};
   const visible = (el) => {{
     if (!el) return false;
     const style = window.getComputedStyle(el);
@@ -79,7 +82,7 @@ def _build_submit_expression(
   const stop = document.querySelector('[data-testid="stop-button"]');
   const busy = !!(turn && (turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')));
   if (!allowGenerationActive && (visible(stop) || busy)) return {{ submitted: false, reason: 'generation-active' }};
-  if (userTurnPending) return {{ submitted: false, reason: 'user-turn-pending' }};
+  if (!allowUserTurnPending && userTurnPending) return {{ submitted: false, reason: 'user-turn-pending' }};
 
   const editor = document.querySelector('#prompt-textarea') ||
     document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
@@ -301,6 +304,7 @@ class RelayChatGPTPage:
         require_message_id: bool,
         allow_blocked: bool = False,
         allow_active: bool = False,
+        allow_user_turn_pending: bool = False,
     ) -> PromptDelivery:
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
@@ -329,6 +333,7 @@ class RelayChatGPTPage:
                 _build_submit_expression(
                     prompt,
                     allow_generation_active=allow_active,
+                    allow_user_turn_pending=allow_user_turn_pending,
                 ),
                 await_promise=True,
             )
@@ -391,6 +396,22 @@ class RelayChatGPTPage:
             allow_blocked=True,
         )
 
+    def send_simple_continue(
+        self,
+        prompt: str,
+        expected_turn_key: TurnKey,
+        acceptance_timeout: float = 40.0,
+    ) -> PromptDelivery:
+        return self._send_prompt(
+            prompt,
+            expected_turn_key,
+            acceptance_timeout=acceptance_timeout,
+            require_message_id=False,
+            allow_blocked=True,
+            allow_active=True,
+            allow_user_turn_pending=True,
+        )
+
     def send_liveness_continue(
         self,
         prompt: str,
@@ -411,6 +432,18 @@ class RelayChatGPTPage:
             allow_blocked=True,
             allow_active=True,
         )
+
+    def refresh(self) -> None:
+        self.protocol.reload_page(self.session_id)
+
+    def current_url(self) -> str:
+        try:
+            value = self.protocol.evaluate(self.session_id, "location.href")
+        except RelayCdpError:
+            if not self._reconnect():
+                raise
+            value = self.protocol.evaluate(self.session_id, "location.href")
+        return str(value or "")
 
     def retry_fault(
         self,
