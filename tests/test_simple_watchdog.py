@@ -130,7 +130,7 @@ def test_send_reuses_existing_prompt_and_visible_bottom_change_confirms_progress
 
     assert watcher.step() == "progress_visible"
     assert page.sent == [(CONTINUE_PROMPT, "assistant-old", 40.0)]
-    assert watcher.diagnostics["user_message_id"] == "user-watchdog"
+    assert watcher.diagnostics["frontend_user_message_id"] == "user-watchdog"
 
 
 def test_no_visible_progress_after_confirmed_send_remains_unknown_and_never_replays():

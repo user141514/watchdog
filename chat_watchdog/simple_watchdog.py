@@ -157,11 +157,11 @@ class SimpleWatcher:
                 self._completion_text = current.assistant_text
                 if _visible_progress(before, current):
                     self._state = "progress_visible"
-                    self._diagnostics = {"user_message_id": delivery.message_id}
+                    self._diagnostics = {"frontend_user_message_id": delivery.message_id}
                     return self._state
 
             self._state = "sent_no_visible_progress"
-            self._diagnostics = {"user_message_id": delivery.message_id}
+            self._diagnostics = {"frontend_user_message_id": delivery.message_id}
             return self._state
         finally:
             page.close()
