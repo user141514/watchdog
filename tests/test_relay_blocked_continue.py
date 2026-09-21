@@ -29,7 +29,7 @@ class FakeProtocol:
 
 
 class BlockedRelayContinueTests(unittest.TestCase):
-    def test_simple_continue_rejects_optimistic_user_dom_without_frontend_acceptance(self) -> None:
+    def test_simple_continue_accepts_new_exact_user_with_empty_composer_before_stop_appears(self) -> None:
         protocol = FakeProtocol()
         page = RelayChatGPTPage(
             target_id="page-1",
@@ -68,14 +68,13 @@ class BlockedRelayContinueTests(unittest.TestCase):
         page.snapshot = lambda: before if protocol.evaluate_calls == 0 else optimistic
 
         delivery = page.send_simple_continue("continue", before.turn_key, acceptance_timeout=0.02)
-        self.assertFalse(delivery.accepted)
-        self.assertTrue(delivery.uncertain)
+        self.assertTrue(delivery.accepted)
+        self.assertEqual(delivery.message_id, "user-watchdog")
 
-    def test_simple_continue_requires_all_frontend_acceptance_signals(self) -> None:
+    def test_simple_continue_requires_exact_user_and_empty_composer(self) -> None:
         cases = [
             {"user_text": "wrong prompt", "stop_visible": True, "composer_has_draft": False},
             {"user_text": "continue", "stop_visible": True, "composer_has_draft": True},
-            {"user_text": "continue", "stop_visible": False, "composer_has_draft": False},
         ]
         for fields in cases:
             with self.subTest(fields=fields):

@@ -370,7 +370,6 @@ class RelayChatGPTPage:
                 and current.user_turn_id != before.user_turn_id
                 and current.user_text.replace("\r\n", "\n").strip() == expected_text
                 and not current.composer_has_draft
-                and current.stop_visible
             )
             if require_frontend_acceptance and frontend_accepted:
                 return PromptDelivery(
