@@ -77,6 +77,7 @@ class Intents:
     def __init__(self, response=None):
         self.calls = []
         self.response = response or {"accepted": True}
+        self.responses = list(response) if isinstance(response, list) else None
 
     def submit(self, *args, **kwargs):
         raise AssertionError("authoritative managed mode must not publish legacy intent payloads")
@@ -89,14 +90,18 @@ class Intents:
             state["turn"]["assistantMessageId"],
             action,
         ))
+        if self.responses is not None:
+            return self.responses.pop(0) if len(self.responses) > 1 else self.responses[0]
         return self.response
 
 
 class ProgressStore:
     def __init__(self, *, stalled=False):
         self.stalled = stalled
+        self.stall_settled = False
         self.observations = []
         self.claims = []
+        self.settlements = []
 
     def observe(self, conversation_id, target_url, fingerprint, *, observable):
         self.observations.append((conversation_id, target_url, fingerprint, observable))
@@ -104,10 +109,11 @@ class ProgressStore:
 
     def claim_stall(self, conversation_id, *, timeout_seconds, state_version, writer_epoch):
         self.claims.append((conversation_id, timeout_seconds, state_version, writer_epoch))
-        if self.stalled:
-            self.stalled = False
-            return True
-        return False
+        return self.stalled and not self.stall_settled
+
+    def settle_stall(self, conversation_id):
+        self.settlements.append(conversation_id)
+        self.stall_settled = True
 
 
 class States:
@@ -175,10 +181,41 @@ class AuthoritativeStateSupervisorTests(unittest.TestCase):
             ("00000000-0000-0000-0000-000000000011", 300.0, 9, 3)
         ])
 
-        # The stall epoch is consumed before the stop effect, so a repeated poll
-        # over the same observable state cannot issue a second stop.
+        # Accepted stop settles this epoch; a repeated poll cannot issue another intent.
+        self.assertEqual(progress_store.settlements, ["00000000-0000-0000-0000-000000000011"])
         self.assertEqual(sup.step(), StepResult.ACTIVE)
         self.assertEqual(len(intents.calls), 1)
+
+    def test_uncertain_stop_retries_same_managed_intent_for_receipt_reconciliation(self):
+        progress_store = ProgressStore(stalled=True)
+        authoritative = state(
+            progress="active",
+            body="empty",
+            turn={"assistantMessageId": None},
+        )
+        page = Page(phase=Phase.RESPONDING, user="user-auth", assistant="", text="Thinking")
+        sup, page, intents, pool = self.supervisor(
+            authoritative,
+            page=page,
+            intent_response=[
+                {"accepted": False, "reason": "delivery_uncertain"},
+                {"accepted": True},
+            ],
+            progress_store=progress_store,
+        )
+
+        self.assertEqual(sup.step(), StepResult.DELIVERY_UNCERTAIN)
+        self.assertEqual(progress_store.settlements, [])
+        self.assertEqual(sup.step(), StepResult.RECOVERY_STARTED)
+        self.assertEqual(intents.calls, [
+            (TARGET, "user-auth", None, "stop"),
+            (TARGET, "user-auth", None, "stop"),
+        ])
+        self.assertEqual(progress_store.settlements, ["00000000-0000-0000-0000-000000000011"])
+        self.assertEqual(sup.step(), StepResult.ACTIVE)
+        self.assertEqual(len(intents.calls), 2)
+        self.assertEqual(page.effects, 0)
+        self.assertEqual(pool.calls, 0)
 
     def test_active_liveness_suspends_when_relay_snapshot_is_unavailable(self):
         progress_store = ProgressStore(stalled=True)

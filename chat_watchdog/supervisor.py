@@ -86,6 +86,8 @@ class ProgressStorePort(Protocol):
         writer_epoch: int,
     ) -> bool: ...
 
+    def settle_stall(self, conversation_id: str): ...
+
 
 class StepResult(str, Enum):
     ACTIVE = "active"
@@ -626,7 +628,15 @@ class Supervisor:
                     stalled = False
                 self.diagnostics['active_stall_claimed'] = stalled
                 if stalled:
-                    return self._publish_stop(value)
+                    result = self._publish_stop(value)
+                    if result is not StepResult.DELIVERY_UNCERTAIN:
+                        try:
+                            self._progress_store.settle_stall(self._progress_id)
+                        except Exception as error:
+                            self.diagnostics.update(
+                                progress_error=f'{type(error).__name__}: {error}'[:1000]
+                            )
+                    return result
             return StepResult.ACTIVE
         if progress in {'unknown', 'idle'}:
             return StepResult.WAITING

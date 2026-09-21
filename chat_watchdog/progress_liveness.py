@@ -57,6 +57,7 @@ class MymemLiteStore:
             "fingerprint": None,
             "last_progress_at": None,
             "last_stop_seq": None,
+            "last_stop_settled_seq": None,
         }
         for line in path.read_text(encoding="utf-8").splitlines():
             if not line:
@@ -74,6 +75,8 @@ class MymemLiteStore:
                 state["observable"] = False
             elif kind == "stop_claim":
                 state["last_stop_seq"] = int(event["seq"])
+            elif kind == "stop_settled":
+                state["last_stop_settled_seq"] = int(event["seq"])
         return state
 
     def _snapshot(self, conversation_id: str, state: dict) -> ProgressPulse:
@@ -174,9 +177,10 @@ class MymemLiteStore:
                 not state["observable"]
                 or last is None
                 or self._clock() - float(last) < timeout_seconds
-                or state["last_stop_seq"] == state["progress_seq"]
             ):
                 return False
+            if state["last_stop_seq"] == state["progress_seq"]:
+                return state["last_stop_settled_seq"] != state["progress_seq"]
             self._append(self.path_for(conversation_id), {
                 "schema": 1,
                 "kind": "stop_claim",
@@ -186,6 +190,20 @@ class MymemLiteStore:
                 "writer_epoch": int(writer_epoch),
             })
             return True
+
+    def settle_stall(self, conversation_id: str) -> ProgressPulse:
+        with self._lock:
+            state = self._read(conversation_id)
+            seq = int(state["progress_seq"])
+            if state["last_stop_seq"] == seq and state["last_stop_settled_seq"] != seq:
+                self._append(self.path_for(conversation_id), {
+                    "schema": 1,
+                    "kind": "stop_settled",
+                    "at": self._clock(),
+                    "seq": seq,
+                })
+                state["last_stop_settled_seq"] = seq
+            return self._snapshot(conversation_id, state)
 
     def remove(self, conversation_id: str) -> None:
         with self._lock:
