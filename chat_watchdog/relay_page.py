@@ -67,8 +67,13 @@ def _build_submit_expression(
     const rect = el.getBoundingClientRect();
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   }};
-  const assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
-  const users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const currentUnits = (role) => Array.from(document.querySelectorAll(
+    '[data-chatgpt-search-unit-key$=":' + role + '"][data-chatgpt-search-message-ids]'
+  ));
+  let assistants = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+  if (!assistants.length) assistants = currentUnits('assistant');
+  let users = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  if (!users.length) users = currentUnits('user');
   const latest = assistants.length ? assistants[assistants.length - 1] : null;
   const latestUser = users.length ? users[users.length - 1] : null;
   const userTurnPending = !!(latestUser && (
@@ -77,30 +82,37 @@ def _build_submit_expression(
       (latest.compareDocumentPosition(latestUser) & 4) !== 0)
   ));
   const turn = latest
-    ? (latest.closest('[data-testid^="conversation-turn-"]') || latest.closest('article[data-turn="assistant"]') || latest)
+    ? (
+        latest.closest('[data-turn-key]') ||
+        latest.closest('[data-testid^="conversation-turn-"]') ||
+        latest.closest('article[data-turn="assistant"]') ||
+        latest
+      )
     : null;
-  const stop = document.querySelector('[data-testid="stop-button"]');
+  const semanticStop = () => document.querySelector('[data-testid="stop-button"]') ||
+    Array.from(document.querySelectorAll('button')).find((button) => {{
+      const label = (
+        button.getAttribute('aria-label') ||
+        button.getAttribute('title') ||
+        button.textContent ||
+        ''
+      ).trim().toLowerCase();
+      return label === 'stop' || label.includes('stop generating') || label.includes('停止');
+    }});
+  const stop = semanticStop();
   const busy = !!(turn && (turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')));
   if (!allowGenerationActive && (visible(stop) || busy)) return {{ submitted: false, reason: 'generation-active' }};
   if (!allowUserTurnPending && userTurnPending) return {{ submitted: false, reason: 'user-turn-pending' }};
 
-  const editor = document.querySelector('#prompt-textarea') ||
+  const text = {text};
+  const normalizedText = text.replace(/\\r\\n/g, '\\n').trim();
+  const findEditor = () => document.querySelector('#prompt-textarea') ||
     document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
     document.querySelector('div[contenteditable="true"]');
-  if (!editor || !visible(editor) || editor.getAttribute('aria-disabled') === 'true') {{
-    return {{ submitted: false, reason: 'composer-unavailable' }};
-  }}
-  const text = {text};
-  const existing = typeof editor.value === 'string'
+  const readEditor = (editor) => typeof editor?.value === 'string'
     ? editor.value
-    : (editor.innerText || editor.textContent || '');
-  const normalizedExisting = existing.replace(/\\r\\n/g, '\\n').trim();
-  const normalizedText = text.replace(/\\r\\n/g, '\\n').trim();
-  if (normalizedExisting && normalizedExisting !== normalizedText) {{
-    return {{ submitted: false, reason: 'composer-not-empty' }};
-  }}
-
-  if (!normalizedExisting) {{
+    : (editor?.innerText || editor?.textContent || '');
+  const writeEditor = (editor) => {{
     editor.focus();
     if (editor instanceof HTMLTextAreaElement || editor instanceof HTMLInputElement) {{
       const prototype = editor instanceof HTMLTextAreaElement ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -116,21 +128,101 @@ def _build_submit_expression(
         editor.dispatchEvent(new InputEvent('input', {{ bubbles: true, inputType: 'insertText', data: text }}));
       }}
     }}
+  }};
+  const ensurePrompt = () => {{
+    const editor = findEditor();
+    if (!editor || !visible(editor) || editor.getAttribute('aria-disabled') === 'true') {{
+      return {{ ok: false, reason: 'composer-unavailable' }};
+    }}
+    const normalizedExisting = readEditor(editor).replace(/\\r\\n/g, '\\n').trim();
+    if (normalizedExisting && normalizedExisting !== normalizedText) {{
+      return {{ ok: false, reason: 'composer-not-empty' }};
+    }}
+    if (!normalizedExisting) writeEditor(editor);
+    const normalizedAfter = readEditor(editor).replace(/\\r\\n/g, '\\n').trim();
+    if (normalizedAfter !== normalizedText) {{
+      return {{ ok: false, reason: 'composer-write-unconfirmed' }};
+    }}
+    return {{ ok: true, editor }};
+  }};
+
+  const initialComposer = ensurePrompt();
+  if (!initialComposer.ok) {{
+    return {{ submitted: false, reason: initialComposer.reason }};
   }}
 
-  const findSend = () => document.querySelector('[data-testid="send-button"]') ||
-    Array.from(document.querySelectorAll('button')).find((button) => {{
-      const label = (button.getAttribute('aria-label') || button.textContent || '').trim().toLowerCase();
+  const enabled = (button) => !!(
+    button && visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true'
+  );
+  const buttonLabel = (button) => (
+    button?.getAttribute?.('aria-label') ||
+    button?.getAttribute?.('title') ||
+    button?.textContent ||
+    ''
+  ).trim().toLowerCase();
+  const isStopAction = (button) => {{
+    if (!button) return false;
+    const testId = (button.getAttribute?.('data-testid') || '').trim().toLowerCase();
+    const label = buttonLabel(button);
+    return testId === 'stop-button' ||
+      label === 'stop' ||
+      label.includes('stop generating') ||
+      label.includes('停止');
+  }};
+  const findSend = () => {{
+    const explicit = document.querySelector('[data-testid="send-button"]');
+    if (explicit) return explicit;
+    const editor = findEditor();
+    const form = editor && typeof editor.closest === 'function' ? editor.closest('form') : null;
+    const formSubmit = form && typeof form.querySelector === 'function'
+      ? form.querySelector('button[type="submit"]')
+      : null;
+    if (formSubmit && !isStopAction(formSubmit)) return formSubmit;
+    return Array.from(document.querySelectorAll('button')).find((button) => {{
+      const label = buttonLabel(button);
       return label === 'send' || label.includes('send message') || label.includes('发送');
     }});
+  }};
+  const findStop = () => document.querySelector('[data-testid="stop-button"]') ||
+    Array.from(document.querySelectorAll('button')).find(isStopAction);
+
+  // 2026-09-26 ChatGPT Web can expose a usable send action while the
+  // assistant is still active. Prefer that non-destructive path first.
   for (let attempt = 0; attempt < 16; attempt += 1) {{
     const button = findSend();
-    if (button && visible(button) && !button.disabled && button.getAttribute('aria-disabled') !== 'true') {{
+    if (enabled(button)) {{
       button.click();
-      return {{ submitted: true }};
+      return {{ submitted: true, path: 'direct' }};
     }}
     await new Promise((resolve) => setTimeout(resolve, 125));
   }}
+
+  // Some active states keep only Stop actionable. Stop is a recovery action,
+  // not the definition of "active": use it only after direct submission is
+  // proven unavailable, then re-establish the exact prompt before sending.
+  if (allowGenerationActive) {{
+    const stopButton = findStop();
+    if (enabled(stopButton)) {{
+      stopButton.click();
+      for (let attempt = 0; attempt < 32; attempt += 1) {{
+        const composer = ensurePrompt();
+        if (!composer.ok) {{
+          if (composer.reason === 'composer-not-empty') {{
+            return {{ submitted: false, reason: 'composer-changed-after-stop', stopped: true }};
+          }}
+        }} else {{
+          const button = findSend();
+          if (enabled(button)) {{
+            button.click();
+            return {{ submitted: true, path: 'stop-then-send', stopped: true }};
+          }}
+        }}
+        await new Promise((resolve) => setTimeout(resolve, 125));
+      }}
+      return {{ submitted: false, reason: 'send-unavailable-after-stop', stopped: true }};
+    }}
+  }}
+
   return {{ submitted: false, reason: 'send-unavailable' }};
 }})()
 """.strip()
@@ -167,7 +259,10 @@ class RelayChatGPTPage:
 
             websocket_factory = websocket.create_connection
         socket = websocket_factory(ws_url, timeout=3.0, suppress_origin=True)
-        protocol = RelayCdpProtocol(socket)
+        # Submit recovery may wait through direct-send probing plus a
+        # stop->send transition; keep the page-control RPC budget above that
+        # browser-side bounded wait without changing the protocol default.
+        protocol = RelayCdpProtocol(socket, request_timeout=8.0)
         try:
             session_id = protocol.attach_target(target_id)
         except BaseException:
@@ -206,7 +301,7 @@ class RelayChatGPTPage:
                 timeout=3.0,
                 suppress_origin=True,
             )
-            protocol = RelayCdpProtocol(replacement_socket)
+            protocol = RelayCdpProtocol(replacement_socket, request_timeout=8.0)
             target_id = str(target["id"])
             session_id = protocol.attach_target(target_id)
         except Exception:

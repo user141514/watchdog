@@ -21,6 +21,14 @@ const element = () => ({
   getAttribute: () => null
 });
 const finalButton = element();
+const semanticStopButton = {
+  ...element(),
+  getAttribute(name) {
+    if (name === 'aria-label') return '停止生成';
+    return null;
+  },
+  textContent: '',
+};
 const contentValue = config.contentText || (config.final ? 'complete response' : 'partial');
 const content = {...element(), innerText: contentValue,
   textContent: contentValue, innerHTML: '<p>text</p>', childElementCount: 1};
@@ -34,12 +42,13 @@ const assistantTurn = {
     return null;
   },
   querySelector(selector) {
-    if (selector.includes('turn-action-button')) return config.final ? finalButton : null;
+    if (selector.includes('turn-action-button')) return !config.newDom && config.final ? finalButton : null;
+    if (selector === '[data-markdown-text-style="assistant-message"]') return config.newDom ? content : null;
     if (selector === '.markdown') return content;
     return null;
   },
   querySelectorAll(selector) {
-    return selector.includes('turn-action-button') && config.final ? [finalButton] : [];
+    return selector.includes('turn-action-button') && !config.newDom && config.final ? [finalButton] : [];
   },
   cloneNode() {
     const clone = {
@@ -59,23 +68,53 @@ const assistantTurn = {
 const userTurn = {getAttribute: name => !config.noStableIds && name === 'data-testid' ? 'conversation-turn-3' : null};
 const pendingUser = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'pending-user-message-uuid' : null,
   closest: () => userTurn, innerText: 'new coordinator prompt', textContent: 'new coordinator prompt'};
-const assistant = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'assistant-message-uuid' : null,
+const assistant = {
+  getAttribute(name) {
+    if (config.noStableIds || config.noMessageIds) return null;
+    if (!config.newDom && name === 'data-message-id') return 'assistant-message-uuid';
+    if (config.newDom && name === 'data-chatgpt-search-message-ids') return 'assistant-message-uuid assistant-message-uuid';
+    if (config.newDom && name === 'data-chatgpt-search-unit-key') return 'fallback-turn-0:2:assistant';
+    return null;
+  },
+  querySelector(selector) {
+    if (config.newDom && selector === '.turn-action-controls') return config.final ? finalButton : null;
+    if (config.newDom && selector === '[data-markdown-text-style="assistant-message"]') return content;
+    return null;
+  },
   closest: () => assistantTurn,
-  compareDocumentPosition(other) { return config.pendingUser && other === pendingUser ? 4 : 0; }};
-const user = {getAttribute: name => !config.noStableIds && !config.noMessageIds && name === 'data-message-id' ? 'user-message-uuid' : null,
-  closest: () => userTurn, innerText: 'fixture prompt', textContent: 'fixture prompt'};
+  compareDocumentPosition(other) { return config.pendingUser && other === pendingUser ? 4 : 0; }
+};
+const user = {
+  getAttribute(name) {
+    if (config.noStableIds || config.noMessageIds) return null;
+    if (!config.newDom && name === 'data-message-id') return 'user-message-uuid';
+    if (config.newDom && name === 'data-chatgpt-search-message-ids') return 'user-message-uuid';
+    if (config.newDom && name === 'data-chatgpt-search-unit-key') return 'fallback-turn-0:0:user';
+    return null;
+  },
+  closest: () => userTurn,
+  innerText: 'fixture prompt',
+  textContent: 'fixture prompt'
+};
 const composer = {...element(), innerText: '', textContent: ''};
 const context = {
   window: {getComputedStyle: () => ({display: 'block', visibility: 'visible'})},
   document: {
     querySelector(selector) {
       if (selector === '#prompt-textarea') return composer;
-      if (selector === '[data-testid="stop-button"]') return config.active ? element() : null;
+      if (selector === '[data-testid="stop-button"]') return config.active && !config.semanticStop ? element() : null;
       return null;
     },
     querySelectorAll(selector) {
-      if (selector === '[data-message-author-role="assistant"]') return [assistant];
-      if (selector === '[data-message-author-role="user"]') return config.pendingUser ? [user, pendingUser] : [user];
+      if (selector === '[data-message-author-role="assistant"]') return config.newDom ? [] : [assistant];
+      if (selector === '[data-message-author-role="user"]') return config.newDom ? [] : (config.pendingUser ? [user, pendingUser] : [user]);
+      if (selector === '[data-chatgpt-search-unit-key$=":assistant"][data-chatgpt-search-message-ids]') {
+        return config.newDom ? [assistant] : [];
+      }
+      if (selector === '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]') {
+        return config.newDom ? [user] : [];
+      }
+      if (selector === 'button') return config.active && config.semanticStop ? [semanticStopButton] : [];
       return [];
     }
   }
@@ -104,6 +143,19 @@ class SnapshotFinalityTests(unittest.TestCase):
         self.assertEqual(self.snapshot(payload).phase, Phase.BLOCKED)
         self.assertIs(payload.get('assistantFinalized'), False)
 
+    def test_20260926_dom_units_preserve_identity_and_finality(self):
+        payload = self.payload(final=True, newDom=True)
+        self.assertIs(payload.get('assistantFinalized'), True)
+        self.assertEqual(payload['assistantTurnId'], 'assistant-message-uuid')
+        self.assertEqual(payload['userTurnId'], 'user-message-uuid')
+        self.assertEqual(payload['assistantText'], 'complete response')
+        self.assertEqual(self.snapshot(payload).phase, Phase.FINISHED)
+
+    def test_20260926_stream_without_final_controls_fails_closed(self):
+        payload = self.payload(final=False, newDom=True)
+        self.assertIs(payload.get('assistantFinalized'), False)
+        self.assertEqual(self.snapshot(payload).phase, Phase.BLOCKED)
+
     def test_final_controls_allow_completed_reply(self):
         payload = self.payload(final=True)
         self.assertIs(payload.get('assistantFinalized'), True)
@@ -128,6 +180,11 @@ class SnapshotFinalityTests(unittest.TestCase):
 
     def test_active_generation_remains_active(self):
         self.assertEqual(self.snapshot(self.payload(final=False, active=True)).phase, Phase.RESPONDING)
+
+    def test_20260926_semantic_stop_keeps_active_generation_visible(self):
+        payload = self.payload(final=False, active=True, semanticStop=True, newDom=True)
+        self.assertIs(payload['stopVisible'], True)
+        self.assertEqual(self.snapshot(payload).phase, Phase.RESPONDING)
 
     def test_liveness_signature_ignores_dom_only_churn(self):
         before = self.payload(

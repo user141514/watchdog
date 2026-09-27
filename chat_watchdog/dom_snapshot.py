@@ -35,9 +35,34 @@ DOM_SNAPSHOT_JS = r"""
     };
     window[receiptKey] = submission;
   }
-  const messageUsers = () => Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const messageId = (node) => {
+    if (!node) return '';
+    const direct = (node.getAttribute?.('data-message-id') || '').trim();
+    if (direct) return direct;
+    const searchIds = (node.getAttribute?.('data-chatgpt-search-message-ids') || '')
+      .trim()
+      .split(/\s+/)
+      .filter(Boolean);
+    if (searchIds.length) return searchIds[searchIds.length - 1];
+    const selected = node.querySelector?.('[data-chatgpt-selection-message-id]');
+    return (selected?.getAttribute?.('data-chatgpt-selection-message-id') || '').trim();
+  };
+  const messageUsers = () => {
+    let nodes = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll(
+        '[data-chatgpt-search-unit-key$=":user"][data-chatgpt-search-message-ids]'
+      ));
+    }
+    return nodes;
+  };
   const messageAssistants = () => {
     let nodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll(
+        '[data-chatgpt-search-unit-key$=":assistant"][data-chatgpt-search-message-ids]'
+      ));
+    }
     if (!nodes.length) {
       nodes = Array.from(document.querySelectorAll(
         '[data-testid^="conversation-turn-"][data-turn="assistant"], article[data-turn="assistant"]'
@@ -70,7 +95,7 @@ DOM_SNAPSHOT_JS = r"""
     const anchorAssistant = currentAssistants.length
       ? currentAssistants[currentAssistants.length - 1]
       : null;
-    const anchorAssistantId = anchorAssistant?.getAttribute?.('data-message-id') || '';
+    const anchorAssistantId = messageId(anchorAssistant);
     // Without an exact stable anchor, the mounted window cannot prove that a
     // later user node is causally after this submission event. Fail closed.
     if (!anchorAssistantId) return;
@@ -78,7 +103,7 @@ DOM_SNAPSHOT_JS = r"""
     submission.pendingSeq = submission.seq;
     submission.pendingText = text;
     submission.pendingKnownIds = messageUsers()
-      .map((node) => node.getAttribute?.('data-message-id') || '')
+      .map(messageId)
       .filter(Boolean);
     submission.pendingAnchorAssistantId = anchorAssistantId;
     submission.pendingTrusted = trusted === true;
@@ -112,11 +137,11 @@ DOM_SNAPSHOT_JS = r"""
   if (submission.pendingSeq && submission.pendingText && submission.pendingAnchorAssistantId) {
     const knownIds = new Set(Array.isArray(submission.pendingKnownIds) ? submission.pendingKnownIds : []);
     const anchorAssistant = assistants.find(
-      (node) => (node.getAttribute?.('data-message-id') || '') === submission.pendingAnchorAssistantId
+      (node) => messageId(node) === submission.pendingAnchorAssistantId
     );
     const receiptNode = anchorAssistant
       ? [...users].reverse().find((node) => {
-          const id = node.getAttribute?.('data-message-id') || '';
+          const id = messageId(node);
           const text = normalizeText(node.innerText || node.textContent || '');
           const followsAnchor = typeof anchorAssistant.compareDocumentPosition === 'function'
             && (anchorAssistant.compareDocumentPosition(node) & 4) !== 0;
@@ -124,7 +149,7 @@ DOM_SNAPSHOT_JS = r"""
         })
       : null;
     if (receiptNode) {
-      const id = receiptNode.getAttribute?.('data-message-id') || '';
+      const id = messageId(receiptNode);
       submission.receiptSeq = Number(submission.pendingSeq || 0);
       submission.receiptId = id;
       submission.receiptText = submission.pendingText;
@@ -147,18 +172,46 @@ DOM_SNAPSHOT_JS = r"""
       (assistant.compareDocumentPosition(user) & 4) !== 0)
   ));
   const userTurn = user
-    ? (user.closest('[data-testid^="conversation-turn-"]') || user.closest('article[data-turn="user"]') || user)
+    ? (
+        user.closest('[data-turn-key]') ||
+        user.closest('[data-testid^="conversation-turn-"]') ||
+        user.closest('article[data-turn="user"]') ||
+        user
+      )
     : null;
   const turn = assistant
-    ? (assistant.closest('[data-testid^="conversation-turn-"]') || assistant.closest('article[data-turn="assistant"]') || assistant)
+    ? (
+        assistant.closest('[data-turn-key]') ||
+        assistant.closest('[data-testid^="conversation-turn-"]') ||
+        assistant.closest('article[data-turn="assistant"]') ||
+        assistant
+      )
     : null;
 
   // A vanished stop button is not proof of a final response. A background
   // tab can retain only a streamed prefix after the server has finished.
-  const assistantFinalized = !!(turn &&
-    turn.querySelector('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]'));
+  // 2026-09-26 ChatGPT Web removed the legacy turn-action testids; its
+  // finalized assistant unit exposes the stable turn-action-controls group.
+  const assistantFinalized = !!(
+    (turn && turn.querySelector('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]'))
+    || assistant?.querySelector?.('.turn-action-controls')
+  );
 
-  const stop = document.querySelector('[data-testid="stop-button"]');
+  const semanticButtonLabel = (button) => normalizeText(
+    button?.getAttribute?.('aria-label') ||
+    button?.getAttribute?.('title') ||
+    button?.textContent ||
+    ''
+  ).toLowerCase();
+  const stop = document.querySelector('[data-testid="stop-button"]') ||
+    Array.from(document.querySelectorAll('button')).find((button) => {
+      if (!visible(button)) return false;
+      const label = semanticButtonLabel(button);
+      return label === 'stop' ||
+        label.includes('stop generating') ||
+        label.includes('停止生成') ||
+        label === '停止';
+    }) || null;
   const assistantBusy = !!(turn && (
     turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')
   ));
@@ -210,6 +263,8 @@ DOM_SNAPSHOT_JS = r"""
   const faultText = retryContexts.find((value) => value) || '';
 
   const contentCandidates = turn ? [
+    assistant?.querySelector?.('[data-markdown-text-style="assistant-message"]'),
+    turn.querySelector('[data-markdown-text-style="assistant-message"]'),
     turn.querySelector('[data-message-content]'),
     turn.querySelector('.markdown'),
     turn.querySelector('.prose'),
@@ -260,8 +315,8 @@ DOM_SNAPSHOT_JS = r"""
     if (!candidate || /^request[-_:]/i.test(candidate) || /^conversation-turn-\d+$/i.test(candidate)) return '';
     return candidate;
   };
-  const turnId = assistant?.getAttribute('data-message-id') || stableTurnId(turn);
-  const userTurnId = user?.getAttribute('data-message-id') || stableTurnId(userTurn);
+  const turnId = messageId(assistant) || stableTurnId(turn);
+  const userTurnId = messageId(user) || stableTurnId(userTurn);
   const userText = user
     ? (user.innerText || user.textContent || userTurn?.textContent || '')
     : '';
