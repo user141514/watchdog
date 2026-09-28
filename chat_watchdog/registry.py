@@ -255,6 +255,8 @@ class WatchRegistry:
                 raise RuntimeError("watch registry is closed")
             existing = self._watchers.get(conversation_id)
             if existing is not None:
+                if requested_task_id is not None and requested_task_id != existing.task_id:
+                    raise RuntimeError("conversation is already bound to a different task")
                 return RegisterResult(
                     task_id=existing.task_id,
                     conversation_id=conversation_id,
@@ -447,7 +449,7 @@ class WatchRegistry:
                 "instance_id": self.instance_id,
                 "pid": os.getpid(),
                 "module_path": str(Path(__file__).resolve()),
-                "protocol_version": 2,
+                "protocol_version": 3,
                 "last_poll_error": self._last_poll_error,
                 "durable": self._store.path is not None,
                 "store_path": self._store.path,

@@ -87,6 +87,29 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(registry.list()[0].task_id, first.task_id)
         self.assertEqual(registry.list()[0].state, "active")
 
+    def test_register_rechecks_task_identity_after_preflight_race(self) -> None:
+        registry: WatchRegistry | None = None
+        raced = False
+
+        def preflight(_url: str) -> None:
+            nonlocal raced
+            if raced:
+                return
+            raced = True
+            assert registry is not None
+            registry.register(PROJECT_URL, task_id="task-winner")
+
+        registry = WatchRegistry(
+            lambda url: FakeWatcher(url),
+            registration_preflight=preflight,
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "different task"):
+            registry.register(PROJECT_URL, task_id="task-loser")
+
+        self.assertEqual(registry.list()[0].task_id, "task-winner")
+        registry.close()
+
     def test_rebind_preserves_task_identity_across_conversation_replacement(self) -> None:
         created: list[FakeWatcher] = []
 
