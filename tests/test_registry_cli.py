@@ -16,9 +16,15 @@ CHAT_URL = f"https://chatgpt.com/g/g-p-example-agent/c/{CHAT_ID}"
 
 class RegistryCliTests(unittest.TestCase):
     def test_parser_is_only_a_thin_client(self) -> None:
-        args = build_parser().parse_args(["add", CHAT_URL])
+        args = build_parser().parse_args([
+            "add", CHAT_URL,
+            "--task-id", "task-123",
+            "--task-label", "Research task",
+        ])
         self.assertEqual(args.command, "add")
         self.assertEqual(args.url, CHAT_URL)
+        self.assertEqual(args.task_id, "task-123")
+        self.assertEqual(args.task_label, "Research task")
         self.assertEqual(args.control_url, "http://127.0.0.1:9235")
 
     def test_start_and_finish_are_lifecycle_aliases(self) -> None:
@@ -33,18 +39,47 @@ class RegistryCliTests(unittest.TestCase):
         output = io.StringIO()
         with patch(
             "chat_watchdog.registry_cli._request",
-            return_value={"conversation_id": CHAT_ID, "created": True},
+            return_value={"task_id": "task-123", "conversation_id": CHAT_ID, "created": True},
         ) as request, redirect_stdout(output):
-            code = main(["add", CHAT_URL])
+            code = main(["add", CHAT_URL, "--task-label", "Research task"])
 
         self.assertEqual(code, 0)
         request.assert_called_once_with(
             "http://127.0.0.1:9235",
             "POST",
             "/register",
-            {"url": CHAT_URL},
+            {"url": CHAT_URL, "task_label": "Research task"},
         )
-        self.assertEqual(output.getvalue().strip(), f"{CHAT_ID}\tcreated")
+        self.assertEqual(output.getvalue().strip(), f"task-123\t{CHAT_ID}\tcreated")
+
+    def test_rebind_forwards_task_identity_and_new_exact_url(self) -> None:
+        output = io.StringIO()
+        with patch(
+            "chat_watchdog.registry_cli._request",
+            return_value={
+                "task_id": "task-123",
+                "previous_conversation_id": CHAT_ID,
+                "conversation_id": "7bb542fd-708c-83ea-869a-721efd83d7f4",
+                "changed": True,
+            },
+        ) as request, redirect_stdout(output):
+            code = main([
+                "rebind",
+                "task-123",
+                "https://chatgpt.com/c/7bb542fd-708c-83ea-869a-721efd83d7f4",
+            ])
+
+        self.assertEqual(code, 0)
+        request.assert_called_once_with(
+            "http://127.0.0.1:9235",
+            "POST",
+            "/rebind",
+            {
+                "task_id": "task-123",
+                "url": "https://chatgpt.com/c/7bb542fd-708c-83ea-869a-721efd83d7f4",
+            },
+        )
+        self.assertIn("task-123", output.getvalue())
 
     def test_list_prints_machine_readable_registry_state(self) -> None:
         payload = {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL}]}

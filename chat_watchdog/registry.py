@@ -41,17 +41,29 @@ class Watcher(Protocol):
 
 @dataclass(frozen=True)
 class RegisterResult:
+    task_id: str
     conversation_id: str
     created: bool
 
 
 @dataclass(frozen=True)
+class RebindResult:
+    task_id: str
+    previous_conversation_id: str
+    conversation_id: str
+    changed: bool
+
+
+@dataclass(frozen=True)
 class WatchRegistration:
+    task_id: str
     conversation_id: str
     target_url: str
+    task_label: str | None = None
     state: str = "active"
     connected: bool = False
     registered_at: float | None = None
+    binding_changed_at: float | None = None
     last_poll_at: float | None = None
     last_success_at: float | None = None
     consecutive_failures: int = 0
@@ -61,6 +73,7 @@ class WatchRegistration:
 
 @dataclass(frozen=True)
 class WatchCompletion:
+    task_id: str
     conversation_id: str
     target_url: str
     result: str | None
@@ -68,10 +81,13 @@ class WatchCompletion:
 
 @dataclass
 class _WatchEntry:
+    task_id: str
     conversation_id: str
     target_url: str
+    task_label: str | None = None
     watcher: Watcher | None = None
     registered_at: float | None = None
+    binding_changed_at: float | None = None
     last_poll_at: float | None = None
     last_success_at: float | None = None
     consecutive_failures: int = 0
@@ -136,6 +152,7 @@ class WatchRegistry:
         self._progress_store = progress_store
         self._clock = clock
         self._watchers: dict[str, _WatchEntry] = {}
+        self._task_to_conversation: dict[str, str] = {}
         self._completed: dict[str, WatchCompletion] = {}
         self._lock = RLock()
         self._poll_lock = Lock()
@@ -153,17 +170,24 @@ class WatchRegistry:
                     raise RuntimeError("stored conversation identity mismatch")
                 if row["status"] == "completed":
                     self._completed[conversation_id] = WatchCompletion(
-                        conversation_id, row["target_url"], row["result"])
+                        row["task_id"], conversation_id, row["target_url"], row["result"])
                 else:
+                    task_id = row["task_id"]
                     lock = self._entry_locks.setdefault(conversation_id, RLock())
                     self._watchers[conversation_id] = _WatchEntry(
-                        conversation_id, row["target_url"], lock=lock,
+                        task_id=task_id,
+                        conversation_id=conversation_id,
+                        target_url=row["target_url"],
+                        task_label=row["task_label"],
+                        lock=lock,
                         registered_at=row["registered_at"],
+                        binding_changed_at=row["binding_changed_at"],
                         last_poll_at=row["last_poll_at"],
                         last_success_at=row["last_success_at"],
                         consecutive_failures=row["consecutive_failures"],
                         last_error=row["last_error"],
                     )
+                    self._task_to_conversation[task_id] = conversation_id
                     if self._progress_store is not None:
                         self._progress_store.ensure(conversation_id, row["target_url"])
                         # A daemon restart breaks the continuous observation
@@ -201,38 +225,152 @@ class WatchRegistry:
             except Exception:
                 _LOG.exception("watchdog transport cleanup failed: %s", entry.conversation_id)
 
-    def register(self, target_url: str) -> RegisterResult:
+    def register(
+        self,
+        target_url: str,
+        *,
+        task_id: str | None = None,
+        task_label: str | None = None,
+    ) -> RegisterResult:
         conversation_id = conversation_id_from_url(target_url)
+        requested_task_id = None if task_id is None else task_id.strip()
+        if requested_task_id == "":
+            raise ValueError("task_id must be a non-empty string")
         with self._lock:
             if self._closed:
                 raise RuntimeError("watch registry is closed")
+            existing = self._watchers.get(conversation_id)
+            if existing is not None:
+                if requested_task_id is not None and requested_task_id != existing.task_id:
+                    raise RuntimeError("conversation is already bound to a different task")
+                return RegisterResult(
+                    task_id=existing.task_id,
+                    conversation_id=conversation_id,
+                    created=False,
+                )
         if self._registration_preflight is not None:
             self._registration_preflight(target_url)
         with self._lock:
             if self._closed:
                 raise RuntimeError("watch registry is closed")
-            if conversation_id in self._watchers:
-                return RegisterResult(conversation_id=conversation_id, created=False)
+            existing = self._watchers.get(conversation_id)
+            if existing is not None:
+                return RegisterResult(
+                    task_id=existing.task_id,
+                    conversation_id=conversation_id,
+                    created=False,
+                )
+            effective_task_id = requested_task_id or str(uuid4())
+            bound_conversation = self._task_to_conversation.get(effective_task_id)
+            if bound_conversation is not None and bound_conversation != conversation_id:
+                raise RuntimeError("task is already bound; use /rebind to replace its conversation")
             at = self._clock()
             if self._progress_store is not None:
                 self._progress_store.ensure(conversation_id, target_url)
             try:
-                self._store.register(conversation_id, target_url, at)
+                self._store.register(
+                    conversation_id,
+                    effective_task_id,
+                    target_url,
+                    at,
+                    task_label=task_label,
+                )
             except BaseException:
                 if self._progress_store is not None:
                     self._progress_store.remove(conversation_id)
                 raise
             self._completed.pop(conversation_id, None)
             lock = self._entry_locks.setdefault(conversation_id, RLock())
-            entry = _WatchEntry(conversation_id, target_url, registered_at=at, lock=lock)
+            entry = _WatchEntry(
+                task_id=effective_task_id,
+                conversation_id=conversation_id,
+                target_url=target_url,
+                task_label=task_label,
+                registered_at=at,
+                binding_changed_at=at,
+                lock=lock,
+            )
             self._watchers[conversation_id] = entry
+            self._task_to_conversation[effective_task_id] = conversation_id
         if self._connect_on_register:
             with entry.lock:
                 with self._lock:
                     current = self._current(entry)
                 if current and entry.watcher is None:
                     self._bind(entry)
-        return RegisterResult(conversation_id=conversation_id, created=True)
+        return RegisterResult(
+            task_id=effective_task_id,
+            conversation_id=conversation_id,
+            created=True,
+        )
+
+    def rebind(self, task_id: str, target_url: str) -> RebindResult:
+        effective_task_id = task_id.strip()
+        if not effective_task_id:
+            raise ValueError("task_id must be a non-empty string")
+        conversation_id = conversation_id_from_url(target_url)
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("watch registry is closed")
+            previous_conversation_id = self._task_to_conversation.get(effective_task_id)
+            if previous_conversation_id is None:
+                raise RuntimeError(f"active task not found: {effective_task_id}")
+            entry = self._watchers[previous_conversation_id]
+            if previous_conversation_id == conversation_id:
+                return RebindResult(
+                    task_id=effective_task_id,
+                    previous_conversation_id=previous_conversation_id,
+                    conversation_id=conversation_id,
+                    changed=False,
+                )
+            collision = self._watchers.get(conversation_id)
+            if collision is not None and collision.task_id != effective_task_id:
+                raise RuntimeError("target conversation is already bound to a different task")
+        if self._registration_preflight is not None:
+            self._registration_preflight(target_url)
+
+        with entry.lock:
+            with self._lock:
+                if not self._current(entry):
+                    raise RuntimeError("task binding changed during rebind")
+                at = self._clock()
+                self._store.rebind(effective_task_id, conversation_id, target_url, at)
+                self._watchers.pop(previous_conversation_id)
+                lock = self._entry_locks.setdefault(conversation_id, RLock())
+                replacement = _WatchEntry(
+                    task_id=effective_task_id,
+                    conversation_id=conversation_id,
+                    target_url=target_url,
+                    task_label=entry.task_label,
+                    registered_at=entry.registered_at,
+                    binding_changed_at=at,
+                    lock=lock,
+                )
+                self._watchers[conversation_id] = replacement
+                self._task_to_conversation[effective_task_id] = conversation_id
+                self._completed.pop(conversation_id, None)
+            self._close_watcher(entry)
+
+        if self._progress_store is not None:
+            try:
+                self._progress_store.remove(previous_conversation_id)
+                self._progress_store.ensure(conversation_id, target_url)
+            except Exception:
+                _LOG.exception("mymem_lite rebind failed: %s", effective_task_id)
+
+        if self._connect_on_register:
+            with replacement.lock:
+                with self._lock:
+                    current = self._current(replacement)
+                if current and replacement.watcher is None:
+                    self._bind(replacement)
+
+        return RebindResult(
+            task_id=effective_task_id,
+            previous_conversation_id=previous_conversation_id,
+            conversation_id=conversation_id,
+            changed=True,
+        )
 
     def unregister(self, conversation: str) -> bool:
         conversation_id = _conversation_id(conversation)
@@ -242,6 +380,7 @@ class WatchRegistry:
                 return False
             self._store.remove(conversation_id, status="active")
             self._watchers.pop(conversation_id)
+            self._task_to_conversation.pop(entry.task_id, None)
         # Once this returns, no operation from the withdrawn generation is live.
         with entry.lock:
             self._close_watcher(entry)
@@ -279,13 +418,16 @@ class WatchRegistry:
         with self._lock:
             return [
                 WatchRegistration(
+                    task_id=entry.task_id,
                     conversation_id=entry.conversation_id,
                     target_url=entry.target_url,
+                    task_label=entry.task_label,
                     state=("reconnecting" if entry.watcher is None else
                            "degraded" if entry.last_error else
                            getattr(entry.watcher, "state", "active")),
                     connected=entry.watcher is not None,
                     registered_at=entry.registered_at,
+                    binding_changed_at=entry.binding_changed_at,
                     last_poll_at=entry.last_poll_at,
                     last_success_at=entry.last_success_at,
                     consecutive_failures=entry.consecutive_failures,
@@ -344,8 +486,9 @@ class WatchRegistry:
                 if completed:
                     self._store.complete(entry.conversation_id, result)
                     self._completed[entry.conversation_id] = WatchCompletion(
-                        entry.conversation_id, entry.target_url, result)
+                        entry.task_id, entry.conversation_id, entry.target_url, result)
                     self._watchers.pop(entry.conversation_id)
+                    self._task_to_conversation.pop(entry.task_id, None)
             if completed:
                 self._close_watcher(entry)
                 if self._progress_store is not None:
@@ -379,6 +522,7 @@ class WatchRegistry:
             self._closed = True
             entries = list(self._watchers.values())
             self._watchers.clear()
+            self._task_to_conversation.clear()
             self._completed.clear()
         for entry in entries:
             with entry.lock:
@@ -451,14 +595,44 @@ def create_control_server(
                 payload = self._read_json()
                 if self.path == "/register":
                     target_url = payload.get("url")
+                    task_id = payload.get("task_id")
+                    task_label = payload.get("task_label")
                     if not isinstance(target_url, str):
                         raise ValueError("url must be a string")
-                    result = registry.register(target_url)
+                    if task_id is not None and not isinstance(task_id, str):
+                        raise ValueError("task_id must be a string")
+                    if task_label is not None and not isinstance(task_label, str):
+                        raise ValueError("task_label must be a string")
+                    result = registry.register(
+                        target_url,
+                        task_id=task_id,
+                        task_label=task_label,
+                    )
                     self._send_json(
                         200,
                         {
+                            "task_id": result.task_id,
                             "conversation_id": result.conversation_id,
                             "created": result.created,
+                        },
+                    )
+                    return
+
+                if self.path == "/rebind":
+                    task_id = payload.get("task_id")
+                    target_url = payload.get("url")
+                    if not isinstance(task_id, str):
+                        raise ValueError("task_id must be a string")
+                    if not isinstance(target_url, str):
+                        raise ValueError("url must be a string")
+                    result = registry.rebind(task_id, target_url)
+                    self._send_json(
+                        200,
+                        {
+                            "task_id": result.task_id,
+                            "previous_conversation_id": result.previous_conversation_id,
+                            "conversation_id": result.conversation_id,
+                            "changed": result.changed,
                         },
                     )
                     return
@@ -484,6 +658,7 @@ def create_control_server(
                     self._send_json(
                         200,
                         {
+                            "task_id": None if completion is None else completion.task_id,
                             "conversation_id": conversation_id,
                             "active": registry.is_active(conversation_id),
                             "completed": completion is not None,

@@ -11,7 +11,9 @@ from chat_watchdog.registry import RegistrationRejected, WatchRegistry, create_c
 
 
 CHAT_ID = "6aa542fd-708c-83ea-869a-721efd83d7f3"
+CHAT_ID_2 = "7bb542fd-708c-83ea-869a-721efd83d7f4"
 CHAT_URL = f"https://chatgpt.com/g/g-p-example-agent/c/{CHAT_ID}"
+CHAT_URL_2 = f"https://chatgpt.com/c/{CHAT_ID_2}"
 
 
 @dataclass
@@ -68,10 +70,14 @@ class RegistryHttpTests(unittest.TestCase):
     def test_register_is_idempotent_and_list_uses_conversation_id(self) -> None:
         status, first = self.request("POST", "/register", {"url": CHAT_URL})
         self.assertEqual(status, 200)
-        self.assertEqual(first, {"conversation_id": CHAT_ID, "created": True})
+        self.assertEqual(first["conversation_id"], CHAT_ID)
+        self.assertTrue(first["created"])
+        self.assertIsInstance(first["task_id"], str)
 
         _, second = self.request("POST", "/register", {"url": CHAT_URL})
-        self.assertEqual(second, {"conversation_id": CHAT_ID, "created": False})
+        self.assertEqual(second["conversation_id"], CHAT_ID)
+        self.assertFalse(second["created"])
+        self.assertEqual(second["task_id"], first["task_id"])
         self.assertEqual(len(self.created), 1)
 
         _, listing = self.request("GET", "/watches")
@@ -79,8 +85,13 @@ class RegistryHttpTests(unittest.TestCase):
         entry = listing["watches"][0]
         # The original identity/state contract is preserved; diagnostics are additive.
         self.assertEqual(
-            {key: entry[key] for key in ("conversation_id", "target_url", "state")},
-            {"conversation_id": CHAT_ID, "target_url": CHAT_URL, "state": "active"},
+            {key: entry[key] for key in ("conversation_id", "target_url", "state", "task_id")},
+            {
+                "conversation_id": CHAT_ID,
+                "target_url": CHAT_URL,
+                "state": "active",
+                "task_id": first["task_id"],
+            },
         )
         self.assertTrue(entry["connected"])
         self.assertEqual(entry["consecutive_failures"], 0)
@@ -89,6 +100,29 @@ class RegistryHttpTests(unittest.TestCase):
         self.created[0].state = "need_input"
         _, paused = self.request("GET", "/watches")
         self.assertEqual(paused["watches"][0]["state"], "need_input")
+
+    def test_rebind_moves_same_task_to_new_conversation(self) -> None:
+        _, first = self.request(
+            "POST",
+            "/register",
+            {"url": CHAT_URL, "task_label": "Research task"},
+        )
+
+        _, rebound = self.request(
+            "POST",
+            "/rebind",
+            {"task_id": first["task_id"], "url": CHAT_URL_2},
+        )
+
+        self.assertTrue(rebound["changed"])
+        self.assertEqual(rebound["task_id"], first["task_id"])
+        self.assertEqual(rebound["previous_conversation_id"], CHAT_ID)
+        self.assertEqual(rebound["conversation_id"], CHAT_ID_2)
+
+        _, listing = self.request("GET", "/watches")
+        self.assertEqual(len(listing["watches"]), 1)
+        self.assertEqual(listing["watches"][0]["conversation_id"], CHAT_ID_2)
+        self.assertEqual(listing["watches"][0]["task_label"], "Research task")
 
     def test_register_rejects_unmountable_managed_target_without_registry_effect(self) -> None:
         def reject(_url: str) -> None:
@@ -117,7 +151,7 @@ class RegistryHttpTests(unittest.TestCase):
         self.assertEqual(listing, {"watches": []})
 
     def test_completion_receipt_survives_active_removal_until_ack(self) -> None:
-        self.request("POST", "/register", {"url": CHAT_URL})
+        _, registered = self.request("POST", "/register", {"url": CHAT_URL})
         self.created[0].should_stop = True
         self.registry.step_all()
 
@@ -125,6 +159,7 @@ class RegistryHttpTests(unittest.TestCase):
         self.assertEqual(
             completion,
             {
+                "task_id": registered["task_id"],
                 "conversation_id": CHAT_ID,
                 "active": False,
                 "completed": True,
@@ -138,6 +173,7 @@ class RegistryHttpTests(unittest.TestCase):
         self.assertEqual(
             missing,
             {
+                "task_id": None,
                 "conversation_id": CHAT_ID,
                 "active": False,
                 "completed": False,

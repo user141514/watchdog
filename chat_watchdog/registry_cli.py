@@ -25,6 +25,15 @@ def build_parser() -> argparse.ArgumentParser:
 
     add = subparsers.add_parser("add", aliases=["start"], help="watch one exact ChatGPT conversation URL")
     add.add_argument("url")
+    add.add_argument("--task-id", help="reuse a caller-owned supervised task identity")
+    add.add_argument("--task-label", help="optional human-readable task label")
+
+    rebind = subparsers.add_parser(
+        "rebind",
+        help="move one supervised task to a replacement ChatGPT conversation URL",
+    )
+    rebind.add_argument("task_id")
+    rebind.add_argument("url")
 
     remove = subparsers.add_parser("remove", aliases=["finish"], help="stop watching a conversation UUID or URL")
     remove.add_argument("conversation")
@@ -64,9 +73,29 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command in {"add", "start"}:
-            result = _request(args.control_url, "POST", "/register", {"url": args.url})
+            payload: dict[str, object] = {"url": args.url}
+            if args.task_id:
+                payload["task_id"] = args.task_id
+            if args.task_label:
+                payload["task_label"] = args.task_label
+            result = _request(args.control_url, "POST", "/register", payload)
             state = "created" if result.get("created") is True else "existing"
-            print(f"{result.get('conversation_id')}\t{state}")
+            print(f"{result.get('task_id')}\t{result.get('conversation_id')}\t{state}")
+            return 0
+
+        if args.command == "rebind":
+            result = _request(
+                args.control_url,
+                "POST",
+                "/rebind",
+                {"task_id": args.task_id, "url": args.url},
+            )
+            state = "rebound" if result.get("changed") is True else "unchanged"
+            print(
+                f"{result.get('task_id')}\t"
+                f"{result.get('previous_conversation_id')}\t"
+                f"{result.get('conversation_id')}\t{state}"
+            )
             return 0
 
         if args.command in {"remove", "finish"}:
@@ -91,7 +120,11 @@ def main(argv: list[str] | None = None) -> int:
             else:
                 for item in watches:
                     if isinstance(item, dict):
-                        print(f"{item.get('conversation_id')}\t{item.get('target_url')}")
+                        print(
+                            f"{item.get('task_id')}\t"
+                            f"{item.get('conversation_id')}\t"
+                            f"{item.get('target_url')}"
+                        )
             return 0
     except RuntimeError as error:
         print(str(error), file=sys.stderr)

@@ -39,16 +39,42 @@ class RegistryStore:
                 self._db.execute("""
                     CREATE TABLE IF NOT EXISTS watch_records (
                         conversation_id TEXT PRIMARY KEY,
+                        task_id TEXT,
+                        task_label TEXT,
                         target_url TEXT NOT NULL,
                         status TEXT NOT NULL CHECK(status IN ('active', 'completed')),
                         result TEXT,
                         registered_at REAL NOT NULL,
+                        binding_changed_at REAL,
                         last_poll_at REAL,
                         last_success_at REAL,
                         consecutive_failures INTEGER NOT NULL DEFAULT 0,
                         last_error TEXT
                     )
                 """)
+                columns = {
+                    row[1] for row in self._db.execute("PRAGMA table_info(watch_records)")
+                }
+                if "task_id" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN task_id TEXT")
+                if "task_label" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN task_label TEXT")
+                if "binding_changed_at" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN binding_changed_at REAL")
+                self._db.execute(
+                    """UPDATE watch_records
+                       SET task_id=conversation_id
+                       WHERE task_id IS NULL OR task_id=''"""
+                )
+                self._db.execute(
+                    """UPDATE watch_records
+                       SET binding_changed_at=registered_at
+                       WHERE binding_changed_at IS NULL"""
+                )
+                self._db.execute(
+                    """CREATE UNIQUE INDEX IF NOT EXISTS watch_records_task_id_unique
+                       ON watch_records(task_id)"""
+                )
         except BaseException:
             self.close()
             raise
@@ -73,18 +99,58 @@ class RegistryStore:
     def load(self) -> list[dict]:
         return [dict(row) for row in self._db.execute("SELECT * FROM watch_records")]
 
-    def register(self, conversation_id: str, target_url: str, at: float) -> None:
+    def register(
+        self,
+        conversation_id: str,
+        task_id: str,
+        target_url: str,
+        at: float,
+        *,
+        task_label: str | None = None,
+    ) -> None:
         with self._db:
             self._db.execute(
                 """INSERT INTO watch_records
-                   (conversation_id, target_url, status, registered_at)
-                   VALUES (?, ?, 'active', ?)
+                   (conversation_id, task_id, task_label, target_url, status,
+                    registered_at, binding_changed_at)
+                   VALUES (?, ?, ?, ?, 'active', ?, ?)
                    ON CONFLICT(conversation_id) DO UPDATE SET
-                   target_url=excluded.target_url, status='active', result=NULL,
-                   registered_at=excluded.registered_at, last_poll_at=NULL,
-                   last_success_at=NULL, consecutive_failures=0, last_error=NULL""",
-                (conversation_id, target_url, at),
+                   task_id=excluded.task_id,
+                   task_label=COALESCE(excluded.task_label, watch_records.task_label),
+                   target_url=excluded.target_url,
+                   status='active',
+                   result=NULL,
+                   registered_at=excluded.registered_at,
+                   binding_changed_at=excluded.binding_changed_at,
+                   last_poll_at=NULL,
+                   last_success_at=NULL,
+                   consecutive_failures=0,
+                   last_error=NULL""",
+                (conversation_id, task_id, task_label, target_url, at, at),
             )
+
+    def rebind(
+        self,
+        task_id: str,
+        conversation_id: str,
+        target_url: str,
+        at: float,
+    ) -> None:
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE watch_records
+                   SET conversation_id=?,
+                       target_url=?,
+                       binding_changed_at=?,
+                       last_poll_at=NULL,
+                       last_success_at=NULL,
+                       consecutive_failures=0,
+                       last_error=NULL
+                   WHERE task_id=? AND status='active'""",
+                (conversation_id, target_url, at, task_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(f"active task not found: {task_id}")
 
     def observe(self, entry) -> None:
         with self._db:

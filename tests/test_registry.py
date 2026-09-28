@@ -9,8 +9,10 @@ from chat_watchdog.registry import WatchRegistry, conversation_id_from_url
 
 
 CHAT_ID = "6aa542fd-708c-83ea-869a-721efd83d7f3"
+CHAT_ID_2 = "7bb542fd-708c-83ea-869a-721efd83d7f4"
 PROJECT_URL = f"https://chatgpt.com/g/g-p-example-agent/c/{CHAT_ID}"
 ROOT_URL = f"https://chatgpt.com/c/{CHAT_ID}"
+ROOT_URL_2 = f"https://chatgpt.com/c/{CHAT_ID_2}"
 
 
 @dataclass
@@ -79,9 +81,35 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertFalse(second.created)
         self.assertEqual(first.conversation_id, CHAT_ID)
         self.assertEqual(second.conversation_id, CHAT_ID)
+        self.assertEqual(first.task_id, second.task_id)
         self.assertEqual(len(created), 1)
         self.assertEqual(registry.list_ids(), [CHAT_ID])
+        self.assertEqual(registry.list()[0].task_id, first.task_id)
         self.assertEqual(registry.list()[0].state, "active")
+
+    def test_rebind_preserves_task_identity_across_conversation_replacement(self) -> None:
+        created: list[FakeWatcher] = []
+
+        def factory(url: str) -> FakeWatcher:
+            watcher = FakeWatcher(url)
+            created.append(watcher)
+            return watcher
+
+        registry = WatchRegistry(factory)
+        first = registry.register(PROJECT_URL, task_label="Research task")
+
+        rebound = registry.rebind(first.task_id, ROOT_URL_2)
+
+        self.assertTrue(rebound.changed)
+        self.assertEqual(rebound.task_id, first.task_id)
+        self.assertEqual(rebound.previous_conversation_id, CHAT_ID)
+        self.assertEqual(rebound.conversation_id, CHAT_ID_2)
+        self.assertTrue(created[0].closed)
+        self.assertEqual(registry.list_ids(), [CHAT_ID_2])
+        registration = registry.list()[0]
+        self.assertEqual(registration.task_id, first.task_id)
+        self.assertEqual(registration.task_label, "Research task")
+        self.assertEqual(registration.target_url, ROOT_URL_2)
 
     def test_restart_suspends_persisted_progress_window(self) -> None:
         with tempfile.TemporaryDirectory() as root:
