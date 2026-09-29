@@ -264,6 +264,62 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertIn("does not support continuation prompt injection", registration.last_error or "")
         registry.close()
 
+    def test_same_task_reusing_completed_conversation_preserves_prompt_without_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store_path = Path(root) / "registry.sqlite3"
+            watcher = FakeWatcher(PROJECT_URL, should_stop=True)
+            registry = WatchRegistry(
+                lambda _url: watcher,
+                store_path=store_path,
+            )
+            first = registry.register(
+                PROJECT_URL,
+                task_id="task-same",
+                task_label="Persistent task",
+            )
+            registry.update_prompt(
+                first.task_id,
+                expected_version=0,
+                step_index=6,
+                step_prompt="PERSIST SAME TASK",
+                updated_by="agent-a",
+            )
+            registry.step_all()
+
+            replacement = FakeWatcher(PROJECT_URL)
+            registry._watcher_factory = lambda _url: replacement
+            second = registry.register(
+                PROJECT_URL,
+                task_id="task-same",
+            )
+
+            self.assertTrue(second.created)
+            prompt = registry.prompt("task-same")
+            self.assertEqual(prompt.version, 1)
+            self.assertEqual(prompt.step_index, 6)
+            self.assertEqual(prompt.step_prompt, "PERSIST SAME TASK")
+            self.assertEqual(prompt.updated_by, "agent-a")
+            self.assertEqual(registry.list()[0].task_label, "Persistent task")
+
+            registry.step_all()
+            self.assertIn("prompt_version=1", replacement.continuation_prompt or "")
+            self.assertIn("PERSIST SAME TASK", replacement.continuation_prompt or "")
+
+            registry.close()
+
+            restarted = WatchRegistry(
+                lambda _url: FakeWatcher(PROJECT_URL),
+                store_path=store_path,
+                connect_on_register=False,
+            )
+            restored = restarted.prompt("task-same")
+            self.assertEqual(restored.version, 1)
+            self.assertEqual(restored.step_index, 6)
+            self.assertEqual(restored.step_prompt, "PERSIST SAME TASK")
+            self.assertEqual(restored.updated_by, "agent-a")
+            self.assertEqual(restarted.list()[0].task_label, "Persistent task")
+            restarted.close()
+
     def test_new_task_reusing_completed_conversation_does_not_inherit_old_prompt(self) -> None:
         watcher = FakeWatcher(PROJECT_URL, should_stop=True)
         registry = WatchRegistry(lambda _url: watcher)

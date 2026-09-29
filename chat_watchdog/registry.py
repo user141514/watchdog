@@ -303,7 +303,7 @@ class WatchRegistry:
             if self._progress_store is not None:
                 self._progress_store.ensure(conversation_id, target_url)
             try:
-                self._store.register(
+                stored = self._store.register(
                     conversation_id,
                     effective_task_id,
                     target_url,
@@ -317,12 +317,21 @@ class WatchRegistry:
             self._completed.pop(conversation_id, None)
             lock = self._entry_locks.setdefault(conversation_id, RLock())
             entry = _WatchEntry(
-                task_id=effective_task_id,
-                conversation_id=conversation_id,
-                target_url=target_url,
-                task_label=task_label,
-                registered_at=at,
-                binding_changed_at=at,
+                task_id=stored["task_id"],
+                conversation_id=stored["conversation_id"],
+                target_url=stored["target_url"],
+                task_label=stored["task_label"],
+                registered_at=stored["registered_at"],
+                binding_changed_at=stored["binding_changed_at"],
+                last_poll_at=stored["last_poll_at"],
+                last_success_at=stored["last_success_at"],
+                consecutive_failures=stored["consecutive_failures"],
+                last_error=stored["last_error"],
+                prompt_version=stored["prompt_version"],
+                prompt_step_index=stored["prompt_step_index"],
+                prompt_step_prompt=stored["prompt_step_prompt"],
+                prompt_updated_at=stored["prompt_updated_at"],
+                prompt_updated_by=stored["prompt_updated_by"],
                 lock=lock,
             )
             self._watchers[conversation_id] = entry

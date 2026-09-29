@@ -126,7 +126,7 @@ class RegistryStore:
         at: float,
         *,
         task_label: str | None = None,
-    ) -> None:
+    ) -> dict:
         with self._db:
             self._db.execute(
                 """INSERT INTO watch_records
@@ -176,6 +176,13 @@ class RegistryStore:
                    last_error=NULL""",
                 (conversation_id, task_id, task_label, target_url, at, at),
             )
+            row = self._db.execute(
+                "SELECT * FROM watch_records WHERE conversation_id=?",
+                (conversation_id,),
+            ).fetchone()
+        if row is None:
+            raise RuntimeError("registered watch record disappeared")
+        return dict(row)
 
     def rebind(
         self,
