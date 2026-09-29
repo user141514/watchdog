@@ -477,45 +477,40 @@ class WatchRegistry:
         if normalized_by is not None and len(normalized_by) > 128:
             raise ValueError("updated_by must be at most 128 characters")
 
+        # Prompt updates are local, durable CAS writes. They never wait for the
+        # long-running per-conversation transport lock. A watcher tick snapshots
+        # one prompt generation at its start, so an update accepted during an
+        # in-flight tick becomes effective on the next tick without creating an
+        # ambiguous "client timed out but write committed later" outcome.
         with self._lock:
             conversation_id = self._task_to_conversation.get(effective_task_id)
             if conversation_id is None:
                 raise RuntimeError(f"active task not found: {effective_task_id}")
             entry = self._watchers[conversation_id]
-
-        # Serialize prompt replacement with one complete watcher step. Once this
-        # method returns, no continuation from the replaced prompt generation
-        # can still be in-flight.
-        with entry.lock:
-            with self._lock:
-                if (
-                    not self._current(entry)
-                    or self._task_to_conversation.get(effective_task_id)
-                    != entry.conversation_id
-                ):
-                    raise RuntimeError("task binding changed during prompt update")
-                if entry.prompt_version != expected_version:
-                    raise PromptVersionConflict(
-                        expected_version=expected_version,
-                        current_version=entry.prompt_version,
-                    )
-                at = self._clock()
-                version = expected_version + 1
-                self._store.update_prompt(
-                    effective_task_id,
+            if not self._current(entry):
+                raise RuntimeError("task binding changed during prompt update")
+            if entry.prompt_version != expected_version:
+                raise PromptVersionConflict(
                     expected_version=expected_version,
-                    version=version,
-                    step_index=step_index,
-                    step_prompt=normalized_prompt,
-                    updated_at=at,
-                    updated_by=normalized_by,
+                    current_version=entry.prompt_version,
                 )
-                entry.prompt_version = version
-                entry.prompt_step_index = step_index
-                entry.prompt_step_prompt = normalized_prompt
-                entry.prompt_updated_at = at
-                entry.prompt_updated_by = normalized_by
-                return self._prompt_state(entry)
+            at = self._clock()
+            version = expected_version + 1
+            self._store.update_prompt(
+                effective_task_id,
+                expected_version=expected_version,
+                version=version,
+                step_index=step_index,
+                step_prompt=normalized_prompt,
+                updated_at=at,
+                updated_by=normalized_by,
+            )
+            entry.prompt_version = version
+            entry.prompt_step_index = step_index
+            entry.prompt_step_prompt = normalized_prompt
+            entry.prompt_updated_at = at
+            entry.prompt_updated_by = normalized_by
+            return self._prompt_state(entry)
 
     def unregister(self, conversation: str) -> bool:
         conversation_id = _conversation_id(conversation)
@@ -611,6 +606,12 @@ class WatchRegistry:
                 if not self._current(entry):
                     return
                 entry.last_poll_at = self._clock()
+                prompt_generation = (
+                    entry.task_id,
+                    entry.prompt_version,
+                    entry.prompt_step_index,
+                    entry.prompt_step_prompt,
+                )
                 # A broken durable store closes the side-effect gate, not just logging.
                 self._store.observe(entry)
             if entry.watcher is None and not self._bind(entry):
@@ -620,10 +621,10 @@ class WatchRegistry:
                 try:
                     setter(
                         render_continuation_prompt(
-                            task_id=entry.task_id,
-                            version=entry.prompt_version,
-                            step_index=entry.prompt_step_index,
-                            step_prompt=entry.prompt_step_prompt,
+                            task_id=prompt_generation[0],
+                            version=prompt_generation[1],
+                            step_index=prompt_generation[2],
+                            step_prompt=prompt_generation[3],
                         )
                     )
                 except Exception as error:  # noqa: BLE001 - prompt injection is part of the send gate

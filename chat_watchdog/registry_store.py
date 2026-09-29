@@ -134,8 +134,37 @@ class RegistryStore:
                     registered_at, binding_changed_at)
                    VALUES (?, ?, ?, ?, 'active', ?, ?)
                    ON CONFLICT(conversation_id) DO UPDATE SET
+                   task_label=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN COALESCE(excluded.task_label, watch_records.task_label)
+                       ELSE excluded.task_label
+                   END,
+                   prompt_version=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN watch_records.prompt_version
+                       ELSE 0
+                   END,
+                   prompt_step_index=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN watch_records.prompt_step_index
+                       ELSE 0
+                   END,
+                   prompt_step_prompt=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN watch_records.prompt_step_prompt
+                       ELSE NULL
+                   END,
+                   prompt_updated_at=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN watch_records.prompt_updated_at
+                       ELSE NULL
+                   END,
+                   prompt_updated_by=CASE
+                       WHEN watch_records.task_id=excluded.task_id
+                       THEN watch_records.prompt_updated_by
+                       ELSE NULL
+                   END,
                    task_id=excluded.task_id,
-                   task_label=COALESCE(excluded.task_label, watch_records.task_label),
                    target_url=excluded.target_url,
                    status='active',
                    result=NULL,

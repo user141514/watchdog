@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 import tempfile
 from threading import Event, Thread
@@ -162,7 +162,7 @@ class WatchRegistryTests(unittest.TestCase):
         self.assertEqual(rebound.step_prompt, "只推进当前最小可验证步骤。")
         registry.close()
 
-    def test_prompt_update_waits_for_inflight_send_generation(self) -> None:
+    def test_prompt_update_does_not_wait_for_inflight_send_generation(self) -> None:
         entered = Event()
         release = Event()
         update_done = Event()
@@ -215,11 +215,11 @@ class WatchRegistryTests(unittest.TestCase):
 
         update_thread = Thread(target=update)
         update_thread.start()
-        time.sleep(0.05)
-        self.assertFalse(
-            update_done.is_set(),
-            "prompt update must not return while an older prompt step is in-flight",
+        self.assertTrue(
+            update_done.wait(timeout=0.5),
+            "prompt update must commit immediately and apply from the next tick",
         )
+        self.assertEqual(registry.prompt(registered.task_id).version, 2)
 
         release.set()
         step_thread.join(timeout=2)
@@ -262,6 +262,110 @@ class WatchRegistryTests(unittest.TestCase):
         registration = registry.list()[0]
         self.assertEqual(registration.state, "degraded")
         self.assertIn("does not support continuation prompt injection", registration.last_error or "")
+        registry.close()
+
+    def test_new_task_reusing_completed_conversation_does_not_inherit_old_prompt(self) -> None:
+        watcher = FakeWatcher(PROJECT_URL, should_stop=True)
+        registry = WatchRegistry(lambda _url: watcher)
+        first = registry.register(PROJECT_URL, task_id="task-old", task_label="Old task")
+        registry.update_prompt(
+            first.task_id,
+            expected_version=0,
+            step_index=4,
+            step_prompt="OLD TASK STEP",
+            updated_by="old-agent",
+        )
+        registry.step_all()
+
+        second = registry.register(PROJECT_URL, task_id="task-new")
+        prompt = registry.prompt(second.task_id)
+        self.assertEqual(prompt.version, 0)
+        self.assertEqual(prompt.step_index, 0)
+        self.assertIsNone(prompt.step_prompt)
+        self.assertIsNone(prompt.updated_at)
+        self.assertIsNone(prompt.updated_by)
+        self.assertIsNone(registry.list()[0].task_label)
+        registry.close()
+
+        with tempfile.TemporaryDirectory() as root:
+            store_path = Path(root) / "registry.sqlite3"
+            first_registry = WatchRegistry(
+                lambda _url: FakeWatcher(PROJECT_URL, should_stop=True),
+                store_path=store_path,
+            )
+            old = first_registry.register(
+                PROJECT_URL,
+                task_id="task-old",
+                task_label="Old task",
+            )
+            first_registry.update_prompt(
+                old.task_id,
+                expected_version=0,
+                step_index=4,
+                step_prompt="OLD TASK STEP",
+                updated_by="old-agent",
+            )
+            first_registry.step_all()
+            first_registry.register(PROJECT_URL, task_id="task-new")
+            first_registry.close()
+
+            restarted = WatchRegistry(
+                lambda _url: FakeWatcher(PROJECT_URL),
+                store_path=store_path,
+                connect_on_register=False,
+            )
+            restored = restarted.prompt("task-new")
+            self.assertEqual(restored.version, 0)
+            self.assertEqual(restored.step_index, 0)
+            self.assertIsNone(restored.step_prompt)
+            self.assertIsNone(restored.updated_at)
+            self.assertIsNone(restored.updated_by)
+            self.assertIsNone(restarted.list()[0].task_label)
+            restarted.close()
+
+    def test_prompt_update_is_immediate_and_applies_from_next_tick(self) -> None:
+        entered = Event()
+        release = Event()
+
+        @dataclass
+        class BlockingWatcher(FakeWatcher):
+            prompts_seen: list[str | None] = field(default_factory=list)
+
+            def step(self) -> None:
+                self.steps += 1
+                self.prompts_seen.append(self.continuation_prompt)
+                if self.steps == 1:
+                    entered.set()
+                    release.wait(timeout=5)
+
+        watcher = BlockingWatcher(PROJECT_URL)
+        registry = WatchRegistry(lambda _url: watcher)
+        registered = registry.register(PROJECT_URL, task_id="task-fast")
+
+        thread = Thread(target=registry.step_all)
+        thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+
+        started = time.monotonic()
+        updated = registry.update_prompt(
+            registered.task_id,
+            expected_version=0,
+            step_index=1,
+            step_prompt="NEXT TICK ONLY",
+            updated_by="agent",
+        )
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 0.5)
+        self.assertEqual(updated.version, 1)
+        self.assertNotIn("NEXT TICK ONLY", watcher.prompts_seen[0] or "")
+
+        release.set()
+        thread.join(timeout=2)
+        self.assertFalse(thread.is_alive())
+
+        registry.step_all()
+        self.assertIn("NEXT TICK ONLY", watcher.prompts_seen[1] or "")
         registry.close()
 
     def test_task_prompt_persists_across_registry_restart(self) -> None:
