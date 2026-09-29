@@ -17,6 +17,10 @@ class FakeWatcher:
     steps: int = 0
     closed: bool = False
     completion_text: str | None = None
+    continuation_prompt: str | None = None
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        self.continuation_prompt = prompt
 
     def step(self) -> None:
         self.steps += 1

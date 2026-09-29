@@ -22,6 +22,10 @@ class Watcher:
     steps: int = 0
     closes: int = 0
     failures: int = 0
+    continuation_prompt: str | None = None
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        self.continuation_prompt = prompt
 
     def step(self):
         self.steps += 1
