@@ -64,11 +64,13 @@ chat-watchdog --registry-port 9235 --relay-url http://127.0.0.1:9224 --poll-seco
 # Replace only with a conversation explicitly authorized by the user.
 chat-watchdog-registry add "https://chatgpt.com/c/<conversation-uuid>"
 chat-watchdog-registry list --json
+chat-watchdog-registry prompt-get <task-id>
+chat-watchdog-registry prompt-set <task-id> --expected-version 0 --step-index 1 --prompt "只推进下一最小可验证步骤" --updated-by operator
 Invoke-RestMethod http://127.0.0.1:9235/health
 chat-watchdog-registry remove "<conversation-uuid>"
 ```
 
-The localhost control API exposes `POST /register`, `POST /unregister`, `GET /watches`, `GET /health`, `POST /completion`, and `POST /completion/ack`. Registration is idempotent by conversation UUID. The production daemon acknowledges the durable commit without waiting for a browser connection: the ACK means desired, not connected. On `SUPERVISOR_DONE`, active registration atomically becomes a completion receipt, retained across restart until ACK.
+The localhost control API exposes `POST /register`, `POST /unregister`, `GET /watches`, `GET /health`, `GET /prompt`, `POST /prompt`, `POST /completion`, and `POST /completion/ack`. Registration is idempotent by conversation UUID. Protocol v4 adds a durable, task-keyed continuation-prompt state: callers may CAS-update only the adaptive step body and step index with `expected_version`; Watchdog always renders the immutable task/envelope fields (`task_id`, prompt version, `SUPERVISOR_DONE`, and `NEED_INPUT`) itself. Prompt state survives restart and conversation rebind, and an update is fenced against an in-flight watcher step so success means no replaced prompt generation can still send. The production daemon acknowledges the durable commit without waiting for a browser connection: the ACK means desired, not connected. On `SUPERVISOR_DONE`, active registration atomically becomes a completion receipt, retained across restart until ACK.
 
 `GET /watches` preserves identity/state fields and adds polling timestamps, binding availability, consecutive failures, latest transport error and managed-state diagnostics. `connected` means a watcher binding exists, not current browser readiness. `last_success_at` means a watchdog step returned, not task progress. Inspect `diagnostics.state_available`, `progress`, `delivery`, `gate`, `writer_epoch` and `reason` too. Unknown state, uncertain delivery and human-required gates never authorize a direct-send fallback.
 

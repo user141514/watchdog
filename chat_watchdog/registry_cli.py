@@ -3,8 +3,10 @@ from __future__ import annotations
 import argparse
 import json
 import os
+from pathlib import Path
 import sys
 from urllib.error import HTTPError, URLError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 
@@ -34,6 +36,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     rebind.add_argument("task_id")
     rebind.add_argument("url")
+
+    prompt_get = subparsers.add_parser(
+        "prompt-get",
+        help="read the current adaptive continuation prompt state for one task",
+    )
+    prompt_get.add_argument("task_id")
+
+    prompt_set = subparsers.add_parser(
+        "prompt-set",
+        help="CAS-update the adaptive continuation prompt for one task",
+    )
+    prompt_set.add_argument("task_id")
+    prompt_set.add_argument("--expected-version", type=int, required=True)
+    prompt_set.add_argument("--step-index", type=int, required=True)
+    prompt_input = prompt_set.add_mutually_exclusive_group(required=True)
+    prompt_input.add_argument("--prompt", help="adaptive prompt text for the next watchdog continuation")
+    prompt_input.add_argument("--file", help="read adaptive prompt text from a UTF-8 file")
+    prompt_input.add_argument("--clear", action="store_true", help="clear the adaptive prompt and use only the watchdog envelope")
+    prompt_set.add_argument("--updated-by", help="optional writer identity for diagnostics")
 
     remove = subparsers.add_parser("remove", aliases=["finish"], help="stop watching a conversation UUID or URL")
     remove.add_argument("conversation")
@@ -96,6 +117,40 @@ def main(argv: list[str] | None = None) -> int:
                 f"{result.get('previous_conversation_id')}\t"
                 f"{result.get('conversation_id')}\t{state}"
             )
+            return 0
+
+        if args.command == "prompt-get":
+            result = _request(
+                args.control_url,
+                "GET",
+                f"/prompt?task_id={quote(args.task_id, safe='')}",
+            )
+            print(json.dumps(result, ensure_ascii=False))
+            return 0
+
+        if args.command == "prompt-set":
+            if args.file:
+                step_prompt = Path(args.file).read_text(encoding="utf-8")
+            elif args.clear:
+                step_prompt = None
+            else:
+                step_prompt = args.prompt
+            payload = {
+                "task_id": args.task_id,
+                "expected_version": args.expected_version,
+                "step_index": args.step_index,
+                "step_prompt": step_prompt,
+                "updated_by": args.updated_by,
+            }
+            if payload["updated_by"] is None:
+                payload.pop("updated_by")
+            result = _request(
+                args.control_url,
+                "POST",
+                "/prompt",
+                payload,
+            )
+            print(json.dumps(result, ensure_ascii=False))
             return 0
 
         if args.command in {"remove", "finish"}:

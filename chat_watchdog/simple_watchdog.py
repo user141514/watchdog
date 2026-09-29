@@ -70,6 +70,7 @@ class SimpleWatcher:
         self._state = "waiting"
         self._completion_text: str | None = None
         self._diagnostics: dict[str, object] = {}
+        self._continuation_prompt = CONTINUE_PROMPT
 
     @property
     def should_stop(self) -> bool:
@@ -87,6 +88,11 @@ class SimpleWatcher:
     @property
     def diagnostics(self) -> dict:
         return dict(self._diagnostics)
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("continuation prompt must be a non-empty string")
+        self._continuation_prompt = prompt
 
     def _connect_or_open(self) -> tuple[RelayChatGPTPage, bool]:
         match = f"/c/{self.conversation_id}"
@@ -139,7 +145,7 @@ class SimpleWatcher:
                 return self._state
 
             delivery = page.send_simple_continue(
-                CONTINUE_PROMPT,
+                self._continuation_prompt,
                 before.turn_key,
                 acceptance_timeout=self.submission_confirm_seconds,
             )

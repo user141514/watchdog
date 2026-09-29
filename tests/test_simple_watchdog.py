@@ -111,6 +111,28 @@ def test_render_identity_mismatch_aborts_before_send():
     assert page.sent == []
 
 
+def test_set_continuation_prompt_changes_next_send_without_rebuilding_watcher():
+    before = snap()
+    progressed = snap(
+        assistant_id="assistant-new",
+        signature="semantic-new",
+        text="new work",
+        user_id="user-watchdog",
+    )
+    page = FakePage([before, progressed])
+    watcher = SimpleWatcher(
+        URL,
+        sleep=lambda _: None,
+        page_factory=factory(page),
+        progress_window_seconds=10,
+        progress_poll_seconds=10,
+    )
+    watcher.set_continuation_prompt("CUSTOM ADAPTIVE PROMPT")
+
+    assert watcher.step() == "progress_visible"
+    assert page.sent == [("CUSTOM ADAPTIVE PROMPT", "assistant-old", 90.0)]
+
+
 def test_send_reuses_existing_prompt_and_visible_bottom_change_confirms_progress():
     before = snap()
     progressed = snap(

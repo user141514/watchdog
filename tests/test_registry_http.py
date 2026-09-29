@@ -22,6 +22,10 @@ class FakeWatcher:
     closed: bool = False
     completion_text: str = "final watchdog result"
     state: str = "active"
+    continuation_prompt: str | None = None
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        self.continuation_prompt = prompt
 
     def step(self) -> None:
         return None
@@ -100,6 +104,80 @@ class RegistryHttpTests(unittest.TestCase):
         self.created[0].state = "need_input"
         _, paused = self.request("GET", "/watches")
         self.assertEqual(paused["watches"][0]["state"], "need_input")
+
+    def test_prompt_update_is_versioned_and_visible_in_watch_projection(self) -> None:
+        self.request(
+            "POST",
+            "/register",
+            {"url": CHAT_URL, "task_id": "task-prompt"},
+        )
+
+        status, updated = self.request(
+            "POST",
+            "/prompt",
+            {
+                "task_id": "task-prompt",
+                "expected_version": 0,
+                "step_index": 2,
+                "step_prompt": "只推进第二步。",
+                "updated_by": "ui",
+            },
+        )
+
+        self.assertEqual(status, 200)
+        self.assertEqual(updated["task_id"], "task-prompt")
+        self.assertEqual(updated["version"], 1)
+        self.assertEqual(updated["step_index"], 2)
+        self.assertEqual(updated["step_prompt"], "只推进第二步。")
+        self.assertEqual(updated["updated_by"], "ui")
+
+        _, listing = self.request("GET", "/watches")
+        prompt = listing["watches"][0]["prompt"]
+        self.assertEqual(prompt["version"], 1)
+        self.assertEqual(prompt["step_index"], 2)
+        self.assertEqual(prompt["step_prompt"], "只推进第二步。")
+
+        with self.assertRaises(HTTPError) as raised:
+            self.request(
+                "POST",
+                "/prompt",
+                {
+                    "task_id": "task-prompt",
+                    "expected_version": 0,
+                    "step_index": 3,
+                    "step_prompt": "过期更新。",
+                    "updated_by": "stale-agent",
+                },
+            )
+        self.assertEqual(raised.exception.code, 409)
+        payload = json.loads(raised.exception.read().decode("utf-8"))
+        self.assertEqual(payload["error"], "prompt_version_conflict")
+        self.assertEqual(payload["current_version"], 1)
+
+    def test_prompt_get_returns_rendered_prompt_with_immutable_envelope(self) -> None:
+        self.request(
+            "POST",
+            "/register",
+            {"url": CHAT_URL, "task_id": "task-prompt"},
+        )
+        self.request(
+            "POST",
+            "/prompt",
+            {
+                "task_id": "task-prompt",
+                "expected_version": 0,
+                "step_index": 1,
+                "step_prompt": "继续当前实验。",
+                "updated_by": "agent",
+            },
+        )
+
+        _, prompt = self.request("GET", "/prompt?task_id=task-prompt")
+        self.assertEqual(prompt["task_id"], "task-prompt")
+        self.assertEqual(prompt["version"], 1)
+        self.assertIn("SUPERVISOR_DONE", prompt["rendered_prompt"])
+        self.assertIn("[SUPERVISOR_STATE: NEED_INPUT]", prompt["rendered_prompt"])
+        self.assertIn("继续当前实验。", prompt["rendered_prompt"])
 
     def test_rebind_moves_same_task_to_new_conversation(self) -> None:
         _, first = self.request(

@@ -10,9 +10,10 @@ from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
 from threading import Lock, RLock
 from typing import Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 from uuid import UUID, uuid4
 
+from .prompt_contract import render_continuation_prompt
 from .registry_store import RegistryStore
 
 _LOG = logging.getLogger(__name__)
@@ -25,6 +26,15 @@ class RegistrationRejected(RuntimeError):
         super().__init__(f"{code}: {reason}")
 
 
+class PromptVersionConflict(RuntimeError):
+    def __init__(self, *, expected_version: int, current_version: int) -> None:
+        self.expected_version = expected_version
+        self.current_version = current_version
+        super().__init__(
+            f"prompt version conflict: expected {expected_version}, current {current_version}"
+        )
+
+
 class Watcher(Protocol):
     should_stop: bool
 
@@ -33,6 +43,8 @@ class Watcher(Protocol):
 
     @property
     def state(self) -> str: ...
+
+    def set_continuation_prompt(self, prompt: str) -> None: ...
 
     def step(self) -> object: ...
 
@@ -55,6 +67,16 @@ class RebindResult:
 
 
 @dataclass(frozen=True)
+class TaskPromptState:
+    task_id: str
+    version: int = 0
+    step_index: int = 0
+    step_prompt: str | None = None
+    updated_at: float | None = None
+    updated_by: str | None = None
+
+
+@dataclass(frozen=True)
 class WatchRegistration:
     task_id: str
     conversation_id: str
@@ -69,6 +91,7 @@ class WatchRegistration:
     consecutive_failures: int = 0
     last_error: str | None = None
     diagnostics: dict | None = None
+    prompt: TaskPromptState | None = None
 
 
 @dataclass(frozen=True)
@@ -92,6 +115,11 @@ class _WatchEntry:
     last_success_at: float | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
+    prompt_version: int = 0
+    prompt_step_index: int = 0
+    prompt_step_prompt: str | None = None
+    prompt_updated_at: float | None = None
+    prompt_updated_by: str | None = None
     lock: object = field(default_factory=RLock)
 
 
@@ -186,6 +214,11 @@ class WatchRegistry:
                         last_success_at=row["last_success_at"],
                         consecutive_failures=row["consecutive_failures"],
                         last_error=row["last_error"],
+                        prompt_version=row["prompt_version"],
+                        prompt_step_index=row["prompt_step_index"],
+                        prompt_step_prompt=row["prompt_step_prompt"],
+                        prompt_updated_at=row["prompt_updated_at"],
+                        prompt_updated_by=row["prompt_updated_by"],
                     )
                     self._task_to_conversation[task_id] = conversation_id
                     if self._progress_store is not None:
@@ -346,6 +379,11 @@ class WatchRegistry:
                     task_label=entry.task_label,
                     registered_at=entry.registered_at,
                     binding_changed_at=at,
+                    prompt_version=entry.prompt_version,
+                    prompt_step_index=entry.prompt_step_index,
+                    prompt_step_prompt=entry.prompt_step_prompt,
+                    prompt_updated_at=entry.prompt_updated_at,
+                    prompt_updated_by=entry.prompt_updated_by,
                     lock=lock,
                 )
                 self._watchers[conversation_id] = replacement
@@ -373,6 +411,111 @@ class WatchRegistry:
             conversation_id=conversation_id,
             changed=True,
         )
+
+    @staticmethod
+    def _prompt_state(entry: _WatchEntry) -> TaskPromptState:
+        return TaskPromptState(
+            task_id=entry.task_id,
+            version=entry.prompt_version,
+            step_index=entry.prompt_step_index,
+            step_prompt=entry.prompt_step_prompt,
+            updated_at=entry.prompt_updated_at,
+            updated_by=entry.prompt_updated_by,
+        )
+
+    def prompt(self, task_id: str) -> TaskPromptState:
+        effective_task_id = task_id.strip()
+        if not effective_task_id:
+            raise ValueError("task_id must be a non-empty string")
+        with self._lock:
+            conversation_id = self._task_to_conversation.get(effective_task_id)
+            if conversation_id is None:
+                raise RuntimeError(f"active task not found: {effective_task_id}")
+            return self._prompt_state(self._watchers[conversation_id])
+
+    def rendered_prompt(self, task_id: str) -> str:
+        state = self.prompt(task_id)
+        return render_continuation_prompt(
+            task_id=state.task_id,
+            version=state.version,
+            step_index=state.step_index,
+            step_prompt=state.step_prompt,
+        )
+
+    def update_prompt(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        step_index: int,
+        step_prompt: str | None,
+        updated_by: str | None = None,
+    ) -> TaskPromptState:
+        effective_task_id = task_id.strip()
+        if not effective_task_id:
+            raise ValueError("task_id must be a non-empty string")
+        if isinstance(expected_version, bool) or not isinstance(expected_version, int):
+            raise ValueError("expected_version must be an integer")
+        if expected_version < 0:
+            raise ValueError("expected_version must be non-negative")
+        if isinstance(step_index, bool) or not isinstance(step_index, int):
+            raise ValueError("step_index must be an integer")
+        if step_index < 0:
+            raise ValueError("step_index must be non-negative")
+        if step_prompt is not None and not isinstance(step_prompt, str):
+            raise ValueError("step_prompt must be a string or null")
+        normalized_prompt = None if step_prompt is None else step_prompt.strip()
+        if normalized_prompt == "":
+            normalized_prompt = None
+        if normalized_prompt is not None and len(normalized_prompt) > 12000:
+            raise ValueError("step_prompt must be at most 12000 characters")
+        if updated_by is not None and not isinstance(updated_by, str):
+            raise ValueError("updated_by must be a string or null")
+        normalized_by = None if updated_by is None else updated_by.strip()
+        if normalized_by == "":
+            normalized_by = None
+        if normalized_by is not None and len(normalized_by) > 128:
+            raise ValueError("updated_by must be at most 128 characters")
+
+        with self._lock:
+            conversation_id = self._task_to_conversation.get(effective_task_id)
+            if conversation_id is None:
+                raise RuntimeError(f"active task not found: {effective_task_id}")
+            entry = self._watchers[conversation_id]
+
+        # Serialize prompt replacement with one complete watcher step. Once this
+        # method returns, no continuation from the replaced prompt generation
+        # can still be in-flight.
+        with entry.lock:
+            with self._lock:
+                if (
+                    not self._current(entry)
+                    or self._task_to_conversation.get(effective_task_id)
+                    != entry.conversation_id
+                ):
+                    raise RuntimeError("task binding changed during prompt update")
+                if entry.prompt_version != expected_version:
+                    raise PromptVersionConflict(
+                        expected_version=expected_version,
+                        current_version=entry.prompt_version,
+                    )
+                at = self._clock()
+                version = expected_version + 1
+                self._store.update_prompt(
+                    effective_task_id,
+                    expected_version=expected_version,
+                    version=version,
+                    step_index=step_index,
+                    step_prompt=normalized_prompt,
+                    updated_at=at,
+                    updated_by=normalized_by,
+                )
+                entry.prompt_version = version
+                entry.prompt_step_index = step_index
+                entry.prompt_step_prompt = normalized_prompt
+                entry.prompt_updated_at = at
+                entry.prompt_updated_by = normalized_by
+                return self._prompt_state(entry)
 
     def unregister(self, conversation: str) -> bool:
         conversation_id = _conversation_id(conversation)
@@ -435,6 +578,7 @@ class WatchRegistry:
                     consecutive_failures=entry.consecutive_failures,
                     last_error=entry.last_error,
                     diagnostics=getattr(entry.watcher, "diagnostics", None),
+                    prompt=self._prompt_state(entry),
                 )
                 for entry in sorted(self._watchers.values(), key=lambda item: item.conversation_id)
             ]
@@ -449,7 +593,7 @@ class WatchRegistry:
                 "instance_id": self.instance_id,
                 "pid": os.getpid(),
                 "module_path": str(Path(__file__).resolve()),
-                "protocol_version": 3,
+                "protocol_version": 4,
                 "last_poll_error": self._last_poll_error,
                 "durable": self._store.path is not None,
                 "store_path": self._store.path,
@@ -470,6 +614,26 @@ class WatchRegistry:
                 # A broken durable store closes the side-effect gate, not just logging.
                 self._store.observe(entry)
             if entry.watcher is None and not self._bind(entry):
+                return
+            setter = getattr(entry.watcher, "set_continuation_prompt", None)
+            if callable(setter):
+                try:
+                    setter(
+                        render_continuation_prompt(
+                            task_id=entry.task_id,
+                            version=entry.prompt_version,
+                            step_index=entry.prompt_step_index,
+                            step_prompt=entry.prompt_step_prompt,
+                        )
+                    )
+                except Exception as error:  # noqa: BLE001 - prompt injection is part of the send gate
+                    self._record_error(entry, error)
+                    return
+            else:
+                self._record_error(
+                    entry,
+                    RuntimeError("watcher does not support continuation prompt injection"),
+                )
                 return
             try:
                 entry.watcher.step()
@@ -579,10 +743,25 @@ def create_control_server(
             return payload
 
         def do_GET(self) -> None:
-            if self.path == "/health":
+            parsed = urlsplit(self.path)
+            if parsed.path == "/health":
                 self._send_json(200, registry.health(stale_after=stale_after))
                 return
-            if self.path != "/watches":
+            if parsed.path == "/prompt":
+                query = parse_qs(parsed.query)
+                values = query.get("task_id", [])
+                if len(values) != 1 or not values[0]:
+                    self._send_json(400, {"error": "task_id query parameter is required"})
+                    return
+                try:
+                    state = registry.prompt(values[0])
+                    payload = asdict(state)
+                    payload["rendered_prompt"] = registry.rendered_prompt(values[0])
+                    self._send_json(200, payload)
+                except RuntimeError as error:
+                    self._send_json(404, {"error": str(error)})
+                return
+            if parsed.path != "/watches":
                 self._send_json(404, {"error": "not found"})
                 return
             self._send_json(
@@ -618,6 +797,24 @@ def create_control_server(
                             "created": result.created,
                         },
                     )
+                    return
+
+                if self.path == "/prompt":
+                    task_id = payload.get("task_id")
+                    expected_version = payload.get("expected_version")
+                    step_index = payload.get("step_index")
+                    step_prompt = payload.get("step_prompt")
+                    updated_by = payload.get("updated_by")
+                    if not isinstance(task_id, str):
+                        raise ValueError("task_id must be a string")
+                    state = registry.update_prompt(
+                        task_id,
+                        expected_version=expected_version,
+                        step_index=step_index,
+                        step_prompt=step_prompt,
+                        updated_by=updated_by,
+                    )
+                    self._send_json(200, asdict(state))
                     return
 
                 if self.path == "/rebind":
@@ -684,6 +881,15 @@ def create_control_server(
                 self._send_json(404, {"error": "not found"})
             except ValueError as error:
                 self._send_json(400, {"error": str(error)})
+            except PromptVersionConflict as error:
+                self._send_json(
+                    409,
+                    {
+                        "error": "prompt_version_conflict",
+                        "expected_version": error.expected_version,
+                        "current_version": error.current_version,
+                    },
+                )
             except RegistrationRejected as error:
                 self._send_json(409, {"error": error.code, "reason": error.reason})
             except RuntimeError as error:

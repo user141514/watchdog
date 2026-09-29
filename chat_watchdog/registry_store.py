@@ -49,7 +49,12 @@ class RegistryStore:
                         last_poll_at REAL,
                         last_success_at REAL,
                         consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                        last_error TEXT
+                        last_error TEXT,
+                        prompt_version INTEGER NOT NULL DEFAULT 0,
+                        prompt_step_index INTEGER NOT NULL DEFAULT 0,
+                        prompt_step_prompt TEXT,
+                        prompt_updated_at REAL,
+                        prompt_updated_by TEXT
                     )
                 """)
                 columns = {
@@ -61,6 +66,20 @@ class RegistryStore:
                     self._db.execute("ALTER TABLE watch_records ADD COLUMN task_label TEXT")
                 if "binding_changed_at" not in columns:
                     self._db.execute("ALTER TABLE watch_records ADD COLUMN binding_changed_at REAL")
+                if "prompt_version" not in columns:
+                    self._db.execute(
+                        "ALTER TABLE watch_records ADD COLUMN prompt_version INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "prompt_step_index" not in columns:
+                    self._db.execute(
+                        "ALTER TABLE watch_records ADD COLUMN prompt_step_index INTEGER NOT NULL DEFAULT 0"
+                    )
+                if "prompt_step_prompt" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN prompt_step_prompt TEXT")
+                if "prompt_updated_at" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN prompt_updated_at REAL")
+                if "prompt_updated_by" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN prompt_updated_by TEXT")
                 self._db.execute(
                     """UPDATE watch_records
                        SET task_id=conversation_id
@@ -151,6 +170,39 @@ class RegistryStore:
             )
             if cursor.rowcount != 1:
                 raise RuntimeError(f"active task not found: {task_id}")
+
+    def update_prompt(
+        self,
+        task_id: str,
+        *,
+        expected_version: int,
+        version: int,
+        step_index: int,
+        step_prompt: str | None,
+        updated_at: float,
+        updated_by: str | None,
+    ) -> None:
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE watch_records
+                   SET prompt_version=?,
+                       prompt_step_index=?,
+                       prompt_step_prompt=?,
+                       prompt_updated_at=?,
+                       prompt_updated_by=?
+                   WHERE task_id=? AND status='active' AND prompt_version=?""",
+                (
+                    version,
+                    step_index,
+                    step_prompt,
+                    updated_at,
+                    updated_by,
+                    task_id,
+                    expected_version,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("prompt update lost durable CAS")
 
     def observe(self, entry) -> None:
         with self._db:

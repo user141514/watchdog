@@ -142,6 +142,9 @@ class _SupervisorWatcher:
         except Exception:
             return None
 
+    def set_continuation_prompt(self, prompt: str) -> None:
+        self.supervisor.set_continuation_prompt(prompt)
+
     def step(self) -> object:
         result = self.supervisor.step()
         if result is StepResult.NEED_INPUT:

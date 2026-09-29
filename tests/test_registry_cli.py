@@ -81,6 +81,63 @@ class RegistryCliTests(unittest.TestCase):
         )
         self.assertIn("task-123", output.getvalue())
 
+    def test_prompt_get_and_set_are_thin_registry_clients(self) -> None:
+        output = io.StringIO()
+        with patch(
+            "chat_watchdog.registry_cli._request",
+            return_value={
+                "task_id": "task-123",
+                "version": 2,
+                "step_index": 4,
+                "step_prompt": "next",
+                "rendered_prompt": "rendered",
+            },
+        ) as request, redirect_stdout(output):
+            code = main(["prompt-get", "task-123"])
+
+        self.assertEqual(code, 0)
+        request.assert_called_once_with(
+            "http://127.0.0.1:9235",
+            "GET",
+            "/prompt?task_id=task-123",
+        )
+        self.assertEqual(json.loads(output.getvalue())["version"], 2)
+
+        output = io.StringIO()
+        with patch(
+            "chat_watchdog.registry_cli._request",
+            return_value={
+                "task_id": "task-123",
+                "version": 3,
+                "step_index": 5,
+                "step_prompt": "只执行下一步",
+                "updated_by": "codex",
+            },
+        ) as request, redirect_stdout(output):
+            code = main([
+                "prompt-set",
+                "task-123",
+                "--expected-version", "2",
+                "--step-index", "5",
+                "--prompt", "只执行下一步",
+                "--updated-by", "codex",
+            ])
+
+        self.assertEqual(code, 0)
+        request.assert_called_once_with(
+            "http://127.0.0.1:9235",
+            "POST",
+            "/prompt",
+            {
+                "task_id": "task-123",
+                "expected_version": 2,
+                "step_index": 5,
+                "step_prompt": "只执行下一步",
+                "updated_by": "codex",
+            },
+        )
+        self.assertEqual(json.loads(output.getvalue())["version"], 3)
+
     def test_list_prints_machine_readable_registry_state(self) -> None:
         payload = {"watches": [{"conversation_id": CHAT_ID, "target_url": CHAT_URL}]}
         output = io.StringIO()

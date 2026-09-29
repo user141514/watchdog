@@ -86,6 +86,20 @@ def blocked_snapshot(
 
 
 class BlockedRecoveryTests(unittest.TestCase):
+    def test_custom_continuation_prompt_is_used_by_managed_supervisor(self) -> None:
+        clock = FakeClock()
+        page = FakePage(blocked_snapshot())
+        supervisor = Supervisor(page, NoAgentPool(), recovery_timeout_seconds=360.0, clock=clock)
+        supervisor.set_continuation_prompt("CUSTOM MANAGED PROMPT")
+
+        self.assertEqual(supervisor.step(), StepResult.BLOCKED)
+        clock.now = 360.0
+        self.assertEqual(supervisor.step(), StepResult.CONTINUED)
+        self.assertEqual(
+            page.sent,
+            [("CUSTOM MANAGED PROMPT", page.current.turn_key)],
+        )
+
     def test_stable_partial_blocked_turn_waits_359_then_continues_once_at_360(self) -> None:
         clock = FakeClock()
         page = FakePage(blocked_snapshot())

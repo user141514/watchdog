@@ -3,6 +3,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+from threading import Event, Thread
+import time
 import unittest
 
 from chat_watchdog.registry import WatchRegistry, conversation_id_from_url
@@ -23,6 +25,10 @@ class FakeWatcher:
     closed: bool = False
     completion_text: str = "final watchdog result"
     state: str = "active"
+    continuation_prompt: str | None = None
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        self.continuation_prompt = prompt
 
     def step(self) -> None:
         self.steps += 1
@@ -109,6 +115,184 @@ class WatchRegistryTests(unittest.TestCase):
 
         self.assertEqual(registry.list()[0].task_id, "task-winner")
         registry.close()
+
+    def test_task_prompt_is_versioned_injected_and_survives_rebind(self) -> None:
+        watcher = FakeWatcher(PROJECT_URL)
+        registry = WatchRegistry(lambda _url: watcher)
+        registered = registry.register(PROJECT_URL, task_id="task-alpha")
+
+        initial = registry.prompt(registered.task_id)
+        self.assertEqual(initial.version, 0)
+        self.assertEqual(initial.step_index, 0)
+        self.assertIsNone(initial.step_prompt)
+
+        updated = registry.update_prompt(
+            registered.task_id,
+            expected_version=0,
+            step_index=1,
+            step_prompt="只推进当前最小可验证步骤。",
+            updated_by="codex",
+        )
+        self.assertEqual(updated.version, 1)
+        self.assertEqual(updated.step_index, 1)
+        self.assertEqual(updated.updated_by, "codex")
+
+        with self.assertRaisesRegex(RuntimeError, "prompt version conflict"):
+            registry.update_prompt(
+                registered.task_id,
+                expected_version=0,
+                step_index=2,
+                step_prompt="这个更新已经过期。",
+                updated_by="stale-agent",
+            )
+
+        registry.step_all()
+        self.assertIsNotNone(watcher.continuation_prompt)
+        self.assertIn("task_id=task-alpha", watcher.continuation_prompt)
+        self.assertIn("prompt_version=1", watcher.continuation_prompt)
+        self.assertIn("step_index=1", watcher.continuation_prompt)
+        self.assertIn("只推进当前最小可验证步骤", watcher.continuation_prompt)
+        self.assertIn("SUPERVISOR_DONE", watcher.continuation_prompt)
+        self.assertIn("[SUPERVISOR_STATE: NEED_INPUT]", watcher.continuation_prompt)
+
+        registry.rebind(registered.task_id, ROOT_URL_2)
+        rebound = registry.prompt(registered.task_id)
+        self.assertEqual(rebound.version, 1)
+        self.assertEqual(rebound.step_index, 1)
+        self.assertEqual(rebound.step_prompt, "只推进当前最小可验证步骤。")
+        registry.close()
+
+    def test_prompt_update_waits_for_inflight_send_generation(self) -> None:
+        entered = Event()
+        release = Event()
+        update_done = Event()
+
+        class BlockingWatcher(FakeWatcher):
+            def __init__(self, url: str) -> None:
+                super().__init__(url)
+                self.sent_prompts: list[str | None] = []
+                self._block_once = True
+
+            def set_continuation_prompt(self, prompt: str) -> None:
+                self.continuation_prompt = prompt
+                if self._block_once:
+                    self._block_once = False
+                    entered.set()
+                    release.wait(timeout=2)
+
+            def step(self) -> None:
+                self.steps += 1
+                self.sent_prompts.append(self.continuation_prompt)
+
+        watcher = BlockingWatcher(PROJECT_URL)
+        registry = WatchRegistry(lambda _url: watcher)
+        registered = registry.register(PROJECT_URL, task_id="task-race")
+        registry.update_prompt(
+            registered.task_id,
+            expected_version=0,
+            step_index=1,
+            step_prompt="FIRST",
+            updated_by="test",
+        )
+
+        step_thread = Thread(target=registry.step_all)
+        step_thread.start()
+        self.assertTrue(entered.wait(timeout=2))
+
+        updated: list[object] = []
+
+        def update() -> None:
+            updated.append(
+                registry.update_prompt(
+                    registered.task_id,
+                    expected_version=1,
+                    step_index=2,
+                    step_prompt="SECOND",
+                    updated_by="test",
+                )
+            )
+            update_done.set()
+
+        update_thread = Thread(target=update)
+        update_thread.start()
+        time.sleep(0.05)
+        self.assertFalse(
+            update_done.is_set(),
+            "prompt update must not return while an older prompt step is in-flight",
+        )
+
+        release.set()
+        step_thread.join(timeout=2)
+        update_thread.join(timeout=2)
+        self.assertFalse(step_thread.is_alive())
+        self.assertFalse(update_thread.is_alive())
+        self.assertTrue(update_done.is_set())
+        self.assertEqual(registry.prompt(registered.task_id).version, 2)
+        self.assertIn("prompt_version=1", watcher.sent_prompts[0] or "")
+        self.assertIn("FIRST", watcher.sent_prompts[0] or "")
+
+        registry.step_all()
+        self.assertEqual(len(watcher.sent_prompts), 2)
+        self.assertIn("prompt_version=2", watcher.sent_prompts[1] or "")
+        self.assertIn("SECOND", watcher.sent_prompts[1] or "")
+        registry.close()
+
+    def test_protocol_v4_fails_closed_for_watcher_without_prompt_injection(self) -> None:
+        @dataclass
+        class LegacyWatcher:
+            should_stop: bool = False
+            completion_text: str | None = None
+            state: str = "waiting"
+            steps: int = 0
+            closed: bool = False
+
+            def step(self) -> None:
+                self.steps += 1
+
+            def close(self) -> None:
+                self.closed = True
+
+        watcher = LegacyWatcher()
+        registry = WatchRegistry(lambda _url: watcher)
+        registry.register(PROJECT_URL, task_id="task-legacy")
+
+        registry.step_all()
+
+        self.assertEqual(watcher.steps, 0)
+        registration = registry.list()[0]
+        self.assertEqual(registration.state, "degraded")
+        self.assertIn("does not support continuation prompt injection", registration.last_error or "")
+        registry.close()
+
+    def test_task_prompt_persists_across_registry_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as root:
+            store_path = Path(root) / "registry.sqlite3"
+            first = WatchRegistry(
+                lambda url: FakeWatcher(url),
+                store_path=store_path,
+                connect_on_register=False,
+            )
+            registered = first.register(PROJECT_URL, task_id="task-persist")
+            first.update_prompt(
+                registered.task_id,
+                expected_version=0,
+                step_index=3,
+                step_prompt="继续执行第三步。",
+                updated_by="ui",
+            )
+            first.close()
+
+            second = WatchRegistry(
+                lambda url: FakeWatcher(url),
+                store_path=store_path,
+                connect_on_register=False,
+            )
+            restored = second.prompt("task-persist")
+            self.assertEqual(restored.version, 1)
+            self.assertEqual(restored.step_index, 3)
+            self.assertEqual(restored.step_prompt, "继续执行第三步。")
+            self.assertEqual(restored.updated_by, "ui")
+            second.close()
 
     def test_rebind_preserves_task_identity_across_conversation_replacement(self) -> None:
         created: list[FakeWatcher] = []

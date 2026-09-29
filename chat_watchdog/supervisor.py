@@ -8,17 +8,12 @@ from typing import Collection, Protocol
 
 from .agent_runner import AgentLease
 from .model import PageSnapshot, Phase, PromptDelivery, TurnKey, is_done, is_need_input
+from .prompt_contract import BASE_CONTINUATION_PROMPT
 from .reanchor_bridge import ReanchorBridgeError, ReanchorOutcome
 from .state_client import StateProtocolError, StateUnavailable
 
 
-CONTINUE_PROMPT = (
-    "继续当前任务，从已经完成的工作直接往下执行；不要重新调研、不要重复已经完成的步骤。"
-    "如果整个任务已经真正完成，请在回复最后单独输出 SUPERVISOR_DONE。"
-    "如果继续需要用户手动操作、登录、授权、确认或补充信息，请说明需要的动作，"
-    "并在回复最后单独输出 [SUPERVISOR_STATE: NEED_INPUT]；不要自行假定用户已经完成。"
-    "如果还没完成且不需要用户介入，就继续实际推进任务。"
-)
+CONTINUE_PROMPT = BASE_CONTINUATION_PROMPT
 
 RECOVERY_PROMPT = (
     "恢复当前已经打开的 ChatGPT 工作对话并推动它继续当前任务。不要新建对话，不要重做已完成步骤。"
@@ -167,8 +162,14 @@ class Supervisor:
         self._liveness_attempted_for: tuple[TurnKey, str] | None = None
         self._pending_reanchor_reason: str | None = None
         self._human_gate: tuple[int, str, str] | None = None
+        self._continuation_prompt = CONTINUE_PROMPT
         self.should_stop = False
         self.diagnostics: dict[str, object] = {}
+
+    def set_continuation_prompt(self, prompt: str) -> None:
+        if not isinstance(prompt, str) or not prompt.strip():
+            raise ValueError("continuation prompt must be a non-empty string")
+        self._continuation_prompt = prompt
 
     def _conversation_advanced(self, snapshot: PageSnapshot) -> bool:
         if self._recovery_baseline is None:
@@ -413,7 +414,7 @@ class Supervisor:
                 "send_liveness_continue",
                 self._page.send_continue,
             )
-            delivery = sender(CONTINUE_PROMPT, key)
+            delivery = sender(self._continuation_prompt, key)
         except Exception:
             delivery = False
         status = self._delivery_status(delivery)
@@ -431,9 +432,17 @@ class Supervisor:
             return StepResult.ALREADY_HANDLED
         try:
             if authoritative_state is not None:
-                result = self._intent_client.submit_v1(authoritative_state, CONTINUE_PROMPT)
+                result = self._intent_client.submit_v1(
+                    authoritative_state,
+                    self._continuation_prompt,
+                )
             else:
-                result = self._intent_client.submit(self._page.target_url, snapshot, CONTINUE_PROMPT, kind=kind)
+                result = self._intent_client.submit(
+                    self._page.target_url,
+                    snapshot,
+                    self._continuation_prompt,
+                    kind=kind,
+                )
         except Exception as error:
             self.diagnostics.update(intent_accepted=None, intent_reason='delivery_uncertain',
                                     error=f'{type(error).__name__}: {error}'[:1000])
@@ -697,7 +706,7 @@ class Supervisor:
 
         self._direct_attempted.add(key)
         try:
-            delivery = self._page.send_continue(CONTINUE_PROMPT, key)
+            delivery = self._page.send_continue(self._continuation_prompt, key)
         except Exception:
             delivery = False
         status = self._delivery_status(delivery)
