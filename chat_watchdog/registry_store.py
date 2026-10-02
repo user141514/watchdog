@@ -1,6 +1,7 @@
 """Transactional desired registrations and completion receipts, not browser state."""
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import sqlite3
@@ -46,9 +47,15 @@ class RegistryStore:
                         last_poll_at REAL,
                         last_success_at REAL,
                         consecutive_failures INTEGER NOT NULL DEFAULT 0,
-                        last_error TEXT
+                        last_error TEXT,
+                        runtime_state TEXT
                     )
                 """)
+                columns = {
+                    row[1] for row in self._db.execute("PRAGMA table_info(watch_records)")
+                }
+                if "runtime_state" not in columns:
+                    self._db.execute("ALTER TABLE watch_records ADD COLUMN runtime_state TEXT")
         except BaseException:
             self.close()
             raise
@@ -71,7 +78,20 @@ class RegistryStore:
         self._owns_lock = True
 
     def load(self) -> list[dict]:
-        return [dict(row) for row in self._db.execute("SELECT * FROM watch_records")]
+        records = []
+        for row in self._db.execute("SELECT * FROM watch_records"):
+            record = dict(row)
+            raw_state = record.get("runtime_state")
+            if raw_state is not None:
+                try:
+                    runtime_state = json.loads(raw_state)
+                except json.JSONDecodeError as error:
+                    raise RuntimeError("invalid persisted watchdog runtime state") from error
+                if not isinstance(runtime_state, dict):
+                    raise RuntimeError("persisted watchdog runtime state must be an object")
+                record["runtime_state"] = runtime_state
+            records.append(record)
+        return records
 
     def register(self, conversation_id: str, target_url: str, at: float) -> None:
         with self._db:
@@ -82,18 +102,24 @@ class RegistryStore:
                    ON CONFLICT(conversation_id) DO UPDATE SET
                    target_url=excluded.target_url, status='active', result=NULL,
                    registered_at=excluded.registered_at, last_poll_at=NULL,
-                   last_success_at=NULL, consecutive_failures=0, last_error=NULL""",
+                   last_success_at=NULL, consecutive_failures=0, last_error=NULL,
+                   runtime_state=NULL""",
                 (conversation_id, target_url, at),
             )
 
     def observe(self, entry) -> None:
+        runtime_state = (
+            None
+            if entry.runtime_state is None
+            else json.dumps(entry.runtime_state, ensure_ascii=False, separators=(",", ":"))
+        )
         with self._db:
             self._db.execute(
                 """UPDATE watch_records SET last_poll_at=?, last_success_at=?,
-                   consecutive_failures=?, last_error=?
+                   consecutive_failures=?, last_error=?, runtime_state=?
                    WHERE conversation_id=? AND status='active'""",
                 (entry.last_poll_at, entry.last_success_at, entry.consecutive_failures,
-                 entry.last_error, entry.conversation_id),
+                 entry.last_error, runtime_state, entry.conversation_id),
             )
 
     def complete(self, conversation_id: str, result: str | None) -> None:

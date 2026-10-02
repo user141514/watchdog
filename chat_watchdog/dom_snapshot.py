@@ -10,6 +10,76 @@ DOM_SNAPSHOT_JS = r"""
     return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
   };
   const normalizeText = (value) => String(value || '').replace(/\r\n/g, '\n').trim();
+  const reactPropChain = (el, maxDepth = 60) => {
+    if (!el) return [];
+    const fiberKey = Object.keys(el).find((key) => key.startsWith('__reactFiber$'));
+    let fiber = fiberKey ? el[fiberKey] : null;
+    const chain = [];
+    for (let depth = 0; fiber && depth < maxDepth; depth += 1, fiber = fiber.return) {
+      const props = fiber.memoizedProps;
+      if (props && typeof props === 'object') chain.push(props);
+    }
+    return chain;
+  };
+  const reactProps = (el, predicate, maxDepth = 60) =>
+    reactPropChain(el, maxDepth).find((props) => predicate(props)) || null;
+  const userSemanticProps = (el) => {
+    const state = {messageId: '', turnId: ''};
+    for (const props of reactPropChain(el)) {
+      if (typeof props.messageId === 'string' && props.messageId) state.messageId = props.messageId;
+      if (typeof props.turnId === 'string' && props.turnId) state.turnId = props.turnId;
+    }
+    return state.messageId || state.turnId ? state : null;
+  };
+  const assistantTurnProps = (el) => {
+    const state = {
+      turnId: '',
+      completed: null,
+      isStreaming: null,
+      isMostRecentTurn: null,
+      hasFinalAssistantStarted: null,
+      activeReasoning: null,
+      workStartedAtMs: null,
+      workCompletedAtMs: null,
+      wasStopped: null,
+    };
+    let found = false;
+    for (const props of reactPropChain(el)) {
+      if (typeof props.turnId === 'string' && props.turnId) {
+        state.turnId = props.turnId;
+        found = true;
+      }
+      for (const key of [
+        'completed', 'isStreaming', 'isMostRecentTurn',
+        'hasFinalAssistantStarted', 'activeReasoning',
+        'workStartedAtMs', 'workCompletedAtMs', 'wasStopped',
+      ]) {
+        if (Object.prototype.hasOwnProperty.call(props, key)) {
+          state[key] = props[key];
+          found = true;
+        }
+      }
+    }
+    return found ? state : null;
+  };
+  const semanticUserId = (el) => {
+    if (!el) return '';
+    const domId = (el.getAttribute?.('data-message-id') || '').trim();
+    if (domId) return domId;
+    const props = userSemanticProps(el);
+    return String(props?.messageId || props?.turnId || '');
+  };
+  const semanticUserTurnId = (el) => {
+    const props = userSemanticProps(el);
+    return String(props?.turnId || '');
+  };
+  const semanticAssistantId = (el) => {
+    if (!el) return '';
+    const domId = (el.getAttribute?.('data-message-id') || '').trim();
+    if (domId) return domId;
+    const props = assistantTurnProps(el);
+    return String(props?.turnId || '');
+  };
 
   // Causal submission receipt. DOM cardinality and mounted-tail identity are
   // observations, not ordering. Record the UI send event first; only later
@@ -35,7 +105,11 @@ DOM_SNAPSHOT_JS = r"""
     };
     window[receiptKey] = submission;
   }
-  const messageUsers = () => Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+  const messageUsers = () => {
+    const legacy = Array.from(document.querySelectorAll('[data-message-author-role="user"]'));
+    if (legacy.length) return legacy;
+    return Array.from(document.querySelectorAll('.bg-user-message'));
+  };
   const messageAssistants = () => {
     let nodes = Array.from(document.querySelectorAll('[data-message-author-role="assistant"]'));
     if (!nodes.length) {
@@ -43,11 +117,15 @@ DOM_SNAPSHOT_JS = r"""
         '[data-testid^="conversation-turn-"][data-turn="assistant"], article[data-turn="assistant"]'
       ));
     }
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll('[class*="MarkdownRoot-"]'));
+    }
     return nodes;
   };
   const readComposerText = () => {
     const editor = document.querySelector('#prompt-textarea') ||
       document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
+      document.querySelector('[contenteditable="true"][role="textbox"]') ||
       document.querySelector('div[contenteditable="true"]');
     return editor
       ? normalizeText(typeof editor.value === 'string' ? editor.value : (editor.innerText || editor.textContent || ''))
@@ -70,7 +148,7 @@ DOM_SNAPSHOT_JS = r"""
     const anchorAssistant = currentAssistants.length
       ? currentAssistants[currentAssistants.length - 1]
       : null;
-    const anchorAssistantId = anchorAssistant?.getAttribute?.('data-message-id') || '';
+    const anchorAssistantId = semanticAssistantId(anchorAssistant);
     // Without an exact stable anchor, the mounted window cannot prove that a
     // later user node is causally after this submission event. Fail closed.
     if (!anchorAssistantId) return;
@@ -78,7 +156,7 @@ DOM_SNAPSHOT_JS = r"""
     submission.pendingSeq = submission.seq;
     submission.pendingText = text;
     submission.pendingKnownIds = messageUsers()
-      .map((node) => node.getAttribute?.('data-message-id') || '')
+      .map((node) => semanticUserId(node))
       .filter(Boolean);
     submission.pendingAnchorAssistantId = anchorAssistantId;
     submission.pendingTrusted = trusted === true;
@@ -94,14 +172,19 @@ DOM_SNAPSHOT_JS = r"""
         recordSubmission(event?.isTrusted === true);
       }
     }, true);
+    document.addEventListener('submit', (event) => {
+      const form = event?.target;
+      const editor = form?.querySelector?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]');
+      if (editor) recordSubmission(event?.isTrusted === true);
+    }, true);
     document.addEventListener('keydown', (event) => {
       if (
         event?.key !== 'Enter'
         || event.shiftKey || event.altKey || event.ctrlKey || event.metaKey || event.isComposing
       ) return;
       const target = event.target;
-      const inComposer = target?.matches?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"]')
-        || target?.closest?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], div[contenteditable="true"]');
+      const inComposer = target?.matches?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]')
+        || target?.closest?.('#prompt-textarea, [contenteditable="true"][data-lexical-editor="true"], [contenteditable="true"][role="textbox"], div[contenteditable="true"]');
       if (inComposer) recordSubmission(event?.isTrusted === true);
     }, true);
     submission.installed = true;
@@ -112,11 +195,11 @@ DOM_SNAPSHOT_JS = r"""
   if (submission.pendingSeq && submission.pendingText && submission.pendingAnchorAssistantId) {
     const knownIds = new Set(Array.isArray(submission.pendingKnownIds) ? submission.pendingKnownIds : []);
     const anchorAssistant = assistants.find(
-      (node) => (node.getAttribute?.('data-message-id') || '') === submission.pendingAnchorAssistantId
+      (node) => semanticAssistantId(node) === submission.pendingAnchorAssistantId
     );
     const receiptNode = anchorAssistant
       ? [...users].reverse().find((node) => {
-          const id = node.getAttribute?.('data-message-id') || '';
+          const id = semanticUserId(node);
           const text = normalizeText(node.innerText || node.textContent || '');
           const followsAnchor = typeof anchorAssistant.compareDocumentPosition === 'function'
             && (anchorAssistant.compareDocumentPosition(node) & 4) !== 0;
@@ -124,7 +207,7 @@ DOM_SNAPSHOT_JS = r"""
         })
       : null;
     if (receiptNode) {
-      const id = receiptNode.getAttribute?.('data-message-id') || '';
+      const id = semanticUserId(receiptNode);
       submission.receiptSeq = Number(submission.pendingSeq || 0);
       submission.receiptId = id;
       submission.receiptText = submission.pendingText;
@@ -141,11 +224,17 @@ DOM_SNAPSHOT_JS = r"""
   }
   const assistant = assistants.length ? assistants[assistants.length - 1] : null;
   const user = users.length ? users[users.length - 1] : null;
-  const userTurnPending = !!(user && (
-    !assistant ||
-    (typeof assistant.compareDocumentPosition === 'function' &&
-      (assistant.compareDocumentPosition(user) & 4) !== 0)
-  ));
+  const fallbackAssistantProps = assistantTurnProps(assistant);
+  const fallbackAssistantTurnId = String(fallbackAssistantProps?.turnId || '');
+  const fallbackUserTurnId = semanticUserTurnId(user);
+  const usesSemanticTurnIds = !!(fallbackAssistantTurnId || fallbackUserTurnId);
+  const userTurnPending = usesSemanticTurnIds
+    ? !!(user && (!assistant || !fallbackAssistantTurnId || !fallbackUserTurnId || fallbackAssistantTurnId !== fallbackUserTurnId))
+    : !!(user && (
+        !assistant ||
+        (typeof assistant.compareDocumentPosition === 'function' &&
+          (assistant.compareDocumentPosition(user) & 4) !== 0)
+      ));
   const userTurn = user
     ? (user.closest('[data-testid^="conversation-turn-"]') || user.closest('article[data-turn="user"]') || user)
     : null;
@@ -155,19 +244,26 @@ DOM_SNAPSHOT_JS = r"""
 
   // A vanished stop button is not proof of a final response. A background
   // tab can retain only a streamed prefix after the server has finished.
-  const assistantFinalized = !!(turn &&
+  const legacyAssistantFinalized = !!(turn &&
     turn.querySelector('[data-testid="copy-turn-action-button"], [data-testid="feedback-turn-action-button"]'));
+  const assistantFinalized = fallbackAssistantProps && typeof fallbackAssistantProps.completed === 'boolean'
+    ? fallbackAssistantProps.completed === true
+    : legacyAssistantFinalized;
 
-  const stop = document.querySelector('[data-testid="stop-button"]');
-  const assistantBusy = !!(turn && (
+  const stop = document.querySelector('[data-testid="stop-button"]') ||
+    Array.from(document.querySelectorAll('button')).find((button) => {
+      const label = normalizeText(button.getAttribute?.('aria-label') || button.textContent || '').toLowerCase();
+      return label === 'stop' || label === '停止';
+    });
+  const assistantBusy = !!((turn && (
     turn.getAttribute('aria-busy') === 'true' || turn.querySelector('[aria-busy="true"]')
-  ));
+  )) || (fallbackAssistantProps && fallbackAssistantProps.completed === false));
 
   const thinkingCandidates = turn ? Array.from(turn.querySelectorAll(
     '[data-testid*="reasoning" i], [data-testid*="thinking" i], [aria-label*="thinking" i], [aria-label*="reasoning" i], button[aria-expanded="true"]'
   )) : [];
   const activeThinkingText = /(thinking|reasoning|思考中|正在思考|推理中)/i;
-  const thinkingVisible = thinkingCandidates.some((el) => {
+  const thinkingVisible = Boolean(fallbackAssistantProps?.activeReasoning) || thinkingCandidates.some((el) => {
     if (!visible(el)) return false;
     const marker = `${el.getAttribute('data-testid') || ''} ${el.getAttribute('aria-label') || ''} ${el.textContent || ''}`;
     return activeThinkingText.test(marker);
@@ -175,6 +271,7 @@ DOM_SNAPSHOT_JS = r"""
 
   const composer = document.querySelector('#prompt-textarea') ||
     document.querySelector('[contenteditable="true"][data-lexical-editor="true"]') ||
+    document.querySelector('[contenteditable="true"][role="textbox"]') ||
     document.querySelector('div[contenteditable="true"]');
   const composerReady = !!(composer && visible(composer) && composer.getAttribute('aria-disabled') !== 'true');
   const composerText = composer
@@ -233,7 +330,16 @@ DOM_SNAPSHOT_JS = r"""
   const contentText = contentRoot
     ? (contentRoot.innerText || contentRoot.textContent || '')
     : '';
-  const fullTurnText = sanitizedTurnText();
+  const fallbackAssistantRoots = fallbackAssistantTurnId
+    ? Array.from(document.querySelectorAll('[class*="MarkdownRoot-"]')).filter(
+        (node) => String(assistantTurnProps(node)?.turnId || '') === fallbackAssistantTurnId
+      )
+    : [];
+  const fallbackFullTurnText = fallbackAssistantRoots
+    .map((node) => normalizeText(node.innerText || node.textContent || ''))
+    .filter(Boolean)
+    .join('\n');
+  const fullTurnText = fallbackFullTurnText || sanitizedTurnText();
   // Long assistant responses can be rendered as multiple markdown/prose
   // content blocks. querySelector() intentionally keeps ordinary progress
   // tracking cheap, but a terminal supervisor marker may live in a later
@@ -260,8 +366,8 @@ DOM_SNAPSHOT_JS = r"""
     if (!candidate || /^request[-_:]/i.test(candidate) || /^conversation-turn-\d+$/i.test(candidate)) return '';
     return candidate;
   };
-  const turnId = assistant?.getAttribute('data-message-id') || stableTurnId(turn);
-  const userTurnId = user?.getAttribute('data-message-id') || stableTurnId(userTurn);
+  const turnId = assistant?.getAttribute('data-message-id') || stableTurnId(turn) || semanticAssistantId(assistant);
+  const userTurnId = user?.getAttribute('data-message-id') || stableTurnId(userTurn) || semanticUserId(user);
   const userText = user
     ? (user.innerText || user.textContent || userTurn?.textContent || '')
     : '';

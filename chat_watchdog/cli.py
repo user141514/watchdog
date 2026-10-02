@@ -7,7 +7,7 @@ from pathlib import Path
 import shlex
 import socket
 import sys
-from threading import Thread
+from threading import Event, Thread
 import time
 
 from .agent_runner import AgentPool, AgentSpec
@@ -18,7 +18,11 @@ from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
 from .progress_liveness import MymemLiteStore
 from .state_client import SidecarStateClient, StateProtocolError, StateUnavailable, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
-from .simple_watchdog import DEFAULT_SIMPLE_INTERVAL_SECONDS, SimpleWatcher
+from .simple_watchdog import (
+    DEFAULT_SIMPLE_INTERVAL_SECONDS,
+    SIMPLE_INACTIVITY_TIMEOUT_SECONDS,
+    SimpleWatcher,
+)
 
 
 def parse_agent_command(value: str) -> AgentSpec:
@@ -171,7 +175,11 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         poll_seconds = args.simple_interval_seconds
 
         def create_watcher(target_url: str) -> SimpleWatcher:
-            return SimpleWatcher(target_url, relay_url=args.relay_url)
+            return SimpleWatcher(
+                target_url,
+                relay_url=args.relay_url,
+                liveness_timeout_seconds=args.simple_inactivity_seconds,
+            )
 
         registration_preflight = None
     else:
@@ -207,10 +215,12 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         registration_preflight=registration_preflight,
         progress_store=progress_store,
     )
+    wake_event = Event()
     try:
         server = create_control_server(
             registry, args.registry_host, args.registry_port,
             stale_after=max(30.0, poll_seconds * 3),
+            wake=wake_event.set,
         )
     except BaseException:
         registry.close()
@@ -231,7 +241,13 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
                 # Storage failure stays observable and closes the send gate; retry
                 # storage on the next poll without losing desired registrations.
                 logging.exception("watch registry polling failed; retaining desired watches")
-            time.sleep(max(0.01, poll_seconds - (time.monotonic() - started)))
+            remaining = max(0.01, poll_seconds - (time.monotonic() - started))
+            if wake_event.wait(timeout=remaining):
+                # Registration changes are durable before the ACK is returned.
+                # Wake the scheduler immediately so a newly registered (or
+                # explicitly re-registered) watch does not inherit an arbitrary
+                # phase of the global 15-minute cadence.
+                wake_event.clear()
         raise RuntimeError("watchdog control server unexpectedly stopped")
     except KeyboardInterrupt:
         logging.info("stopped by user")
@@ -295,7 +311,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--simple-interval-seconds",
         type=float,
         default=DEFAULT_SIMPLE_INTERVAL_SECONDS,
-        help="simple watchdog interval; default: 900",
+        help="simple watchdog observation interval; default: 15 seconds",
+    )
+    parser.add_argument(
+        "--simple-inactivity-seconds",
+        type=float,
+        default=SIMPLE_INACTIVITY_TIMEOUT_SECONDS,
+        help="simple watchdog no-progress timeout before a nudge; default: 900 seconds",
     )
     parser.add_argument(
         "--registry-store",
@@ -416,6 +438,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if args.simple_interval_seconds <= 0:
         raise SystemExit("--simple-interval-seconds must be > 0")
+    if args.simple_inactivity_seconds <= 0:
+        raise SystemExit("--simple-inactivity-seconds must be > 0")
     if args.simple:
         if args.registry_port is None:
             raise SystemExit("--simple requires --registry-port")

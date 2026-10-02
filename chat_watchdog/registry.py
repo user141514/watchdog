@@ -76,6 +76,7 @@ class _WatchEntry:
     last_success_at: float | None = None
     consecutive_failures: int = 0
     last_error: str | None = None
+    runtime_state: dict[str, object] | None = None
     lock: object = field(default_factory=RLock)
 
 
@@ -163,6 +164,7 @@ class WatchRegistry:
                         last_success_at=row["last_success_at"],
                         consecutive_failures=row["consecutive_failures"],
                         last_error=row["last_error"],
+                        runtime_state=row.get("runtime_state"),
                     )
                     if self._progress_store is not None:
                         self._progress_store.ensure(conversation_id, row["target_url"])
@@ -187,7 +189,11 @@ class WatchRegistry:
 
     def _bind(self, entry: _WatchEntry) -> bool:
         try:
-            entry.watcher = self._watcher_factory(entry.target_url)
+            watcher = self._watcher_factory(entry.target_url)
+            restore_state = getattr(watcher, "restore_state", None)
+            if entry.runtime_state is not None and callable(restore_state):
+                restore_state(dict(entry.runtime_state))
+            entry.watcher = watcher
             return True
         except Exception as error:  # noqa: BLE001 - isolate arbitrary transport plugins
             self._record_error(entry, error)
@@ -329,6 +335,11 @@ class WatchRegistry:
                 return
             try:
                 entry.watcher.step()
+                durable_state = getattr(entry.watcher, "durable_state", None)
+                if durable_state is not None:
+                    if not isinstance(durable_state, dict):
+                        raise TypeError("watcher durable_state must be a dict")
+                    entry.runtime_state = dict(durable_state)
                 completed = entry.watcher.should_stop
                 result = entry.watcher.completion_text if completed else None
             except Exception as error:  # noqa: BLE001 - one watcher must not kill its siblings
@@ -393,6 +404,7 @@ def create_control_server(
     port: int = 9235,
     *,
     stale_after: float = 120.0,
+    wake: Callable[[], None] | None = None,
 ) -> HTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("watchdog control server must bind to localhost")
@@ -454,6 +466,8 @@ def create_control_server(
                     if not isinstance(target_url, str):
                         raise ValueError("url must be a string")
                     result = registry.register(target_url)
+                    if wake is not None:
+                        wake()
                     self._send_json(
                         200,
                         {
@@ -469,6 +483,8 @@ def create_control_server(
                         raise ValueError("conversation_id or url must be a string")
                     conversation_id = _conversation_id(conversation)
                     removed = registry.unregister(conversation_id)
+                    if removed and wake is not None:
+                        wake()
                     self._send_json(
                         200,
                         {"conversation_id": conversation_id, "removed": removed},
