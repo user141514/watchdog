@@ -110,6 +110,7 @@ const {expression, completed, draft} = JSON.parse(fs.readFileSync(0, 'utf8'));
 
 let submitted = 0;
 let clicked = 0;
+let unrelatedClicked = 0;
 
 class Element {
   getBoundingClientRect() { return {width: 20, height: 20}; }
@@ -157,6 +158,9 @@ button.getAttribute = name => {
   return null;
 };
 button.click = () => { clicked += 1; };
+const unrelatedButton = new Element();
+unrelatedButton.getAttribute = name => name === 'aria-label' ? '发送' : null;
+unrelatedButton.click = () => { unrelatedClicked += 1; };
 
 const form = new Element();
 form.querySelector = selector => selector === 'button[type="submit"]' ? button : null;
@@ -182,7 +186,7 @@ const context = {
       if (selector === '[data-message-author-role="user"]') return [];
       if (selector === '[class*="MarkdownRoot-"]') return [assistant];
       if (selector === '.bg-user-message') return [user];
-      if (selector === 'button') return [button];
+      if (selector === 'button') return [unrelatedButton, button];
       return [];
     },
     execCommand(command, _showUi, value) {
@@ -210,6 +214,7 @@ const context = {
     result,
     submitted,
     clicked,
+    unrelatedClicked,
     draft: editor.innerText
   }));
 })().catch(error => { console.error(error); process.exitCode = 1; });
@@ -281,11 +286,12 @@ class NewUiCompatibilityTests(unittest.TestCase):
         self.assertTrue(snap.user_turn_pending)
         self.assertEqual(snap.phase, Phase.BLOCKED)
 
-    def test_new_ui_submit_uses_form_request_submit(self):
+    def test_new_ui_submit_clicks_only_composer_form_send_button(self):
         actual = self.submit_result()
         self.assertTrue(actual["result"]["submitted"])
-        self.assertEqual(actual["submitted"], 1)
-        self.assertEqual(actual["clicked"], 0)
+        self.assertEqual(actual["submitted"], 0)
+        self.assertEqual(actual["clicked"], 1)
+        self.assertEqual(actual["unrelatedClicked"], 0)
         self.assertEqual(actual["draft"], "fixture-only")
 
     def test_new_ui_active_generation_blocks_submit(self):

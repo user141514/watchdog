@@ -26,6 +26,12 @@ def free_port():
 
 
 def request(port, path, body=None, *, timeout=5):
+    if path == "/register":
+        body = {
+            "explicit": True, "source": "controlled-api", "actor": "test-controller",
+            "operation_id": "process-test-bind", "reason": "explicit fixture bind",
+            **(body or {}),
+        }
     data = None if body is None else json.dumps(body).encode()
     req = Request(f"http://127.0.0.1:{port}{path}", data=data,
                   headers={"Content-Type": "application/json"})
@@ -40,6 +46,21 @@ def start_state_owner():
             return None
 
         def do_POST(self):
+            if self.path == "/internal/watchdog-withdraw":
+                # This isolated owner fixture rejects every bind/intent, so
+                # there is no remote effect to drain for any generation.
+                length = int(self.headers.get("content-length", "0"))
+                payload = json.loads(self.rfile.read(length).decode())
+                body = json.dumps({
+                    "accepted": True, "quiescent": True,
+                    "registrationId": payload["registrationId"],
+                }).encode()
+                self.send_response(200)
+                self.send_header("content-type", "application/json")
+                self.send_header("content-length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
             if self.path != "/internal/conversation-state":
                 self.send_response(404)
                 self.end_headers()
@@ -86,7 +107,10 @@ def stop_state_owner(server, thread):
 
 def start_daemon(store, port, sidecar_port):
     process = subprocess.Popen(
-        [sys.executable, "-I", "-m", "chat_watchdog", "--registry-port", str(port),
+        [sys.executable, "-I", "-c",
+         "import runpy,sys; sys.path.insert(0,sys.argv.pop(1)); "
+         "runpy.run_module('chat_watchdog',run_name='__main__')",
+         str(ROOT), "--registry-port", str(port),
          "--registry-store", str(store), "--relay-url", "http://127.0.0.1:1",
          "--intent-url", f"http://127.0.0.1:{sidecar_port}/internal/conversation-intents",
          "--poll-seconds", "0.05"],

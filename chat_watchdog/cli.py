@@ -15,6 +15,7 @@ from .reanchor_bridge import ReanchorBridge, ReanchorCli
 from .registry import RegistrationRejected, WatchRegistry, conversation_id_from_url, create_control_server
 from .relay_page import RelayChatGPTPage
 from .intent_client import SidecarIntentClient, DEFAULT_INTENT_URL
+from .observation_client import SidecarObservationClient, SidecarObservationPage, sibling_observation_endpoint
 from .progress_liveness import MymemLiteStore
 from .state_client import SidecarStateClient, StateProtocolError, StateUnavailable, sibling_state_endpoint
 from .supervisor import StepResult, Supervisor
@@ -126,10 +127,14 @@ class _SupervisorWatcher:
         self.page = page
         self.supervisor = supervisor
         self._state = "active"
+        self._completion_text = None
+
+    def bind_registration(self, registration_id):
+        self.page.bind_registration(registration_id)
 
     @property
     def should_stop(self) -> bool:
-        return self.supervisor.should_stop
+        return False
 
     @property
     def state(self) -> str:
@@ -141,14 +146,17 @@ class _SupervisorWatcher:
 
     @property
     def completion_text(self) -> str | None:
-        try:
-            return self.page.snapshot().assistant_text
-        except Exception:
-            return None
+        return self._completion_text
 
     def step(self) -> object:
+        if self.supervisor.should_stop:
+            self._state = "done"
+            return StepResult.DONE
         result = self.supervisor.step()
-        if result is StepResult.NEED_INPUT:
+        self._completion_text = getattr(self.page, "completion_text", None)
+        if result is StepResult.DONE:
+            self._state = "done"
+        elif result is StepResult.NEED_INPUT:
             self._state = "need_input"
         elif result in {StepResult.WAITING, StepResult.USER_TURN_PENDING}:
             self._state = "waiting"
@@ -174,15 +182,22 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         progress_store = None
         poll_seconds = args.simple_interval_seconds
 
+        endpoint = _managed_intent_endpoint(args)
+        simple_intents = intent_client or SidecarIntentClient(endpoint)
+        owner_client = simple_intents
+        simple_observations = SidecarObservationClient(sibling_observation_endpoint(endpoint))
+
         def create_watcher(target_url: str) -> SimpleWatcher:
             return SimpleWatcher(
                 target_url,
-                relay_url=args.relay_url,
                 liveness_timeout_seconds=args.simple_inactivity_seconds,
+                observation_client=simple_observations,
+                intent_client=simple_intents,
             )
 
         registration_preflight = None
     else:
+        owner_client = intent_client
         if pool is None:
             raise RuntimeError("managed registry requires an agent pool")
         progress_store = MymemLiteStore(args.mymem_lite_dir)
@@ -190,15 +205,22 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
 
         def create_watcher(target_url: str) -> _SupervisorWatcher:
             conversation_id = conversation_id_from_url(target_url)
-            page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
+            if intent_client is not None:
+                page = SidecarObservationPage(
+                    target_url,
+                    SidecarObservationClient(sibling_observation_endpoint(intent_client.endpoint)),
+                    intent_client, refresh_on_snapshot=True,
+                )
+            else:
+                page = RelayChatGPTPage.connect(args.relay_url, f"/c/{conversation_id}")
             supervisor = Supervisor(
                 _ObservationPage(page) if intent_client else page,
                 pool,
                 recovery_timeout_seconds=args.recovery_timeout_seconds,
                 heartbeat_seconds=args.reanchor_heartbeat_seconds,
                 reanchor=None,
-                intent_client=intent_client,
-                state_client=state_client,
+                intent_client=page if intent_client else None,
+                state_client=page if intent_client else state_client,
                 progress_store=progress_store,
                 progress_id=conversation_id,
                 active_stall_seconds=args.active_stall_seconds,
@@ -213,6 +235,7 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         store_path=args.registry_store,
         connect_on_register=False,
         registration_preflight=registration_preflight,
+        withdrawal_callback=owner_client.withdraw_watch if owner_client is not None else None,
         progress_store=progress_store,
     )
     wake_event = Event()
@@ -225,7 +248,7 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
     except BaseException:
         registry.close()
         raise
-    control = Thread(target=server.serve_forever, kwargs={"poll_interval": 0.1},
+    control = Thread(target=_serve_registry_control, args=(server, wake_event),
                      name="watchdog-control", daemon=True)
     control.start()
     logging.info(
@@ -234,20 +257,8 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
     )
     try:
         while control.is_alive():
-            started = time.monotonic()
-            try:
-                registry.step_all()
-            except Exception:
-                # Storage failure stays observable and closes the send gate; retry
-                # storage on the next poll without losing desired registrations.
-                logging.exception("watch registry polling failed; retaining desired watches")
-            remaining = max(0.01, poll_seconds - (time.monotonic() - started))
-            if wake_event.wait(timeout=remaining):
-                # Registration changes are durable before the ACK is returned.
-                # Wake the scheduler immediately so a newly registered (or
-                # explicitly re-registered) watch does not inherit an arbitrary
-                # phase of the global 15-minute cadence.
-                wake_event.clear()
+            _registry_poll_cycle(registry, wake_event, poll_seconds,
+                                 is_control_alive=control.is_alive)
         raise RuntimeError("watchdog control server unexpectedly stopped")
     except KeyboardInterrupt:
         logging.info("stopped by user")
@@ -257,6 +268,33 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         control.join(timeout=5)
         server.server_close()
         registry.close()
+
+
+def _serve_registry_control(server, wake_event) -> None:
+    try:
+        server.serve_forever(poll_interval=0.1)
+    finally:
+        # Empty membership has no timer; control shutdown must release its wait.
+        wake_event.set()
+
+
+def _registry_poll_cycle(registry, wake_event, poll_seconds: float, *,
+                         is_control_alive=None) -> None:
+    # Clear before observing membership. A registration during the poll/check
+    # leaves its wake set, so the subsequent wait cannot lose that change.
+    wake_event.clear()
+    if is_control_alive is not None and not is_control_alive():
+        return
+    started = time.monotonic()
+    try:
+        registry.step_all()
+    except Exception:
+        logging.exception("watch registry polling failed; retaining desired watches")
+    if not registry.has_scheduler_work():
+        wake_event.wait()
+        return
+    remaining = max(0.01, poll_seconds - (time.monotonic() - started))
+    wake_event.wait(timeout=remaining)
 
 
 def _default_state_root() -> Path:
@@ -287,7 +325,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--match-url",
         default="chatgpt.com",
-        help="substring that must uniquely identify the existing ChatGPT tab",
+        help="exact conversation URL in Sidecar mode; unique tab substring in legacy mode",
     )
     parser.add_argument(
         "--send-admission-url",
@@ -305,7 +343,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--simple",
         action="store_true",
-        help="use the minimal refresh/check/nudge watchdog; registry mode only",
+        help="use the mechanical ACTION/REVIEW watchdog through Sidecar; registry mode only",
     )
     parser.add_argument(
         "--simple-interval-seconds",
@@ -317,7 +355,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--simple-inactivity-seconds",
         type=float,
         default=SIMPLE_INACTIVITY_TIMEOUT_SECONDS,
-        help="simple watchdog no-progress timeout before a nudge; default: 900 seconds",
+        help="simple watchdog no-progress timeout before owner recovery; default: 900 seconds",
     )
     parser.add_argument(
         "--registry-store",
@@ -443,10 +481,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.simple:
         if args.registry_port is None:
             raise SystemExit("--simple requires --registry-port")
-        if any((args.intent_url, args.send_admission_url, args.legacy_direct_send,
-                args.reanchor_store, args.reanchor_scope, args.reanchor_cli, args.reanchor_epoch)):
-            raise SystemExit("--simple is a standalone registry mode; do not combine managed/legacy/reanchor writers")
+        if any((args.legacy_direct_send, args.reanchor_store, args.reanchor_scope,
+                args.reanchor_cli, args.reanchor_epoch)):
+            raise SystemExit("--simple requires Sidecar ownership; do not combine legacy/reanchor writers")
         return _run_registry_mode(args, None, None, None)
+
+    if args.registry_port is None and not args.legacy_direct_send:
+        raise SystemExit("managed Sidecar Watchdog requires --registry-port and an explicit durable registration")
 
     try:
         intent_client = build_intent_client(args)
@@ -466,7 +507,17 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as error:
         raise SystemExit(str(error)) from error
 
-    page = RelayChatGPTPage.connect(args.relay_url, args.match_url)
+    if intent_client is not None:
+        try:
+            page = SidecarObservationPage(
+                args.match_url,
+                SidecarObservationClient(sibling_observation_endpoint(intent_client.endpoint)),
+                intent_client, refresh_on_snapshot=True,
+            )
+        except ValueError as error:
+            raise SystemExit("managed --match-url must be an exact ChatGPT conversation URL") from error
+    else:
+        page = RelayChatGPTPage.connect(args.relay_url, args.match_url)
     supervisor = Supervisor(
         _ObservationPage(page) if intent_client else page,
         pool,
@@ -474,7 +525,7 @@ def main(argv: list[str] | None = None) -> int:
         heartbeat_seconds=args.reanchor_heartbeat_seconds,
         reanchor=reanchor,
         intent_client=intent_client,
-        state_client=state_client,
+        state_client=page if intent_client else state_client,
     )
 
     logging.info("watching %s every %.1fs", page.target_url, args.poll_seconds)

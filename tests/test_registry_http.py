@@ -55,6 +55,12 @@ class RegistryHttpTests(unittest.TestCase):
         self.registry.close()
 
     def request(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
+        if path == "/register":
+            body = {
+                "explicit": True, "source": "controlled-api", "actor": "test-controller",
+                "operation_id": "http-test-bind", "reason": "explicit fixture bind",
+                **(body or {}),
+            }
         data = None if body is None else json.dumps(body).encode("utf-8")
         request = Request(
             f"{self.base_url}{path}",

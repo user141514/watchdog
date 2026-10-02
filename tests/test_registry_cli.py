@@ -38,12 +38,17 @@ class RegistryCliTests(unittest.TestCase):
             code = main(["add", CHAT_URL])
 
         self.assertEqual(code, 0)
-        request.assert_called_once_with(
-            "http://127.0.0.1:9235",
-            "POST",
-            "/register",
-            {"url": CHAT_URL},
-        )
+        request.assert_called_once()
+        base_url, method, path, payload = request.call_args.args
+        self.assertEqual((base_url, method, path), (
+            "http://127.0.0.1:9235", "POST", "/register",
+        ))
+        self.assertEqual(payload["url"], CHAT_URL)
+        self.assertIs(payload["explicit"], True)
+        self.assertEqual(payload["source"], "cli-explicit")
+        self.assertTrue(payload["actor"])
+        self.assertTrue(payload["operation_id"])
+        self.assertEqual(payload["reason"], "explicit CLI bind")
         self.assertEqual(output.getvalue().strip(), f"{CHAT_ID}\tcreated")
 
     def test_list_prints_machine_readable_registry_state(self) -> None:

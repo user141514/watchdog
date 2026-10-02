@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
 import sys
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from uuid import uuid4
 
 
 DEFAULT_CONTROL_URL = "http://127.0.0.1:9235"
@@ -64,7 +66,14 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     try:
         if args.command in {"add", "start"}:
-            result = _request(args.control_url, "POST", "/register", {"url": args.url})
+            result = _request(args.control_url, "POST", "/register", {
+                "url": args.url,
+                "explicit": True,
+                "source": "cli-explicit",
+                "actor": getpass.getuser(),
+                "operation_id": str(uuid4()),
+                "reason": "explicit CLI bind",
+            })
             state = "created" if result.get("created") is True else "existing"
             print(f"{result.get('conversation_id')}\t{state}")
             return 0
@@ -75,7 +84,13 @@ def main(argv: list[str] | None = None) -> int:
                 args.control_url,
                 "POST",
                 "/unregister",
-                {key: args.conversation},
+                {
+                    key: args.conversation,
+                    "source": "cli-explicit",
+                    "actor": getpass.getuser(),
+                    "operation_id": str(uuid4()),
+                    "reason": "explicit CLI unbind",
+                },
             )
             state = "removed" if result.get("removed") is True else "missing"
             print(f"{result.get('conversation_id')}\t{state}")

@@ -8,6 +8,11 @@ import time
 from typing import Callable
 
 from .model import PageSnapshot, Phase, is_need_input
+from .intent_client import SidecarIntentClient
+from .observation_client import (
+    ObservationProtocolError, ObservationUnavailable,
+    SidecarObservationClient, SidecarObservationPage,
+)
 from .registry import conversation_id_from_url
 from .relay_cdp import RelayCdpProtocol
 from .relay_page import (
@@ -120,11 +125,22 @@ class SimpleWatcher:
     progress_window_seconds: float = PROGRESS_WINDOW_SECONDS
     liveness_timeout_seconds: float = SIMPLE_INACTIVITY_TIMEOUT_SECONDS
     clock: Callable[[], float] = time.monotonic
-    page_factory: Callable[..., RelayChatGPTPage] = RelayChatGPTPage.connect
+    page_factory: Callable[..., RelayChatGPTPage] | None = None
     open_page: Callable[[str, str], RelayChatGPTPage] | None = None
+    observation_client: SidecarObservationClient | None = None
+    intent_client: SidecarIntentClient | None = None
+    legacy_direct_send: bool = False
+    registration_id: str | None = None
 
     def __post_init__(self) -> None:
         self.conversation_id = conversation_id_from_url(self.target_url)
+        if self.page_factory is None and not self.legacy_direct_send:
+            self.observation_client = self.observation_client or SidecarObservationClient()
+            self.intent_client = self.intent_client or SidecarIntentClient()
+        elif self.observation_client is not None or self.intent_client is not None:
+            raise ValueError("managed observations cannot share a direct page factory")
+        if self.legacy_direct_send and self.page_factory is None:
+            self.page_factory = RelayChatGPTPage.connect
         self._state = "waiting"
         self._completion_text: str | None = None
         self._diagnostics: dict[str, object] = {}
@@ -139,6 +155,7 @@ class SimpleWatcher:
         self._last_active_at: float | None = None
         self._liveness_attempted_for: tuple[str, str] | None = None
         self._transition_attempted_for: str | None = None
+        self._persistence_callback: Callable[[dict[str, object]], None] | None = None
 
     @property
     def should_stop(self) -> bool:
@@ -162,11 +179,16 @@ class SimpleWatcher:
             "cycle": self._cycle,
             "next_prompt": self._next_prompt,
             "status": self._run_status,
+            "transition_turn_id": self._transition_attempted_for,
         }
 
     def restore_state(self, value: dict[str, object]) -> None:
-        if set(value) != {"phase", "cycle", "next_prompt", "status"}:
-            raise ValueError("simple watchdog state must contain exactly phase/cycle/next_prompt/status")
+        base_keys = {"phase", "cycle", "next_prompt", "status"}
+        if set(value) not in (base_keys, base_keys | {"transition_turn_id"}):
+            raise ValueError("invalid simple watchdog durable state fields")
+        transition_turn_id = value.get("transition_turn_id")
+        if transition_turn_id is not None and (not isinstance(transition_turn_id, str) or not transition_turn_id):
+            raise ValueError("transition_turn_id must be a non-empty string or null")
         phase = value["phase"]
         cycle = value["cycle"]
         next_prompt = value["next_prompt"]
@@ -183,9 +205,18 @@ class SimpleWatcher:
         self._cycle = cycle
         self._next_prompt = next_prompt
         self._run_status = status
+        self._transition_attempted_for = transition_turn_id
         self._done_latched = status == DONE_STATUS
         if self._done_latched:
             self._state = "done"
+
+    def set_persistence_callback(self, callback) -> None:
+        self._persistence_callback = callback
+
+    def bind_registration(self, registration_id) -> None:
+        if self.intent_client is not None:
+            self.intent_client.bind_watch(registration_id, self.target_url)
+        self.registration_id = registration_id
 
     @property
     def diagnostics(self) -> dict:
@@ -195,6 +226,11 @@ class SimpleWatcher:
         # Polling observes an existing exact tab only. A missing target is a
         # transient browser/relay condition; opening a replacement here can
         # fan out duplicate ChatGPT tabs while the real tab is merely hidden.
+        if self.observation_client is not None:
+            return SidecarObservationPage(
+                self.target_url, self.observation_client, self.intent_client, sleep=self.sleep,
+                registration_id=self.registration_id,
+            ), False
         match = f"/c/{self.conversation_id}"
         return self.page_factory(self.relay_url, match), False
 
@@ -229,6 +265,11 @@ class SimpleWatcher:
 
         try:
             page, opened = self._connect_or_open()
+        except (ObservationUnavailable, ObservationProtocolError) as error:
+            self._state = "observation_unavailable"
+            self._last_active_at = None
+            self._diagnostics = {"reason": str(error), "observation_available": False}
+            return self._state
         except RelayTargetSelectionError as error:
             if "no matching ChatGPT target" not in str(error):
                 raise
@@ -307,13 +348,14 @@ class SimpleWatcher:
                         self._state = "active"
                         return self._state
 
-                    if progress_key != self._last_active_key:
+                    if progress_key != self._last_active_key or self._last_active_at is None:
                         # Any newly visible assistant content restarts the
                         # 15-minute inactivity window. Observation cadence is
                         # intentionally independent from this timer.
                         self._last_active_key = progress_key
                         self._last_active_at = now
-                        self._liveness_attempted_for = None
+                        if self._liveness_attempted_for != progress_key:
+                            self._liveness_attempted_for = None
                         self._state = "active"
                         self._diagnostics = {
                             "inactivity_seconds": 0.0,
@@ -373,10 +415,11 @@ class SimpleWatcher:
                     # It shares the 900s fallback clock with active stalls.
                     block_key = (before.turn_key or "", before.assistant_text_signature or "")
                     now = self.clock()
-                    if block_key != self._last_active_key:
+                    if block_key != self._last_active_key or self._last_active_at is None:
                         self._last_active_key = block_key
                         self._last_active_at = now
-                        self._liveness_attempted_for = None
+                        if self._liveness_attempted_for != block_key:
+                            self._liveness_attempted_for = None
                         self._state = "blocked"
                         self._diagnostics = {
                             "inactivity_seconds": 0.0,
@@ -393,8 +436,15 @@ class SimpleWatcher:
                         and self._liveness_attempted_for != block_key
                     ):
                         self._liveness_attempted_for = block_key
-                        page.refresh()
-                        self._state = "blocked_recovery_refresh"
+                        refresh = page.refresh()
+                        if refresh is None or refresh.accepted:
+                            self._state = "blocked_recovery_refresh"
+                        elif refresh.uncertain:
+                            self._state = "blocked_recovery_unknown"
+                        elif refresh.stale:
+                            self._state = "blocked_recovery_stale"
+                        else:
+                            self._state = "blocked_recovery_rejected"
                         self._diagnostics = {
                             "inactivity_seconds": max(0.0, now - self._last_active_at),
                             "inactivity_timeout_seconds": self.liveness_timeout_seconds,
@@ -424,15 +474,14 @@ class SimpleWatcher:
             self._liveness_attempted_for = None
             if before.turn_key and self._transition_attempted_for == before.turn_key:
                 self._state = "transition_pending"
+                self._diagnostics = {"reason": "awaiting_new_assistant_turn_or_explicit_reregister"}
                 return self._state
 
-            # After REVIEW->ACTION, phase=0 plus a non-empty next_prompt is the
-            # durable evidence that an ACTION transition was already consumed.
-            # A daemon restart loses the ephemeral turn latch; if the still-
-            # visible finished body is itself a valid REVIEW payload, fail
-            # closed instead of misclassifying it as a completed ACTION and
-            # sending REVIEW twice.
-            if self._phase == 0 and self._next_prompt:
+            # Older durable rows have no consumed turn fence. For those rows,
+            # phase=0 plus next_prompt and a still-visible REVIEW payload must
+            # fail closed. Current rows use the exact durable turn comparison
+            # above, so a new ACTION may finish with any body, including JSON.
+            if self._phase == 0 and self._next_prompt and not self._transition_attempted_for:
                 try:
                     _parse_review(before.assistant_text)
                 except ValueError:
@@ -442,6 +491,7 @@ class SimpleWatcher:
                     self._diagnostics = {"reason": "prior_review_still_visible"}
                     return self._state
 
+            previous_state = self.durable_state
             if self._phase == 0:
                 # ACTION has no terminal authority. Even if its body contains a
                 # DONE marker, natural finality always transitions to REVIEW.
@@ -466,18 +516,29 @@ class SimpleWatcher:
                 transition_phase = 0
                 transition_cycle = self._cycle + 1
 
+            # Reserve semantic authority before the owner can execute the
+            # browser effect. The durable consumed turn fence survives a crash
+            # between the owner receipt and the registry's regular observation.
+            self._phase = transition_phase
+            self._cycle = transition_cycle
+            self._transition_attempted_for = before.turn_key or None
+            if self._persistence_callback is not None:
+                try:
+                    self._persistence_callback(self.durable_state)
+                except Exception as error:
+                    self.restore_state(previous_state)
+                    self._state = "transition_storage_unavailable"
+                    self._diagnostics = {"reason": "transition_reservation_failed", "error": str(error)[:1000]}
+                    return self._state
             delivery = page.send_simple_continue(
                 prompt,
                 before.turn_key,
                 acceptance_timeout=0.0,
             )
-            if delivery.accepted or delivery.uncertain:
-                # An uncertain frontend receipt is consumed as an attempted
-                # transition. This fails closed instead of replaying a prompt
-                # that may already have been accepted by the browser.
-                self._phase = transition_phase
-                self._cycle = transition_cycle
-                self._transition_attempted_for = before.turn_key or None
+            if not delivery.accepted and not delivery.uncertain:
+                # A definitive rejection proves no new semantic phase was
+                # accepted. Unknown delivery retains the durable reservation.
+                self.restore_state(previous_state)
             if not delivery.accepted:
                 self._state = "submission_unknown" if delivery.uncertain else "send_rejected"
                 return self._state
@@ -489,6 +550,7 @@ class SimpleWatcher:
             self._diagnostics = {"frontend_user_message_id": delivery.message_id}
             return self._state
         finally:
+            self._diagnostics.update(getattr(page, "diagnostics", {}))
             page.close()
 
     def close(self) -> None:

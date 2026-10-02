@@ -7,6 +7,7 @@ from chat_watchdog.contracts import parse_conversation_state
 from chat_watchdog.intent_client import SidecarIntentClient
 
 TARGET = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000011"
+REGISTRATION = "10000000-0000-0000-0000-000000000001"
 
 
 def state(**overrides):
@@ -39,6 +40,7 @@ def state(**overrides):
 def expected_intent_id(text, *, action="continue", assistant_id="assistant-9"):
     material = [
         "conversation-runtime/v1",
+        REGISTRATION,
         "watchdog",
         action,
         TARGET,
@@ -62,12 +64,14 @@ def test_submit_v1_builds_strict_envelope_from_authoritative_state():
 
     client = SidecarIntentClient(request_json=request)
     text = "continue bounded task"
-    result = client.submit_v1(state(), text)
+    result = client.submit_v1(state(), text, registration_id=REGISTRATION)
 
     assert result["accepted"] is True
     assert len(calls) == 1
-    endpoint, payload = calls[0]
-    assert endpoint.endswith("/internal/conversation-intents")
+    endpoint, packet = calls[0]
+    assert endpoint.endswith("/internal/watchdog-intents")
+    assert packet["registrationId"] == REGISTRATION
+    payload = packet["intent"]
     assert payload == {
         "contractVersion": 1,
         "intentId": expected_intent_id(text),
@@ -90,14 +94,14 @@ def test_submit_v1_intent_identity_is_stable_for_retry_and_changes_with_command(
     payloads = []
 
     def request(_endpoint, payload):
-        payloads.append(payload)
+        payloads.append(payload["intent"])
         return {"accepted": False, "reason": "pacing"}
 
     client = SidecarIntentClient(request_json=request)
     authoritative = state()
-    client.submit_v1(authoritative, "continue bounded task")
-    client.submit_v1(authoritative, "continue bounded task")
-    client.submit_v1(authoritative, "different continuation")
+    client.submit_v1(authoritative, "continue bounded task", registration_id=REGISTRATION)
+    client.submit_v1(authoritative, "continue bounded task", registration_id=REGISTRATION)
+    client.submit_v1(authoritative, "different continuation", registration_id=REGISTRATION)
 
     assert payloads[0]["intentId"] == payloads[1]["intentId"]
     assert payloads[0]["intentId"] != payloads[2]["intentId"]
@@ -106,7 +110,7 @@ def test_submit_v1_intent_identity_is_stable_for_retry_and_changes_with_command(
 def test_submit_v1_rejects_missing_authoritative_message_identity_before_post():
     client = SidecarIntentClient(request_json=lambda *_: pytest.fail("must not post invalid intent"))
     with pytest.raises(ValueError):
-        client.submit_v1(state(turn={"assistantMessageId": None}), "continue bounded task")
+        client.submit_v1(state(turn={"assistantMessageId": None}), "continue bounded task", registration_id=REGISTRATION)
 
 
 def test_submit_v1_stop_allows_active_turn_without_assistant_message_id():
@@ -118,10 +122,12 @@ def test_submit_v1_stop_allows_active_turn_without_assistant_message_id():
 
     client = SidecarIntentClient(request_json=request)
     active = state(progress="active", body="empty", turn={"assistantMessageId": None})
-    result = client.submit_v1(active, None, action="stop")
+    result = client.submit_v1(active, None, action="stop", registration_id=REGISTRATION)
 
     assert result["accepted"] is True
-    _, payload = calls[0]
+    _, packet = calls[0]
+    assert packet["registrationId"] == REGISTRATION
+    payload = packet["intent"]
     assert payload == {
         "contractVersion": 1,
         "intentId": expected_intent_id(None, action="stop", assistant_id=None),
@@ -143,4 +149,4 @@ def test_submit_v1_stop_allows_active_turn_without_assistant_message_id():
 def test_submit_v1_rejects_invalid_owner_response():
     client = SidecarIntentClient(request_json=lambda *_: {"accepted": "yes"})
     with pytest.raises(RuntimeError, match="invalid intent owner receipt"):
-        client.submit_v1(state(), "continue bounded task")
+        client.submit_v1(state(), "continue bounded task", registration_id=REGISTRATION)
