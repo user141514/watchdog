@@ -46,18 +46,22 @@ def activate(root):
     if health() is not None: raise RuntimeError("stop the exact old Watchdog instance before activation")
     runtime=Path(os.environ["LOCALAPPDATA"])/"chat-watchdog"
     commit,target=prepare(root)
-    python=runtime/"venv"/"Scripts"/"python.exe"
+    python=runtime/"venv"/"Scripts"/"pythonw.exe"
     launcher=runtime/"start-current-watchdog.cmd"
     store=runtime/"registry-v2.sqlite3"
     if launcher.exists():
         backup=runtime/("start-current-watchdog.before-"+commit+".cmd")
         if not backup.exists(): shutil.copy2(launcher,backup)
     launcher.write_text(
-        '@echo off\ncd /d "'+str(target)+'"\n"'+str(python)+
+        '@echo off\ncd /d "'+str(target)+'"\nstart "" /b "'+str(python)+
         '" -m chat_watchdog --simple --registry-port 9235 --registry-store "'+
-        str(store)+'" --simple-interval-seconds 15\n',encoding="utf-8")
+        str(store)+'" --simple-interval-seconds 15 >> "'+str(runtime/"quiet-watchdog.stdout.log")+
+        '" 2>> "'+str(runtime/"quiet-watchdog.stderr.log")+'"\n',encoding="utf-8")
     with (runtime/"quiet-watchdog.stdout.log").open("ab") as stdout, (runtime/"quiet-watchdog.stderr.log").open("ab") as stderr:
-        subprocess.Popen(["cmd.exe","/d","/s","/c",str(launcher)],cwd=runtime,stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,creationflags=subprocess.DETACHED_PROCESS|subprocess.CREATE_NEW_PROCESS_GROUP)
+        subprocess.Popen([str(python),"-m","chat_watchdog","--simple","--registry-port","9235",
+            "--registry-store",str(store),"--simple-interval-seconds","15"],cwd=target,
+            stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,
+            creationflags=subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP)
     deadline=time.monotonic()+20
     while time.monotonic()<deadline:
         current=health()

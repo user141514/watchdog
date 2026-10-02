@@ -39,6 +39,12 @@ Watchdog 基线包括当时实际运行目录中的现代 UI 和机械两相改�
 - Observatory：安装器失败时自动恢复 .previous。部署成功后的主动回档应先停止已确认的 Observatory 服务，恢复已验证原运行快照或由 clean rollback tag 走 canonical app:install；启动后重新验证 install metadata、资产与数据目录。原运行快照可保留曾有热更新而 install metadata 未跟进的精确字节。
 - 如果撤回或扩展升级显示 busy/unknown，先解释真实未收敛状态。不要把 ACK、命令超时、文件已复制或源码测试通过当作运行完成。
 
+## 不可读页面与后台运行
+
+页面缺少持久轮次身份时，保留 desired 注册，报告 `observation_unavailable / persistent_turn_identity_unavailable`；不自行刷新、发送或清除身份检查。相同失败只在状态首次出现时发 WARNING，原因或类型变化继续告警；恢复成功记录 INFO。失败计数、完整错误和最后成功时间持续更新，因此去重不等于隐藏故障。
+
+激活器直接以 `pythonw.exe` 和 `CREATE_NO_WINDOW` 启动精确 release；稳定 launcher 使用后台 GUI Python，同一 registry 和 stdout/stderr 日志。运行验收要在至少两个 scheduler 周期中核对重复错误日志数量，并确认没有 Watchdog 控制台窗口。
+
 ## 长期 gate
 
 运行 `python -m pytest -q tests/test_zero_browser_system_gate.py`：真实 --simple 子进程，隔离 SQLite、fake Sidecar 和 Relay 计数，覆盖 EMPTY、明确绑定恢复观察、解绑 ACK 后静默、隐式注册拒绝、重启仍空载。ACTIVE interval=0.03s，每段静默窗口0.25s。Gate 不访问真实浏览器。

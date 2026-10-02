@@ -120,7 +120,7 @@ def activation_fakes(helper, source, monkeypatch, health_value):
         monotonic=lambda: next(ticks), sleep=lambda _seconds: None,
     ))
     monkeypatch.setattr(helper, "subprocess", SimpleNamespace(
-        Popen=fake_launch, DEVNULL=-3, DETACHED_PROCESS=8, CREATE_NEW_PROCESS_GROUP=512,
+        Popen=fake_launch, DEVNULL=-3, DETACHED_PROCESS=8, CREATE_NEW_PROCESS_GROUP=512, CREATE_NO_WINDOW=0x08000000,
     ))
     return root, runtime, commit, target, launches
 
@@ -156,6 +156,27 @@ def test_activate_success_requires_exact_runtime_store_and_true_readiness(helper
     result = helper.activate(root)
     assert result == {"commit": commit, "runtime": str(target), "health": health_value}
     assert len(launches) == 1
+
+
+def test_activation_launches_background_runtime_without_allocating_console(helper, source, monkeypatch):
+    _root, runtime, commit = source
+    health_value = {
+        "module_path": str(runtime / "releases" / commit / "chat_watchdog" / "registry.py"),
+        "store_path": str(runtime / "registry-v2.sqlite3"), "ready": True,
+    }
+    root, runtime, _commit, target, launches = activation_fakes(helper, source, monkeypatch, health_value)
+    helper.activate(root)
+    args, kwargs = launches[0]
+    assert Path(args[0][0]).name == "pythonw.exe"
+    assert args[0][1:3] == ["-m", "chat_watchdog"]
+    assert kwargs["cwd"] == target
+    assert kwargs["creationflags"] & 0x08000000
+    assert not kwargs["creationflags"] & 8
+    assert Path(kwargs["stdout"].name) == runtime / "quiet-watchdog.stdout.log"
+    assert Path(kwargs["stderr"].name) == runtime / "quiet-watchdog.stderr.log"
+    launcher = (runtime / "start-current-watchdog.cmd").read_text()
+    assert 'start "" /b ' in launcher
+    assert "pythonw.exe" in launcher
 
 
 @pytest.mark.parametrize("mismatch", ["module_path", "store_path"])

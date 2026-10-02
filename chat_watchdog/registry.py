@@ -87,6 +87,15 @@ class _WatchEntry:
     last_registration: dict | None = None
     registration_id: str = field(default_factory=lambda: str(uuid4()))
     lock: object = field(default_factory=RLock)
+    logged_failure: tuple[type[Exception], str] | None = None
+
+    @property
+    def observation_failure_reason(self) -> str | None:
+        # This typed native refusal proves no readable persistent turn identity.
+        # Unknown identity/protocol failures retain their own full error.
+        if self.last_error == "RuntimeError: persistent_turn_identity_unavailable":
+            return "persistent_turn_identity_unavailable"
+        return None
 
 
 def conversation_id_from_url(value: str) -> str:
@@ -197,13 +206,18 @@ class WatchRegistry:
         return not self._closed and self._watchers.get(entry.conversation_id) is entry
 
     def _record_error(self, entry: _WatchEntry, error: Exception) -> None:
+        failure = (type(error), str(error))
         with self._lock:
             if not self._current(entry):
                 return
             entry.consecutive_failures += 1
-            entry.last_error = f"{type(error).__name__}: {error}"[:1000]
+            entry.last_error = f"{type(error).__name__}: {error}"
             self._store.observe(entry)
-        _LOG.warning("watchdog %s retained for retry: %s", entry.conversation_id, entry.last_error)
+            changed = entry.logged_failure != failure
+            entry.logged_failure = failure
+            detail = entry.last_error
+        if changed:
+            _LOG.warning("watchdog %s retained for retry: %s", entry.conversation_id, detail)
 
     def _bind(self, entry: _WatchEntry) -> bool:
         try:
@@ -379,7 +393,8 @@ class WatchRegistry:
                 WatchRegistration(
                     conversation_id=entry.conversation_id,
                     target_url=entry.target_url,
-                    state=("reconnecting" if entry.watcher is None else
+                    state=("observation_unavailable" if entry.observation_failure_reason else
+                           "reconnecting" if entry.watcher is None else
                            "degraded" if entry.last_error else
                            getattr(entry.watcher, "state", "active")),
                     connected=entry.watcher is not None,
@@ -388,7 +403,12 @@ class WatchRegistry:
                     last_success_at=entry.last_success_at,
                     consecutive_failures=entry.consecutive_failures,
                     last_error=entry.last_error,
-                    diagnostics=getattr(entry.watcher, "diagnostics", None),
+                    diagnostics=({
+                        **(getattr(entry.watcher, "diagnostics", None) or {}),
+                        "observation_available": False,
+                        "reason": entry.observation_failure_reason,
+                    } if entry.observation_failure_reason else
+                        getattr(entry.watcher, "diagnostics", None)),
                     last_registration=None if entry.last_registration is None else dict(entry.last_registration),
                     registration_id=entry.registration_id,
                 )
@@ -459,9 +479,11 @@ class WatchRegistry:
                 if (not self._current(entry) or entry.registration_id != generation
                         or entry.conversation_id in self._pending_withdrawals):
                     return
+                recovered_error = entry.last_error
                 entry.last_success_at = self._clock()
                 entry.consecutive_failures = 0
                 entry.last_error = None
+                entry.logged_failure = None
                 # Preserve phase, reservations and accepted-review lineage before
                 # discarding a cache. Desired membership/generation remains owned
                 # here; an observation or owner denial cannot register a watch.
@@ -477,6 +499,9 @@ class WatchRegistry:
                     self._completed[entry.conversation_id] = WatchCompletion(
                         entry.conversation_id, entry.target_url, result)
                     self._watchers.pop(entry.conversation_id)
+            if recovered_error is not None:
+                _LOG.info("watchdog %s recovered from retry: %s",
+                          entry.conversation_id, recovered_error)
             if cached is not None:
                 self._close_transport(entry.conversation_id, cached)
             if completed:
