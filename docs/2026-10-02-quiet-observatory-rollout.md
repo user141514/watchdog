@@ -32,10 +32,10 @@ Watchdog 基线包括当时实际运行目录中的现代 UI 和机械两相改�
 
 ## 回档原则与操作
 
-**代码回档默认保留当前 desired registry 和业务数据。** 快照里的 watchdog-registry.sqlite3 只用于数据库灾难恢复；用它做普通代码回档，会让后来已经解绑的任务复活。
+**安全回档默认停监督器、保留当前 desired registry 和业务数据。** 快照里的 watchdog-registry.sqlite3 只用于数据库灾难恢复；用它做普通代码回档，会让后来已经解绑的任务复活。
 
-- Watchdog：先按 /health 身份停止新 runtime，恢复快照中的 watchdog-start.cmd 至稳定 launcher，再启动并验证 module_path 指向旧 runtime、store_path 仍是同一 registry-v2.sqlite3，确认当前成员未改变。旧 runtime 代码字节和 7052c11 tag 均保留。
-- Sidecar：在独立 clean checkout 的 d50c48e6 基线运行 canonical bootstrap --activate，指定既有 Runtime Home 和同一 subagents Project，然后 extension-update 验证旧 build 的新 instance。保留 data_root；不手改 current_release 或 Native Messaging manifest。
+- Watchdog：先按 /health 身份停止新 runtime，恢复快照中的 watchdog-start.cmd 至稳定 launcher，默认保持监督器停止并保留 registry-v2.sqlite3。旧 runtime 字节和 7052c11 tag 均保留，但旧代码不理解 pending withdrawal，也没有显式注册门禁；不能直接启动并宣称新生命周期契约仍成立。若要恢复旧监督服务，须使用保留显式门禁的兼容回档 release，并重新做 owner drain、membership 和空载 gate。
+- Sidecar：在独立 clean checkout 的 d50c48e6 基线运行 canonical bootstrap --activate，指定既有 Runtime Home 和同一 subagents Project，然后 extension-update 验证旧 build 的新 instance。回旧 owner 前，必须先在新 owner 证明 pending withdrawal 与 durable content-effect journal 均已真实收敛；未收敛时保持停机，不能丢掉屏障。保留 data_root；不手改 current_release 或 Native Messaging manifest。d50c48e6 的 WorkController 仍有旧式 auto-register，因此配套 Watchdog 必须保持停止，或者使用仍拒绝隐式注册的兼容 release。
 - Observatory：安装器失败时自动恢复 .previous。部署成功后的主动回档应先停止已确认的 Observatory 服务，恢复已验证原运行快照或由 clean rollback tag 走 canonical app:install；启动后重新验证 install metadata、资产与数据目录。原运行快照可保留曾有热更新而 install metadata 未跟进的精确字节。
 - 如果撤回或扩展升级显示 busy/unknown，先解释真实未收敛状态。不要把 ACK、命令超时、文件已复制或源码测试通过当作运行完成。
 

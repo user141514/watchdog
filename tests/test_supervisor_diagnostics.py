@@ -8,6 +8,7 @@ from test_supervisor_authoritative_state import Intents, Page, Pool, States, TAR
 def test_owner_outage_is_distinguishable_from_an_alive_idle_watcher():
     page = Page()
     page.close = lambda: None
+    page.bind_registration = lambda registration_id: None
     sup = Supervisor(page, Pool(), intent_client=Intents(),
                      state_client=States(error=StateUnavailable("sidecar unreachable")))
     watcher = _SupervisorWatcher(page, sup)

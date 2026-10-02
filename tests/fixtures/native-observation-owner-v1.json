@@ -1,0 +1,44 @@
+{
+  "found": true,
+  "state": {
+    "contractVersion": 1,
+    "conversationId": "conv_c1a601d7-54a5-4ee7-b39d-656358ae94da",
+    "target": "https://chatgpt.com/c/00000000-0000-4000-8000-000000000101",
+    "stateVersion": 1,
+    "turn": {
+      "turnId": "review-turn",
+      "userMessageId": "10000000-0000-4000-8000-000000000101",
+      "assistantMessageId": "20000000-0000-4000-8000-000000000101"
+    },
+    "progress": "terminal",
+    "body": "substantive",
+    "delivery": "delivered",
+    "gate": "none",
+    "writer": {
+      "mode": "managed",
+      "epoch": 7
+    }
+  },
+  "observation": {
+    "contractVersion": 1,
+    "source": "browser",
+    "conversationId": "conv_c1a601d7-54a5-4ee7-b39d-656358ae94da",
+    "target": "https://chatgpt.com/c/00000000-0000-4000-8000-000000000101",
+    "observedAt": "2026-10-02T15:39:52.703Z",
+    "turnId": "review-turn",
+    "userMessageId": "10000000-0000-4000-8000-000000000101",
+    "assistantMessageId": "20000000-0000-4000-8000-000000000101",
+    "assistantText": "{\"decision\":\"DONE\",\"terminal\":\"SUPERVISOR_DONE\"}",
+    "readable": true,
+    "generating": false,
+    "terminal": true,
+    "body": "substantive",
+    "humanGate": false,
+    "delivery": "delivered",
+    "requestId": null
+  },
+  "lineage": {
+    "registrationId": "30000000-0000-4000-8000-000000000101",
+    "intentId": "review-intent"
+  }
+}

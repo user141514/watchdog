@@ -19,6 +19,15 @@ class WatchdogOwnerScopeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "registration"):
             client.submit_v1(STATE, "continue task")
 
+    def test_prepared_intent_identity_is_known_without_post_and_matches_dispatch(self):
+        calls = []
+        client = SidecarIntentClient(request_json=lambda endpoint, payload: (
+            calls.append((endpoint, payload)) or {"accepted": True}))
+        prepared = client.prepare_v1(STATE, "continue task", registration_id=REGISTRATION)
+        self.assertEqual(calls, [])
+        client.submit_v1(STATE, "continue task", registration_id=REGISTRATION)
+        self.assertEqual(prepared, calls[0][1]["intent"])
+
     def test_registered_intent_wraps_strict_v1_payload_in_owner_scope(self):
         calls = []
         client = SidecarIntentClient(request_json=lambda endpoint, payload: (

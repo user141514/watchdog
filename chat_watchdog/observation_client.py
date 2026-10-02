@@ -49,28 +49,46 @@ def sibling_observation_endpoint(intent_endpoint: str) -> str:
 class ObservationSample:
     state: ContractValue
     observation: ContractValue
+    lineage: dict[str, str | None] | None = None
+
+    def _trusted_phase(self) -> tuple[Phase, str]:
+        state, obs = self.state.to_dict(), self.observation.to_dict()
+        if (not obs["readable"] or obs["generating"] is None or obs["terminal"] is None
+                or obs["humanGate"] is None or obs["body"] == "unknown"
+                or obs["delivery"] == "unknown"):
+            return Phase.BLOCKED, "observation_signals_unknown"
+        if obs["humanGate"] is True or state["gate"] != "none":
+            return Phase.BLOCKED, "human_required"
+        if obs["delivery"] != "delivered" or state["delivery"] != "delivered":
+            return Phase.BLOCKED, "observation_delivery_unsettled"
+        if not obs["userMessageId"] or not obs["assistantMessageId"]:
+            return Phase.BLOCKED, "observation_identity_incomplete"
+        # This complete positive mapping is shared by both Watchdog modes.
+        # Retained owner state is usable only when it agrees with this actual
+        # browser sample; unknown/idle state cannot authorize an effect.
+        phases = {
+            (True, False): ("active", Phase.RESPONDING),
+            (False, True): ("terminal", Phase.FINISHED),
+            (False, False): ("blocked", Phase.BLOCKED),
+        }
+        expected = phases.get((obs["generating"], obs["terminal"]))
+        if expected is None:
+            return Phase.BLOCKED, "observation_finality_conflict"
+        progress, phase = expected
+        if state["progress"] != progress:
+            return Phase.BLOCKED, "observation_progress_mismatch"
+        if state["body"] != obs["body"]:
+            return Phase.BLOCKED, "observation_body_mismatch"
+        if phase is Phase.FINISHED and obs["body"] != "substantive":
+            return Phase.BLOCKED, "observation_final_body_unconfirmed"
+        return phase, ""
 
     def snapshot(self) -> PageSnapshot:
-        state = self.state.to_dict()
-        obs = self.observation.to_dict()
+        state, obs = self.state.to_dict(), self.observation.to_dict()
         text = (obs["assistantText"] or "") if obs["readable"] else ""
-        known = bool(
-            obs["readable"] and obs["generating"] is not None
-            and obs["terminal"] is not None and obs["humanGate"] is not None
-            and obs["body"] != "unknown" and obs["delivery"] != "unknown"
-        )
-        gate = obs["humanGate"] is True or state["gate"] == "human_required"
+        phase, reason = self._trusted_phase()
         pending = obs["delivery"] == "pending" or state["delivery"] == "pending"
         pending = pending or not obs["assistantMessageId"]
-        guarded = not known or gate or obs["delivery"] == "uncertain" or state["delivery"] == "uncertain"
-        phase = Phase.BLOCKED
-        if not guarded and not pending:
-            if obs["generating"] is True and obs["terminal"] is False:
-                phase = Phase.RESPONDING
-            elif (obs["generating"] is False and obs["terminal"] is True
-                  and obs["body"] == "substantive"
-                  and obs["userMessageId"] and obs["assistantMessageId"]):
-                phase = Phase.FINISHED
         signature = hashlib.sha256(text.encode("utf-8")).hexdigest() if text else ""
         return PageSnapshot(
             phase=phase, assistant_turn_id=obs["assistantMessageId"] or "",
@@ -78,8 +96,8 @@ class ObservationSample:
             assistant_count=int(bool(obs["assistantMessageId"])),
             user_count=int(bool(obs["userMessageId"])),
             user_turn_id=obs["userMessageId"] or "", user_turn_pending=pending,
-            interaction_required=guarded, stop_visible=obs["generating"] is True,
-            fault_text=("observation_signals_unknown" if not known else ""),
+            interaction_required=bool(reason), stop_visible=obs["generating"] is True,
+            fault_text=reason,
         )
 
 
@@ -111,8 +129,19 @@ class SidecarObservationClient:
             if set(payload) - {"found", "reason"} or not isinstance(payload.get("reason"), str) or not payload["reason"]:
                 raise ObservationProtocolError("invalid unavailable-observation response")
             raise ObservationUnavailable(payload["reason"])
-        if set(payload) != {"found", "state", "observation"}:
+        base_keys = {"found", "state", "observation"}
+        if set(payload) not in (base_keys, base_keys | {"lineage"}):
             raise ObservationProtocolError("fresh observation and state are both required")
+        lineage = payload.get("lineage")
+        if lineage is not None:
+            if not isinstance(lineage, Mapping) or set(lineage) != {"registrationId", "intentId"}:
+                raise ObservationProtocolError("invalid observation lineage")
+            if any(value is not None and (not isinstance(value, str) or not value or len(value) > 256)
+                   for value in lineage.values()):
+                raise ObservationProtocolError("invalid observation lineage identity")
+            if (lineage["registrationId"] is None) != (lineage["intentId"] is None):
+                raise ObservationProtocolError("incomplete observation lineage")
+            lineage = dict(lineage)
         try:
             state = parse_conversation_state(payload["state"])
             observation = parse_observation(payload["observation"])
@@ -132,7 +161,7 @@ class SidecarObservationClient:
         age = self._clock() - observed_at.timestamp()
         if age < -5.0 or age > self.max_age_seconds:
             raise ObservationUnavailable("observation_stale")
-        return ObservationSample(state, observation)
+        return ObservationSample(state, observation, lineage)
 
 
 class SidecarObservationPage:
@@ -190,17 +219,12 @@ class SidecarObservationPage:
             raise ObservationUnavailable("observation_unavailable")
         if _conversation_id(target) != _conversation_id(self.target_url):
             raise ObservationProtocolError("observation/state target mismatch")
-        obs, state = self._sample.observation.to_dict(), self._sample.state.to_dict()
+        state = self._sample.state.to_dict()
+        if state["gate"] == "human_required":
+            return self._sample.state
         current = self._sample.snapshot()
-        if (not obs["readable"] or obs["generating"] is None or obs["terminal"] is None
-                or obs["humanGate"] is None or obs["body"] == "unknown"
-                or obs["delivery"] == "unknown"):
-            raise ObservationProtocolError("observation_signals_unknown")
-        if (state["progress"] == "terminal" and current.phase is not Phase.FINISHED
-                and state["gate"] != "human_required"):
-            raise ObservationProtocolError("current_observation_not_terminal")
-        if state["progress"] == "active" and current.phase not in (Phase.THINKING, Phase.RESPONDING):
-            raise ObservationProtocolError("current_observation_not_active")
+        if current.fault_text or current.user_turn_pending:
+            raise ObservationProtocolError(current.fault_text or "user_turn_pending")
         return self._sample.state
 
     def bind_registration(self, registration_id):
@@ -208,6 +232,11 @@ class SidecarObservationPage:
         self.registration_id = registration_id
 
     def submit_v1(self, state, text=None, *, source="watchdog", action="continue"):
+        current = self._sample.snapshot() if self._current_available else None
+        safe_phases = (Phase.THINKING, Phase.RESPONDING) if action == "stop" else (Phase.FINISHED, Phase.BLOCKED)
+        if (current is None or current.interaction_required or current.user_turn_pending
+                or current.phase not in safe_phases):
+            return {"accepted": False, "reason": "observation_not_actionable"}
         return self._intents.submit_v1(state, text, source=source, action=action,
                                        registration_id=self.registration_id)
 
@@ -233,6 +262,28 @@ class SidecarObservationPage:
             stale=stale, uncertain=uncertain,
         )
 
+    def proves_user_turn(self, user_turn_id):
+        if not self._current_available or not user_turn_id:
+            return False
+        state, obs = self._sample.state.to_dict(), self._sample.observation.to_dict()
+        # A pending human turn need not yet have an assistant or finality.
+        # This is only persistent-user evidence, never permission to write.
+        return bool(obs["readable"] is True and obs["userMessageId"] == user_turn_id
+                    and obs["delivery"] == "delivered" and state["delivery"] == "delivered")
+
+    def review_lineage_matches(self, expected_intent_id, registration_id):
+        lineage = self._sample.lineage or {}
+        return bool(expected_intent_id and registration_id
+                    and lineage.get("intentId") == expected_intent_id
+                    and lineage.get("registrationId") == registration_id)
+
+    def prepare_simple_continue(self, prompt, expected_turn_key):
+        current = self.snapshot()
+        if current.turn_key != expected_turn_key or current.phase is not Phase.FINISHED:
+            raise ObservationProtocolError("observation_not_actionable")
+        return self._intents.prepare_v1(self._sample.state, prompt,
+                                        registration_id=self.registration_id)["intentId"]
+
     def send_simple_continue(self, prompt, expected_turn_key, acceptance_timeout=0.0):
         snapshot = self.snapshot()
         if snapshot.turn_key != expected_turn_key or snapshot.phase is not Phase.FINISHED:
@@ -240,7 +291,7 @@ class SidecarObservationPage:
         return self._submit(prompt)
 
     def recover_stalled_active(self, prompt, expected_turn_key, *, stop_timeout=10.0,
-                               acceptance_timeout=90.0):
+                               acceptance_timeout=90.0, before_continue=None):
         before = self.snapshot()
         if before.turn_key != expected_turn_key or before.phase not in (Phase.THINKING, Phase.RESPONDING):
             return PromptDelivery(accepted=False, stale=True)
@@ -268,6 +319,16 @@ class SidecarObservationPage:
             if (obs["readable"] and obs["generating"] is False
                     and obs["terminal"] is not None and obs["humanGate"] is False
                     and not current.interaction_required and not current.user_turn_pending):
+                if before_continue is not None:
+                    try:
+                        intent_id = self._intents.prepare_v1(
+                            self._sample.state, prompt, registration_id=self.registration_id,
+                        )["intentId"]
+                        before_continue(intent_id)
+                    except Exception as error:
+                        self.diagnostics.update(recovery_reason="recovery_reservation_failed",
+                                                recovery_error=str(error)[:1000])
+                        return PromptDelivery(accepted=False)
                 return self._submit(prompt)
             if time.monotonic() >= deadline:
                 self.diagnostics["recovery_reason"] = "stop_not_observed"

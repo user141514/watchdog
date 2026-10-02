@@ -105,7 +105,7 @@ class SidecarIntentClient:
             raise RuntimeError('invalid intent owner receipt')
         return result
 
-    def submit_v1(self, state, text=None, *, source='watchdog', action='continue', registration_id=None):
+    def prepare_v1(self, state, text=None, *, source='watchdog', action='continue', registration_id=None):
         if source == 'watchdog':
             self._registration_id(registration_id)
         if action not in {'continue', 'stop'}:
@@ -144,6 +144,11 @@ class SidecarIntentClient:
                 'assistantMessageId': turn['assistantMessageId'],
             },
         }).to_dict()
+        return payload
+
+    def submit_v1(self, state, text=None, *, source='watchdog', action='continue', registration_id=None):
+        payload = self.prepare_v1(state, text, source=source, action=action,
+                                  registration_id=registration_id)
         endpoint = self.endpoint
         if source == 'watchdog':
             endpoint = self._sibling('/internal/watchdog-intents')

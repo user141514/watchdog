@@ -13,11 +13,13 @@ def health():
 def prepare(root):
     subprocess.run(["git","diff","--quiet"],cwd=root,check=True)
     subprocess.run(["git","diff","--cached","--quiet"],cwd=root,check=True)
+    untracked=subprocess.check_output(["git","ls-files","--others","--exclude-standard"],cwd=root,text=True).strip()
+    if untracked: raise RuntimeError("untracked files must be reviewed and preserved before exporting a release")
     commit=subprocess.check_output(["git","rev-parse","HEAD"],cwd=root,text=True).strip()
     runtime=Path(os.environ["LOCALAPPDATA"])/"chat-watchdog"
     target=runtime/"releases"/commit
+    payload=subprocess.check_output(["git","archive","--format=zip",commit],cwd=root)
     if not target.exists():
-        payload=subprocess.check_output(["git","archive","--format=zip",commit],cwd=root)
         staging=runtime/"releases"/(commit+".staging")
         if staging.exists(): raise RuntimeError("stale staging directory requires inspection")
         staging.mkdir(parents=True)
@@ -29,6 +31,15 @@ def prepare(root):
         staging.rename(target)
     if not (target/"chat_watchdog"/"registry.py").is_file():
         raise RuntimeError("invalid exported runtime")
+    # A directory named after a SHA is not evidence that its bytes still match.
+    # Existing releases may contain normal Python caches, but every tracked
+    # source file must equal this exact Git export; never hot-repair a release.
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        for member in archive.infolist():
+            if member.is_dir(): continue
+            path=target/member.filename
+            if not path.is_file() or path.read_bytes()!=archive.read(member):
+                raise RuntimeError("release content does not match Git commit: "+member.filename)
     return commit,target
 
 def activate(root):
@@ -56,7 +67,8 @@ def activate(root):
                 raise RuntimeError("listener belongs to a different runtime")
             if Path(current.get("store_path","")).resolve()!=store.resolve():
                 raise RuntimeError("listener belongs to a different registry")
-            return {"commit":commit,"runtime":str(target),"health":current}
+            if current.get("ready") is True:
+                return {"commit":commit,"runtime":str(target),"health":current}
         time.sleep(0.25)
     raise RuntimeError("new runtime did not become ready; retain rollback launcher and inspect stderr")
 

@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from collections.abc import Callable
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from http.server import BaseHTTPRequestHandler, HTTPServer, ThreadingHTTPServer
 from pathlib import Path
@@ -212,7 +213,7 @@ class WatchRegistry:
                 bind_registration(entry.registration_id)
             restore_state = getattr(watcher, "restore_state", None)
             if entry.runtime_state is not None and callable(restore_state):
-                restore_state(dict(entry.runtime_state))
+                restore_state(deepcopy(entry.runtime_state))
             persist = getattr(watcher, "set_persistence_callback", None)
             if callable(persist):
                 persist(lambda state: self._persist_runtime_state(entry, state))
@@ -227,15 +228,19 @@ class WatchRegistry:
             if not self._current(entry):
                 raise RuntimeError("watch generation was withdrawn before effect reservation")
             self._store.reserve_runtime_state(entry.conversation_id, entry.registration_id, state)
-            entry.runtime_state = dict(state)
+            entry.runtime_state = deepcopy(state)
 
     @staticmethod
     def _close_watcher(entry: _WatchEntry) -> None:
-        if entry.watcher is not None:
+        WatchRegistry._close_transport(entry.conversation_id, entry.watcher)
+
+    @staticmethod
+    def _close_transport(conversation_id: str, watcher: Watcher | None) -> None:
+        if watcher is not None:
             try:
-                entry.watcher.close()
+                watcher.close()
             except Exception:
-                _LOG.exception("watchdog transport cleanup failed: %s", entry.conversation_id)
+                _LOG.exception("watchdog transport cleanup failed: %s", conversation_id)
 
     def _provenance(self, metadata: dict | None, reason: str) -> dict:
         metadata = metadata or {}
@@ -430,6 +435,7 @@ class WatchRegistry:
             with self._lock:
                 if not self._current(entry):
                     return
+                generation = entry.registration_id
                 entry.last_poll_at = self._clock()
                 # A broken durable store closes the side-effect gate, not just logging.
                 self._store.observe(entry)
@@ -441,19 +447,28 @@ class WatchRegistry:
                 if durable_state is not None:
                     if not isinstance(durable_state, dict):
                         raise TypeError("watcher durable_state must be a dict")
-                    entry.runtime_state = dict(durable_state)
+                    entry.runtime_state = deepcopy(durable_state)
                 completed = entry.watcher.should_stop
                 result = entry.watcher.completion_text if completed else None
+                owner_rebind = getattr(entry.watcher, "requires_owner_rebind", False) is True
             except Exception as error:  # noqa: BLE001 - one watcher must not kill its siblings
                 self._record_error(entry, error)
                 return
+            cached = None
             with self._lock:
-                if not self._current(entry):
+                if (not self._current(entry) or entry.registration_id != generation
+                        or entry.conversation_id in self._pending_withdrawals):
                     return
                 entry.last_success_at = self._clock()
                 entry.consecutive_failures = 0
                 entry.last_error = None
+                # Preserve phase, reservations and accepted-review lineage before
+                # discarding a cache. Desired membership/generation remains owned
+                # here; an observation or owner denial cannot register a watch.
                 self._store.observe(entry)
+                if owner_rebind and not completed:
+                    cached = entry.watcher
+                    entry.watcher = None
                 if completed:
                     self._store.complete(entry.conversation_id, result,
                                          self._provenance({"source": "watchdog-runtime",
@@ -462,6 +477,8 @@ class WatchRegistry:
                     self._completed[entry.conversation_id] = WatchCompletion(
                         entry.conversation_id, entry.target_url, result)
                     self._watchers.pop(entry.conversation_id)
+            if cached is not None:
+                self._close_transport(entry.conversation_id, cached)
             if completed:
                 self._close_watcher(entry)
                 if self._progress_store is not None:

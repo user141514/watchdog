@@ -155,6 +155,8 @@ class SimpleWatcher:
         self._last_active_at: float | None = None
         self._liveness_attempted_for: tuple[str, str] | None = None
         self._transition_attempted_for: str | None = None
+        self._expected_review_intent_id: str | None = None
+        self._legacy_transition_state = False
         self._persistence_callback: Callable[[dict[str, object]], None] | None = None
 
     @property
@@ -174,21 +176,38 @@ class SimpleWatcher:
 
     @property
     def durable_state(self) -> dict[str, object]:
-        return {
+        state = {
             "phase": self._phase,
             "cycle": self._cycle,
             "next_prompt": self._next_prompt,
             "status": self._run_status,
             "transition_turn_id": self._transition_attempted_for,
+            "expected_review_intent_id": self._expected_review_intent_id,
+            "liveness_attempted_for": (None if self._liveness_attempted_for is None
+                                       else list(self._liveness_attempted_for)),
         }
+        # Absence carries the unresolved legacy fence across regular registry
+        # checkpoints and owner rebinds. Modern human-input release keeps an
+        # explicit null, so a new ACTION is never mistaken for that old REVIEW.
+        if self._legacy_transition_state and self._transition_attempted_for is None:
+            state.pop("transition_turn_id")
+        return state
 
     def restore_state(self, value: dict[str, object]) -> None:
         base_keys = {"phase", "cycle", "next_prompt", "status"}
-        if set(value) not in (base_keys, base_keys | {"transition_turn_id"}):
+        optional_keys = {"transition_turn_id", "expected_review_intent_id", "liveness_attempted_for"}
+        if not base_keys <= set(value) or set(value) - (base_keys | optional_keys):
             raise ValueError("invalid simple watchdog durable state fields")
         transition_turn_id = value.get("transition_turn_id")
         if transition_turn_id is not None and (not isinstance(transition_turn_id, str) or not transition_turn_id):
             raise ValueError("transition_turn_id must be a non-empty string or null")
+        expected_review_intent_id = value.get("expected_review_intent_id")
+        if expected_review_intent_id is not None and (not isinstance(expected_review_intent_id, str) or not expected_review_intent_id):
+            raise ValueError("expected_review_intent_id must be a non-empty string or null")
+        liveness = value.get("liveness_attempted_for")
+        if liveness is not None and (not isinstance(liveness, (list, tuple)) or len(liveness) != 2
+                                     or any(not isinstance(part, str) for part in liveness)):
+            raise ValueError("liveness_attempted_for must be a two-string tuple or null")
         phase = value["phase"]
         cycle = value["cycle"]
         next_prompt = value["next_prompt"]
@@ -206,6 +225,9 @@ class SimpleWatcher:
         self._next_prompt = next_prompt
         self._run_status = status
         self._transition_attempted_for = transition_turn_id
+        self._legacy_transition_state = "transition_turn_id" not in value
+        self._expected_review_intent_id = expected_review_intent_id
+        self._liveness_attempted_for = None if liveness is None else tuple(liveness)
         self._done_latched = status == DONE_STATUS
         if self._done_latched:
             self._state = "done"
@@ -213,10 +235,42 @@ class SimpleWatcher:
     def set_persistence_callback(self, callback) -> None:
         self._persistence_callback = callback
 
+    def _checkpoint_liveness(self, key) -> bool:
+        previous = self._liveness_attempted_for
+        self._liveness_attempted_for = key
+        try:
+            if self._persistence_callback is not None:
+                self._persistence_callback(self.durable_state)
+        except Exception as error:
+            self._liveness_attempted_for = previous
+            self._state = "liveness_storage_unavailable"
+            self._diagnostics = {"reason": "liveness_reservation_failed", "error": str(error)[:1000]}
+            return False
+        return True
+
+    def _reserve_review_recovery(self, intent_id) -> None:
+        previous = self._expected_review_intent_id
+        self._expected_review_intent_id = intent_id
+        try:
+            if self._persistence_callback is not None:
+                self._persistence_callback(self.durable_state)
+        except Exception:
+            self._expected_review_intent_id = previous
+            raise
+
     def bind_registration(self, registration_id) -> None:
         if self.intent_client is not None:
             self.intent_client.bind_watch(registration_id, self.target_url)
         self.registration_id = registration_id
+
+    @staticmethod
+    def _owner_binding_required(diagnostics) -> bool:
+        return any(diagnostics.get(key) == "watchdog_binding_required"
+                   for key in ("intent_reason", "recovery_reason"))
+
+    @property
+    def requires_owner_rebind(self) -> bool:
+        return self._owner_binding_required(self._diagnostics)
 
     @property
     def diagnostics(self) -> dict:
@@ -291,7 +345,9 @@ class SimpleWatcher:
             if self._need_input_latched:
                 current_user_turn_id = before.user_turn_id or ""
                 latched_user_turn_id = self._need_input_user_turn_id or ""
-                if not current_user_turn_id or current_user_turn_id == latched_user_turn_id:
+                if (not current_user_turn_id or current_user_turn_id == latched_user_turn_id
+                        or (self.observation_client is not None
+                            and not page.proves_user_turn(current_user_turn_id))):
                     self._state = "need_input"
                     return self._state
 
@@ -304,6 +360,8 @@ class SimpleWatcher:
                 self._last_active_at = None
                 self._liveness_attempted_for = None
                 self._transition_attempted_for = None
+                if self._phase == 0:
+                    self._legacy_transition_state = False
                 self._state = "human_input_observed"
                 return self._state
 
@@ -316,6 +374,17 @@ class SimpleWatcher:
                 self._need_input_latched = True
                 self._need_input_user_turn_id = before.user_turn_id or ""
                 return self._state
+
+            if self._phase == 1 and self.observation_client is not None:
+                if before.turn_key and before.turn_key == self._transition_attempted_for:
+                    self._state = "transition_pending"
+                    self._diagnostics = {"reason": "awaiting_owned_review_turn_or_explicit_reregister"}
+                    return self._state
+                if not page.review_lineage_matches(self._expected_review_intent_id, self.registration_id):
+                    self._state = "need_input"
+                    self._diagnostics = {"reason": "review_lineage_unverified",
+                                         "required_action": "explicit_unregister_then_register_to_reset_phase"}
+                    return self._state
 
             # Simple mode is deliberately conservative: never double-text an
             # active assistant, race a newer user turn, or push through a
@@ -372,7 +441,12 @@ class SimpleWatcher:
                         # Consume this exact stagnant state before attempting an
                         # effect. A lost ACK must never cause the same active
                         # turn/signature to receive a second liveness prompt.
-                        self._liveness_attempted_for = progress_key
+                        if not self._checkpoint_liveness(progress_key):
+                            return self._state
+                        previous_review_intent_id = self._expected_review_intent_id
+                        recovery_kwargs = {}
+                        if self._phase == 1 and self.observation_client is not None:
+                            recovery_kwargs["before_continue"] = self._reserve_review_recovery
                         recovery_prompt = (
                             REVIEW_RECOVERY_PROMPT if self._phase == 1 else ACTION_RECOVERY_PROMPT
                         )
@@ -381,7 +455,12 @@ class SimpleWatcher:
                             before.turn_key,
                             stop_timeout=min(10.0, self.submission_confirm_seconds),
                             acceptance_timeout=self.submission_confirm_seconds,
+                            **recovery_kwargs,
                         )
+                        if not delivery.accepted and not delivery.uncertain:
+                            self._expected_review_intent_id = previous_review_intent_id
+                            if self._owner_binding_required(getattr(page, "diagnostics", {})):
+                                self._liveness_attempted_for = None
                         self._diagnostics = {
                             "liveness_turn_key": before.turn_key,
                             "liveness_signature": before.assistant_text_signature,
@@ -435,8 +514,12 @@ class SimpleWatcher:
                         and now - self._last_active_at >= self.liveness_timeout_seconds
                         and self._liveness_attempted_for != block_key
                     ):
-                        self._liveness_attempted_for = block_key
+                        if not self._checkpoint_liveness(block_key):
+                            return self._state
                         refresh = page.refresh()
+                        if (refresh is not None and not refresh.accepted and not refresh.uncertain
+                                and self._owner_binding_required(getattr(page, "diagnostics", {}))):
+                            self._liveness_attempted_for = None
                         if refresh is None or refresh.accepted:
                             self._state = "blocked_recovery_refresh"
                         elif refresh.uncertain:
@@ -481,7 +564,8 @@ class SimpleWatcher:
             # phase=0 plus next_prompt and a still-visible REVIEW payload must
             # fail closed. Current rows use the exact durable turn comparison
             # above, so a new ACTION may finish with any body, including JSON.
-            if self._phase == 0 and self._next_prompt and not self._transition_attempted_for:
+            if (self._phase == 0 and self._next_prompt and self._legacy_transition_state
+                    and not self._transition_attempted_for):
                 try:
                     _parse_review(before.assistant_text)
                 except ValueError:
@@ -519,6 +603,17 @@ class SimpleWatcher:
             # Reserve semantic authority before the owner can execute the
             # browser effect. The durable consumed turn fence survives a crash
             # between the owner receipt and the registry's regular observation.
+            if transition_phase == 1 and self.observation_client is not None:
+                try:
+                    expected_review_intent_id = page.prepare_simple_continue(prompt, before.turn_key)
+                except Exception as error:
+                    self.restore_state(previous_state)
+                    self._state = "send_rejected"
+                    self._diagnostics = {"reason": "review_intent_preparation_failed", "error": str(error)[:1000]}
+                    return self._state
+            else:
+                expected_review_intent_id = None
+            self._expected_review_intent_id = expected_review_intent_id
             self._phase = transition_phase
             self._cycle = transition_cycle
             self._transition_attempted_for = before.turn_key or None

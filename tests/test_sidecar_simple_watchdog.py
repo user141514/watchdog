@@ -17,13 +17,15 @@ from chat_watchdog.supervisor import Supervisor, StepResult
 TARGET = "https://chatgpt.com/c/00000000-0000-0000-0000-000000000123"
 NOW = 1790899200.0
 REGISTRATION = "10000000-0000-0000-0000-000000000001"
+FIXTURE_REVIEW_INTENT = "fixture-review-intent"
 
 
 def sample(*, text="action output", user="u1", assistant="a1", version=7,
            generating=False, terminal=True, body="substantive",
-           gate=False, delivery="delivered", readable=True, observed_at=None):
+           gate=False, delivery="delivered", readable=True, observed_at=None, lineage=None):
     return {
         "found": True,
+        "lineage": lineage or {"registrationId": None, "intentId": None},
         "state": {
             "contractVersion": 1, "conversationId": "conv-123", "target": TARGET,
             "stateVersion": version,
@@ -57,7 +59,11 @@ class Owner:
         self.reads += 1
         if self.observations:
             self.last = self.observations.pop(0)
-        return copy.deepcopy(self.last)
+        result = copy.deepcopy(self.last)
+        if result.get("lineage", {}).get("intentId") == "__previous_intent__":
+            sent_turns = [intent for intent in self.intents if intent.get("action") == "continue"]
+            result["lineage"]["intentId"] = sent_turns[-1]["intentId"] if sent_turns else None
+        return result
 
     def submit(self, endpoint, payload):
         self.intents.append(copy.deepcopy(payload.get("intent", payload)))
@@ -179,18 +185,22 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         self.assertIn("REVIEW 0", intent["text"])
 
     def test_review_continue_preserves_prompt_and_review_done_is_durable_noop(self):
-        owner = Owner([sample(text='{"decision":"CONTINUE","next_prompt":"next concrete step"}')])
+        lineage = {"registrationId": REGISTRATION, "intentId": FIXTURE_REVIEW_INTENT}
+        owner = Owner([sample(text='{"decision":"CONTINUE","next_prompt":"next concrete step"}', lineage=lineage)])
         runtime = watcher(owner)
-        runtime.restore_state({"phase": 1, "cycle": 3, "next_prompt": "", "status": "RUNNING"})
+        runtime.restore_state({"phase": 1, "cycle": 3, "next_prompt": "", "status": "RUNNING",
+                               "expected_review_intent_id": FIXTURE_REVIEW_INTENT})
         self.assertEqual(runtime.step(), "transition_sent")
         self.assertEqual(runtime.durable_state, {
             "phase": 0, "cycle": 4, "next_prompt": "next concrete step", "status": "RUNNING",
             "transition_turn_id": "a1",
+            "expected_review_intent_id": None, "liveness_attempted_for": None,
         })
         self.assertEqual(owner.intents[0]["text"], "next concrete step")
-        done_owner = Owner([sample(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}')])
+        done_owner = Owner([sample(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}', lineage=lineage)])
         done = watcher(done_owner)
-        done.restore_state({"phase": 1, "cycle": 4, "next_prompt": "", "status": "RUNNING"})
+        done.restore_state({"phase": 1, "cycle": 4, "next_prompt": "", "status": "RUNNING",
+                            "expected_review_intent_id": FIXTURE_REVIEW_INTENT})
         self.assertEqual(done.step(), "done")
         self.assertEqual(done.step(), "done")
         self.assertEqual(done_owner.reads, 1)
@@ -227,12 +237,14 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
 
     def test_new_action_json_still_transitions_to_review_after_prior_review(self):
         owner = Owner([
-            sample(text='{"decision":"CONTINUE","next_prompt":"advance next step"}'),
+            sample(text='{"decision":"CONTINUE","next_prompt":"advance next step"}',
+                   lineage={"registrationId": REGISTRATION, "intentId": FIXTURE_REVIEW_INTENT}),
             sample(assistant="a2", user="u2", version=8,
                    text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}'),
         ])
         runtime = watcher(owner)
-        runtime.restore_state({"phase": 1, "cycle": 0, "next_prompt": "", "status": "RUNNING"})
+        runtime.restore_state({"phase": 1, "cycle": 0, "next_prompt": "", "status": "RUNNING",
+                               "expected_review_intent_id": FIXTURE_REVIEW_INTENT})
         self.assertEqual(runtime.step(), "transition_sent")
         self.assertEqual(runtime.step(), "transition_sent")
         self.assertEqual(runtime.durable_state["phase"], 1)
@@ -255,6 +267,77 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         runtime.step()
         self.assertEqual(len(owner.intents), 1)
 
+    def test_retained_progress_never_authorizes_write_against_current_observation(self):
+        # Cross product: only the positive active/terminal/blocked agreement
+        # can be used for effects; an old state's classification grants none.
+        raw_cases = [
+            {"generating": True, "terminal": False, "body": "incomplete", "progress": "active"},
+            {"generating": False, "terminal": True, "body": "substantive", "progress": "terminal"},
+            {"generating": False, "terminal": False, "body": "incomplete", "progress": "blocked"},
+        ]
+        for raw in raw_cases:
+            for retained in ("active", "terminal", "blocked", "idle", "unknown"):
+                if retained == raw["progress"]:
+                    continue
+                with self.subTest(raw=raw, retained=retained):
+                    value = sample(generating=raw["generating"], terminal=raw["terminal"],
+                                   body=raw["body"])
+                    value["state"]["progress"] = retained
+                    classic_owner = Owner([value])
+                    observation, intent = classic_owner.clients()
+                    page = SidecarObservationPage(TARGET, observation, intent,
+                                                  registration_id=REGISTRATION)
+                    classic = Supervisor(page, None, intent_client=page, state_client=page)
+                    self.assertEqual(classic.step(), StepResult.BLOCKED)
+                    self.assertEqual(classic_owner.intents, [])
+
+                    simple_owner = Owner([value])
+                    clock = [0.0]
+                    simple = watcher(simple_owner, clock=lambda: clock[0])
+                    checkpoints = []
+                    simple.set_persistence_callback(checkpoints.append)
+                    self.assertEqual(simple.step(), "blocked")
+                    clock[0] = 900
+                    self.assertEqual(simple.step(), "blocked")
+                    self.assertEqual(simple_owner.intents, [])
+                    self.assertEqual(checkpoints, [])
+
+    def test_pending_uncertain_or_human_gate_cannot_use_retained_blocked_authority(self):
+        for changed in (
+            {"delivery": "pending"}, {"delivery": "uncertain"},
+            {"gate": True}, {"readable": False}, {"body": "unknown"},
+            {"generating": True, "terminal": True},
+        ):
+            with self.subTest(changed=changed):
+                value = sample(**{"terminal": False, "body": "incomplete", **changed})
+                value["state"].update(progress="blocked", body="incomplete", gate="none")
+                classic_owner = Owner([value])
+                observation, intent = classic_owner.clients()
+                page = SidecarObservationPage(TARGET, observation, intent,
+                                              registration_id=REGISTRATION)
+                classic = Supervisor(page, None, intent_client=page, state_client=page)
+                self.assertEqual(classic.step(), StepResult.BLOCKED)
+                self.assertEqual(classic_owner.intents, [])
+                simple_owner = Owner([value])
+                clock = [0.0]
+                simple = watcher(simple_owner, clock=lambda: clock[0])
+                checkpoints = []
+                simple.set_persistence_callback(checkpoints.append)
+                simple.step()
+                clock[0] = 900
+                simple.step()
+                self.assertEqual(simple_owner.intents, [])
+                self.assertEqual(checkpoints, [])
+
+    def test_authoritative_human_gate_returns_pause_without_writes(self):
+        value = sample(gate=True, terminal=False, body="incomplete")
+        owner = Owner([value])
+        observation, intent = owner.clients()
+        page = SidecarObservationPage(TARGET, observation, intent, registration_id=REGISTRATION)
+        classic = Supervisor(page, None, intent_client=page, state_client=page)
+        self.assertEqual(classic.step(), StepResult.NEED_INPUT)
+        self.assertEqual(owner.intents, [])
+
     def test_restart_never_interprets_consumed_action_json_as_review_done(self):
         owner = Owner([sample(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}')],
                       receipt=TimeoutError("lost acknowledgment"))
@@ -276,7 +359,7 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         owner = Owner([
             sample(text="operator required\n[SUPERVISOR_STATE: NEED_INPUT]"),
             sample(text="operator required\n[SUPERVISOR_STATE: NEED_INPUT]"),
-            sample(user="u2", assistant=None, terminal=False, body="empty", delivery="pending"),
+            sample(user="u2", assistant=None, terminal=False, body="empty", delivery="delivered"),
             sample(user="u2", assistant="a2", text="human request handled"),
         ])
         runtime = watcher(owner)

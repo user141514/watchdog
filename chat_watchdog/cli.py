@@ -141,6 +141,11 @@ class _SupervisorWatcher:
         return self._state
 
     @property
+    def requires_owner_rebind(self) -> bool:
+        return any(self.supervisor.diagnostics.get(key) == "watchdog_binding_required"
+                   for key in ("intent_reason", "recovery_reason"))
+
+    @property
     def diagnostics(self) -> dict:
         return dict(self.supervisor.diagnostics)
 
