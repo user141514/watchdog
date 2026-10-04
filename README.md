@@ -86,6 +86,20 @@ The Windows default is `%LOCALAPPDATA%/chat-watchdog/registry-v2.sqlite3`; POSIX
 
 Registry mode does not share one reanchor scope across conversations; single-conversation mode remains available for an explicit reanchor binding. Localhost is a trusted local-operator boundary, not signed proof of human authorization. Callers must retain requester/explicit-target policy; never infer authority from browser focus, a title, a previous assistant summary, or a recovered URL.
 
+## Managed simple-mode continuation
+
+Managed `--simple` mode has three triggers sharing the same Sidecar intent owner:
+
+| Trigger | Timing | Behavior |
+| --- | --- | --- |
+| Normal ACTION / REVIEW progression | Positively complete current response | Advance the mechanical phase; only a valid owned REVIEW can declare DONE. |
+| Observed liveness recovery | Stable incomplete response for up to 30 seconds, or configured inactivity | Recover that exact stopped/inactive state once; visible progress restarts its inactivity timer. |
+| Fixed prompt fallback | Every 900 seconds on an independent durable clock | Continue the current phase; active generation is stopped through the owner and must be observed stopped before continuation. |
+
+The fixed deadline does not reset when text or turn progress changes. It is persisted before an effect, survives restarts, and skips missed intervals instead of sending a backlog. Normal progression has priority and can consume a due interval with its existing send. A latched DONE, NEED_INPUT, explicit withdrawal, unverified identity/lineage or uncertain delivery blocks automatic sends. An accepted or unknown fallback retains its consumed-turn fence until a genuinely new turn is observed. Natural completion during Stop wins over the fallback.
+
+Old durable registrations without a fixed deadline arm it on their first managed watcher step. Existing unknown sends are retained; a timer cannot manufacture missing message identities or recover an unbound watch.
+
 ## Release and deployment gates
 
 Build a wheel with `python -m build --wheel`, install it into a new stable virtual environment, and verify the installed module path/version independently of the checkout. Do not replace modules inside a live environment or point scheduled tasks at disposable worktrees. The Windows task should own the long-lived Python process directly with restart-on-failure settings, not launch a detached child and immediately report success. Record the old action, active inventory and exact package before handover; re-read `/health` and `/watches` afterward.

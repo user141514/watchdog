@@ -336,6 +336,75 @@ class SidecarObservationPage:
                 return PromptDelivery(accepted=False)
             self._sleep(min(0.25, max(0.0, deadline - time.monotonic())))
 
+    def send_fixed_prompt(self, prompt, expected_turn_key, *, stop_timeout=10.0,
+                          before_continue=None):
+        before = self._sample.snapshot() if self._current_available else None
+        if (before is None or before.turn_key != expected_turn_key
+                or not self.registration_id or before.interaction_required
+                or before.user_turn_pending):
+            return PromptDelivery(accepted=False, stale=True)
+        expected_turn = self._sample.state.to_dict()["turn"]
+        expected_lineage = self._sample.lineage
+
+        def capture():
+            self._current_available = False
+            try:
+                self._sample = self._observations.read(self.target_url)
+            except (ObservationUnavailable, ObservationProtocolError) as error:
+                self.diagnostics.update(recovery_reason="fixed_prompt_observation_unavailable",
+                                        recovery_error=str(error)[:1000])
+                return None
+            self._current_available = True
+            self._update_diagnostics()
+            current = self._sample.snapshot()
+            if (self._sample.state.to_dict()["turn"] != expected_turn
+                    or self._sample.lineage != expected_lineage):
+                self.diagnostics["recovery_reason"] = "fixed_prompt_identity_changed"
+                return None
+            if current.interaction_required or current.user_turn_pending:
+                self.diagnostics["recovery_reason"] = "fixed_prompt_observation_not_actionable"
+                return None
+            # Fixed time does not require a stagnant body. Natural finality,
+            # including a REVIEW DONE arriving during Stop, still wins.
+            if current.phase is Phase.FINISHED and (
+                    before.phase is not Phase.FINISHED
+                    or current.assistant_text_signature != before.assistant_text_signature):
+                self.diagnostics["recovery_reason"] = "fixed_prompt_natural_finality"
+                return None
+            return current
+
+        current = capture()
+        if current is None:
+            return PromptDelivery(accepted=False, stale=True)
+        if current.phase in (Phase.THINKING, Phase.RESPONDING):
+            stopped = self._submit(action="stop")
+            if not stopped.accepted:
+                return stopped
+            deadline = time.monotonic() + stop_timeout
+            while True:
+                current = capture()
+                if current is None:
+                    return PromptDelivery(accepted=False, stale=True)
+                if current.phase not in (Phase.THINKING, Phase.RESPONDING):
+                    break
+                if time.monotonic() >= deadline:
+                    self.diagnostics["recovery_reason"] = "fixed_prompt_stop_not_observed"
+                    return PromptDelivery(accepted=False)
+                self._sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+        if current.phase not in (Phase.BLOCKED, Phase.FINISHED):
+            return PromptDelivery(accepted=False, stale=True)
+        try:
+            intent_id = self._intents.prepare_v1(
+                self._sample.state, prompt, registration_id=self.registration_id,
+            )["intentId"]
+            if before_continue is not None:
+                before_continue(intent_id)
+        except Exception as error:
+            self.diagnostics.update(recovery_reason="fixed_prompt_reservation_failed",
+                                    recovery_error=str(error)[:1000])
+            return PromptDelivery(accepted=False)
+        return self._submit(prompt)
+
     def recover_incomplete(self, prompt, expected_turn_key, *, acceptance_timeout=90.0,
                            before_continue=None):
         before = self._sample.snapshot() if self._current_available else None
