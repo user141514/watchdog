@@ -98,6 +98,7 @@ class ObservationSample:
             user_turn_id=obs["userMessageId"] or "", user_turn_pending=pending,
             interaction_required=bool(reason), stop_visible=obs["generating"] is True,
             fault_text=reason,
+            stream_interrupted=(phase is Phase.BLOCKED and not reason and obs["body"] == "incomplete"),
         )
 
 
@@ -334,6 +335,41 @@ class SidecarObservationPage:
                 self.diagnostics["recovery_reason"] = "stop_not_observed"
                 return PromptDelivery(accepted=False)
             self._sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+
+    def recover_incomplete(self, prompt, expected_turn_key, *, acceptance_timeout=90.0,
+                           before_continue=None):
+        before = self._sample.snapshot() if self._current_available else None
+        if (before is None or before.turn_key != expected_turn_key
+                or not before.stream_interrupted):
+            return PromptDelivery(accepted=False, stale=True)
+        previous_turn = self._sample.state.to_dict()["turn"]
+        self._current_available = False
+        try:
+            self._sample = self._observations.read(self.target_url)
+        except (ObservationUnavailable, ObservationProtocolError) as error:
+            self.diagnostics.update(recovery_reason="incomplete_observation_unavailable",
+                                    recovery_error=str(error)[:1000])
+            return PromptDelivery(accepted=False)
+        self._current_available = True
+        self._update_diagnostics()
+        current = self._sample.snapshot()
+        if (not current.stream_interrupted
+                or self._sample.state.to_dict()["turn"] != previous_turn
+                or current.assistant_text_signature != before.assistant_text_signature):
+            self.diagnostics["recovery_reason"] = "conversation_progressed"
+            return PromptDelivery(accepted=False, stale=True)
+        try:
+            intent_id = self._intents.prepare_v1(
+                self._sample.state, prompt, registration_id=self.registration_id,
+            )["intentId"]
+            if before_continue is not None:
+                before_continue(intent_id)
+        except Exception as error:
+            self.diagnostics.update(recovery_reason="recovery_reservation_failed",
+                                    recovery_error=str(error)[:1000])
+            return PromptDelivery(accepted=False)
+        # The owner re-observes and checks version/epoch/turn at dispatch.
+        return self._submit(prompt)
 
     def refresh(self):
         if not self.registration_id:

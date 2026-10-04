@@ -122,6 +122,82 @@ class SimpleReviewLineageTests(unittest.TestCase):
         self.assertEqual(restarted.step(), "done")
         self.assertEqual(len(owner.intents), 3)
 
+    def test_incomplete_review_reserves_recovery_lineage_without_stopping_or_phase_change(self):
+        incomplete = own_review(user="review-u2", assistant="review-a2", version=8,
+                                terminal=False, body="incomplete")
+        checkpoints = []
+        class CheckedOwner(Owner):
+            def submit(self, endpoint, payload):
+                self_case.assertEqual(checkpoints[-1]["expected_review_intent_id"],
+                                      payload["intent"]["intentId"])
+                return super().submit(endpoint, payload)
+        self_case = self
+        owner = CheckedOwner([sample(), incomplete, incomplete, incomplete,
+                              own_review(user="recovery-u3", assistant="recovery-a3", version=9, text=DONE)])
+        clock = [0.0]
+        runtime = watcher(owner, clock=lambda: clock[0])
+        runtime.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
+        self.assertEqual(runtime.step(), "transition_sent")
+        original_review_id = runtime.durable_state["expected_review_intent_id"]
+        self.assertEqual(runtime.step(), "blocked")
+        clock[0] = 30
+        self.assertEqual(runtime.step(), "liveness_recovery_sent")
+        self.assertEqual([x["action"] for x in owner.intents], ["continue", "continue"])
+        self.assertNotEqual(runtime.durable_state["expected_review_intent_id"], original_review_id)
+        self.assertEqual(runtime.durable_state["phase"], 1)
+        self.assertEqual(runtime.durable_state["cycle"], 0)
+        self.assertIn("REVIEW", owner.intents[-1]["text"])
+        self.assertEqual(runtime.step(), "done")
+
+    def test_incomplete_review_lost_ack_preserves_new_link_across_restart(self):
+        class LostReceiptOwner(Owner):
+            def submit(self, endpoint, payload):
+                result = super().submit(endpoint, payload)
+                if len(self.intents) == 2:
+                    raise TimeoutError("recovery receipt lost")
+                return result
+        incomplete = own_review(user="review-u2", assistant="review-a2", version=8,
+                                terminal=False, body="incomplete")
+        owner = LostReceiptOwner([sample(), incomplete, incomplete, incomplete,
+                                  own_review(user="recovery-u3", assistant="recovery-a3", version=9, text=DONE)])
+        clock = [0.0]
+        runtime = watcher(owner, clock=lambda: clock[0])
+        checkpoints = []
+        runtime.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
+        self.assertEqual(runtime.step(), "transition_sent")
+        self.assertEqual(runtime.step(), "blocked")
+        clock[0] = 30
+        self.assertEqual(runtime.step(), "liveness_recovery_unknown")
+        self.assertEqual(checkpoints[-1]["expected_review_intent_id"], owner.intents[-1]["intentId"])
+        restarted = watcher(owner, clock=lambda: clock[0])
+        restarted.restore_state(checkpoints[-1])
+        self.assertEqual(restarted.step(), "done")
+        self.assertEqual(len(owner.intents), 2)
+
+    def test_incomplete_review_reservation_failure_never_dispatches_or_changes_old_link(self):
+        incomplete = own_review(user="review-u2", assistant="review-a2", version=8,
+                                terminal=False, body="incomplete")
+        owner = Owner([sample(), incomplete])
+        clock = [0.0]
+        runtime = watcher(owner, clock=lambda: clock[0])
+        checkpoints = []
+        runtime.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
+        self.assertEqual(runtime.step(), "transition_sent")
+        original_review_id = runtime.durable_state["expected_review_intent_id"]
+        def checkpoint(state):
+            if state["expected_review_intent_id"] != original_review_id:
+                raise OSError("review lineage checkpoint failed")
+            checkpoints.append(copy.deepcopy(state))
+        runtime.set_persistence_callback(checkpoint)
+        self.assertEqual(runtime.step(), "blocked")
+        clock[0] = 30
+        self.assertEqual(runtime.step(), "liveness_recovery_rejected")
+        self.assertEqual(runtime.durable_state["expected_review_intent_id"], original_review_id)
+        clock[0] = 1000
+        self.assertEqual(runtime.step(), "blocked")
+        self.assertEqual(len(owner.intents), 1)
+        self.assertEqual(checkpoints[-1]["expected_review_intent_id"], original_review_id)
+
     def test_storage_failure_before_liveness_dispatch_never_stops_or_refreshes(self):
         for fields in (
             {"generating": True, "terminal": False, "body": "incomplete"},

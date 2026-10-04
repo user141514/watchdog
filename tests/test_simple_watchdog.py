@@ -138,6 +138,22 @@ def test_need_input_pauses_until_new_human_turn_then_release_tick_only_observes(
     assert len(page.sent) == 1
 
 
+def test_legacy_stream_interrupted_does_not_use_managed_incomplete_recovery():
+    clock = FakeClock()
+    blocked = PageSnapshot(phase=Phase.BLOCKED, assistant_turn_id="legacy-a",
+                           assistant_text_signature="legacy-signature", assistant_text="partial",
+                           assistant_count=1, user_count=1, user_turn_id="legacy-u",
+                           stream_interrupted=True)
+    page = FakePage([blocked])
+    watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page), clock=clock)
+    assert watcher.step() == "blocked"
+    clock.now = 30
+    assert watcher.step() == "blocked"
+    clock.now = 900
+    assert watcher.step() == "blocked"
+    assert page.sent == []
+
+
 def test_target_change_never_sends():
     page = FakePage([snap()], url="https://chatgpt.com/c/00000000-0000-0000-0000-000000000999")
     watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page))

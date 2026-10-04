@@ -251,9 +251,101 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         self.assertEqual(len(owner.intents), 2)
         self.assertIn("REVIEW 1", owner.intents[1]["text"])
 
+    def test_incomplete_waits_for_stability_then_continues_once_using_fresh_cas(self):
+        for configured_timeout, recovery_at in ((900, 30), (10, 10)):
+            with self.subTest(timeout=configured_timeout):
+                incomplete = sample(terminal=False, body="incomplete")
+                fresh = sample(terminal=False, body="incomplete", version=9)
+                fresh["state"]["writer"]["epoch"] = 6
+                owner = Owner([incomplete, incomplete, incomplete, fresh])
+                clock = [0.0]
+                runtime = watcher(owner, clock=lambda: clock[0],
+                                  liveness_timeout_seconds=configured_timeout)
+                checkpoints = []
+                runtime.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
+                self.assertEqual(runtime.step(), "blocked")
+                clock[0] = recovery_at - 1
+                self.assertEqual(runtime.step(), "blocked")
+                self.assertEqual(owner.intents, [])
+                clock[0] = recovery_at
+                self.assertEqual(runtime.step(), "liveness_recovery_sent")
+                self.assertEqual(len(owner.intents), 1)
+                sent = owner.intents[0]
+                self.assertEqual(sent["action"], "continue")
+                self.assertEqual(sent["expectedStateVersion"], 9)
+                self.assertEqual(sent["expectedWriterEpoch"], 6)
+                self.assertEqual(sent["expected"], {"userMessageId": "u1", "assistantMessageId": "a1"})
+                self.assertIn("ACTION phase=0", sent["text"])
+                self.assertEqual(checkpoints[-1]["phase"], 0)
+                self.assertEqual(checkpoints[-1]["cycle"], 0)
+                clock[0] += 900
+                self.assertEqual(runtime.step(), "blocked")
+                self.assertEqual(len(owner.intents), 1)
+
+    def test_incomplete_stability_starts_when_active_or_empty_blocked_becomes_incomplete(self):
+        for previous_kind, text in (("active", "partial work"), ("empty", "")):
+            with self.subTest(previous=previous_kind):
+                previous = sample(text=text, terminal=False,
+                                  generating=previous_kind == "active",
+                                  body="incomplete" if previous_kind == "active" else "empty")
+                incomplete = sample(text=text, terminal=False, body="incomplete")
+                owner = Owner([previous, incomplete])
+                clock = [0.0]
+                runtime = watcher(owner, clock=lambda: clock[0])
+                self.assertEqual(runtime.step(), "active" if previous_kind == "active" else "blocked")
+                clock[0] = 60
+                self.assertEqual(runtime.step(), "blocked")
+                self.assertEqual(owner.intents, [])
+                clock[0] = 89
+                self.assertEqual(runtime.step(), "blocked")
+                self.assertEqual(owner.intents, [])
+                clock[0] = 90
+                self.assertEqual(runtime.step(), "liveness_recovery_sent")
+                self.assertEqual(len(owner.intents), 1)
+                self.assertEqual(owner.intents[0]["action"], "continue")
+
+    def test_incomplete_lost_receipt_restart_does_not_repeat_the_same_recovery(self):
+        owner = Owner([sample(terminal=False, body="incomplete")],
+                      receipt=TimeoutError("continue acknowledgment lost"))
+        clock = [0.0]
+        first = watcher(owner, clock=lambda: clock[0])
+        checkpoints = []
+        first.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
+        self.assertEqual(first.step(), "blocked")
+        clock[0] = 30
+        self.assertEqual(first.step(), "liveness_recovery_unknown")
+        restarted = watcher(owner, clock=lambda: clock[0])
+        restarted.restore_state(checkpoints[-1])
+        self.assertEqual(restarted.step(), "blocked")
+        clock[0] = 1000
+        self.assertEqual(restarted.step(), "blocked")
+        self.assertEqual(len(owner.intents), 1)
+
+    def test_incomplete_recovery_rejects_changed_fresh_observation_without_dispatch(self):
+        changes = (
+            {"text": "new assistant progress"},
+            {"user": "new-human"},
+            {"generating": True},
+            {"terminal": True, "body": "substantive"},
+            {"gate": True},
+            {"delivery": "uncertain"},
+            {"body": "unknown"},
+            {"readable": False},
+        )
+        for fields in changes:
+            with self.subTest(fields=fields):
+                before = sample(terminal=False, body="incomplete")
+                changed = sample(**{"terminal": False, "body": "incomplete", **fields})
+                owner = Owner([before, changed])
+                observation, intent = owner.clients()
+                page = SidecarObservationPage(TARGET, observation, intent, registration_id=REGISTRATION)
+                result = page.recover_incomplete("continue exact action", page.snapshot().turn_key)
+                self.assertFalse(result.accepted)
+                self.assertEqual(owner.intents, [])
+
     def test_blocked_liveness_refresh_uses_owner_scope_after_900s_only_once(self):
         clock = [0.0]
-        owner = Owner([sample(terminal=False, body="incomplete")])
+        owner = Owner([sample(terminal=False, body="empty")])
         runtime = watcher(owner, clock=lambda: clock[0])
         self.assertEqual(runtime.step(), "blocked")
         clock[0] = 899

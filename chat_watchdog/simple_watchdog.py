@@ -152,6 +152,7 @@ class SimpleWatcher:
         self._need_input_latched = False
         self._need_input_user_turn_id: str | None = None
         self._last_active_key: tuple[str, str] | None = None
+        self._last_active_kind: str | None = None
         self._last_active_at: float | None = None
         self._liveness_attempted_for: tuple[str, str] | None = None
         self._transition_attempted_for: str | None = None
@@ -417,11 +418,13 @@ class SimpleWatcher:
                         self._state = "active"
                         return self._state
 
-                    if progress_key != self._last_active_key or self._last_active_at is None:
+                    if (progress_key != self._last_active_key or self._last_active_kind != "active"
+                            or self._last_active_at is None):
                         # Any newly visible assistant content restarts the
                         # 15-minute inactivity window. Observation cadence is
                         # intentionally independent from this timer.
                         self._last_active_key = progress_key
+                        self._last_active_kind = "active"
                         self._last_active_at = now
                         if self._liveness_attempted_for != progress_key:
                             self._liveness_attempted_for = None
@@ -489,22 +492,60 @@ class SimpleWatcher:
                     return self._state
 
                 if before.phase is Phase.BLOCKED:
-                    # BLOCKED without an explicit human/transport gate is an
-                    # observation failure, not permission for immediate repair.
-                    # It shares the 900s fallback clock with active stalls.
+                    # Only the managed positive incomplete projection grants a
+                    # short recovery window. Other blocked states keep the fallback.
+                    incomplete = self.observation_client is not None and before.stream_interrupted
+                    recovery_timeout = (min(self.liveness_timeout_seconds, 30.0)
+                                        if incomplete else self.liveness_timeout_seconds)
                     block_key = (before.turn_key or "", before.assistant_text_signature or "")
+                    block_kind = "incomplete" if incomplete else "blocked"
                     now = self.clock()
-                    if block_key != self._last_active_key or self._last_active_at is None:
+                    if (block_key != self._last_active_key or self._last_active_kind != block_kind
+                            or self._last_active_at is None):
                         self._last_active_key = block_key
+                        self._last_active_kind = block_kind
                         self._last_active_at = now
                         if self._liveness_attempted_for != block_key:
                             self._liveness_attempted_for = None
                         self._state = "blocked"
                         self._diagnostics = {
                             "inactivity_seconds": 0.0,
-                            "inactivity_timeout_seconds": self.liveness_timeout_seconds,
+                            "inactivity_timeout_seconds": recovery_timeout,
                             "assistant_turn_key": before.turn_key,
                         }
+                        return self._state
+                    if (incomplete and self._last_active_at is not None
+                            and now - self._last_active_at >= recovery_timeout
+                            and self._liveness_attempted_for != block_key):
+                        if not self._checkpoint_liveness(block_key):
+                            return self._state
+                        previous_review_intent_id = self._expected_review_intent_id
+                        recovery_kwargs = {}
+                        if self._phase == 1:
+                            recovery_kwargs["before_continue"] = self._reserve_review_recovery
+                        delivery = page.recover_incomplete(
+                            REVIEW_RECOVERY_PROMPT if self._phase == 1 else ACTION_RECOVERY_PROMPT,
+                            before.turn_key, acceptance_timeout=self.submission_confirm_seconds,
+                            **recovery_kwargs,
+                        )
+                        if not delivery.accepted and not delivery.uncertain:
+                            self._expected_review_intent_id = previous_review_intent_id
+                            if self._owner_binding_required(getattr(page, "diagnostics", {})):
+                                self._liveness_attempted_for = None
+                        self._diagnostics = {
+                            "liveness_turn_key": before.turn_key,
+                            "liveness_signature": before.assistant_text_signature,
+                            "frontend_user_message_id": delivery.message_id,
+                            "inactivity_timeout_seconds": recovery_timeout,
+                        }
+                        if delivery.accepted:
+                            self._state = "liveness_recovery_sent"
+                        elif delivery.uncertain:
+                            self._state = "liveness_recovery_unknown"
+                        elif delivery.stale:
+                            self._state = "liveness_recovery_stale"
+                        else:
+                            self._state = "liveness_recovery_rejected"
                         return self._state
                     if (
                         not before.interaction_required
@@ -541,7 +582,7 @@ class SimpleWatcher:
                             if self._last_active_at is None
                             else max(0.0, now - self._last_active_at)
                         ),
-                        "inactivity_timeout_seconds": self.liveness_timeout_seconds,
+                        "inactivity_timeout_seconds": recovery_timeout,
                         "assistant_turn_key": before.turn_key,
                     }
                     return self._state
