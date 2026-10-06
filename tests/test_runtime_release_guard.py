@@ -169,6 +169,7 @@ def test_activation_launches_background_runtime_without_allocating_console(helpe
     args, kwargs = launches[0]
     assert Path(args[0][0]).name == "pythonw.exe"
     assert args[0][1:3] == ["-m", "chat_watchdog"]
+    assert "--fixed-action-scheduler" in args[0]
     assert kwargs["cwd"] == target
     assert kwargs["creationflags"] & 0x08000000
     assert not kwargs["creationflags"] & 8
@@ -177,6 +178,7 @@ def test_activation_launches_background_runtime_without_allocating_console(helpe
     launcher = (runtime / "start-current-watchdog.cmd").read_text()
     assert 'start "" /b ' in launcher
     assert "pythonw.exe" in launcher
+    assert "--fixed-action-scheduler" in launcher
 
 
 @pytest.mark.parametrize("mismatch", ["module_path", "store_path"])

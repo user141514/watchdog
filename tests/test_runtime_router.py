@@ -4,6 +4,7 @@ import subprocess
 import sys
 import unittest
 
+from chat_watchdog.cli import build_parser
 from chat_watchdog.simple_watchdog import SimpleWatcher
 
 
@@ -27,6 +28,15 @@ class RuntimeRouterTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr or result.stdout)
         self.assertIn("--simple", result.stdout)
+
+    def test_fixed_action_scheduler_requires_explicit_runtime_flag(self):
+        parser = build_parser()
+        default = parser.parse_args(["--simple", "--registry-port", "9235"])
+        enabled = parser.parse_args([
+            "--simple", "--registry-port", "9235", "--fixed-action-scheduler"
+        ])
+        self.assertFalse(default.fixed_action_scheduler)
+        self.assertTrue(enabled.fixed_action_scheduler)
 
     def test_normal_simple_watcher_does_not_own_mechanical_timer(self):
         self.assertFalse(hasattr(SimpleWatcher, "_fixed_prompt_due"))

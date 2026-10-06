@@ -246,7 +246,7 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
     )
     fixed_action_scheduler = (
         _build_fixed_action_scheduler()
-        if args.simple and os.name == "nt"
+        if args.simple and args.fixed_action_scheduler and os.name == "nt"
         else None
     )
     wake_event = Event()
@@ -395,6 +395,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="simple watchdog no-progress timeout before owner recovery; default: 900 seconds",
     )
     parser.add_argument(
+        "--fixed-action-scheduler",
+        action="store_true",
+        help=(
+            "project durable simple-registry membership into independent Windows "
+            "fixed-action Scheduled Tasks; canonical production runtime only"
+        ),
+    )
+    parser.add_argument(
         "--registry-store",
         default=os.environ.get("CHAT_WATCHDOG_REGISTRY_STORE") or default_registry_store(),
         help="durable desired registrations and receipts; exactly one process owns this SQLite file",
@@ -515,6 +523,10 @@ def main(argv: list[str] | None = None) -> int:
         raise SystemExit("--simple-interval-seconds must be > 0")
     if args.simple_inactivity_seconds <= 0:
         raise SystemExit("--simple-inactivity-seconds must be > 0")
+    if args.fixed_action_scheduler and not args.simple:
+        raise SystemExit("--fixed-action-scheduler requires --simple")
+    if args.fixed_action_scheduler and os.name != "nt":
+        raise SystemExit("--fixed-action-scheduler is Windows-only")
     if args.simple:
         if args.registry_port is None:
             raise SystemExit("--simple requires --registry-port")

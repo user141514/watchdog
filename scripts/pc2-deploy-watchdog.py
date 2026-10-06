@@ -55,11 +55,12 @@ def activate(root):
     launcher.write_text(
         '@echo off\ncd /d "'+str(target)+'"\nstart "" /b "'+str(python)+
         '" -m chat_watchdog --simple --registry-port 9235 --registry-store "'+
-        str(store)+'" --simple-interval-seconds 15 >> "'+str(runtime/"quiet-watchdog.stdout.log")+
+        str(store)+'" --simple-interval-seconds 15 --fixed-action-scheduler >> "'+str(runtime/"quiet-watchdog.stdout.log")+
         '" 2>> "'+str(runtime/"quiet-watchdog.stderr.log")+'"\n',encoding="utf-8")
     with (runtime/"quiet-watchdog.stdout.log").open("ab") as stdout, (runtime/"quiet-watchdog.stderr.log").open("ab") as stderr:
         subprocess.Popen([str(python),"-m","chat_watchdog","--simple","--registry-port","9235",
-            "--registry-store",str(store),"--simple-interval-seconds","15"],cwd=target,
+            "--registry-store",str(store),"--simple-interval-seconds","15",
+            "--fixed-action-scheduler"],cwd=target,
             stdin=subprocess.DEVNULL,stdout=stdout,stderr=stderr,
             creationflags=subprocess.CREATE_NO_WINDOW|subprocess.CREATE_NEW_PROCESS_GROUP)
     deadline=time.monotonic()+20
