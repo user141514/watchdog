@@ -87,7 +87,34 @@ class FixedActionSchedulerTests(unittest.TestCase):
             creates = [call for call, _ in runner.calls if "/Create" in call]
             self.assertEqual(len(creates), 1)
 
-    def test_existing_prompt_and_interval_are_preserved(self):
+    def test_existing_builtin_prompt_is_upgraded_but_interval_is_preserved(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            config_dir = root / "fixed-action-timer"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / f"{CID}.json"
+            config_path.write_text(
+                json.dumps({
+                    "target_url": TARGET,
+                    "relay_url": "http://127.0.0.1:9224",
+                    "acceptance_timeout_seconds": 12,
+                    "interval_minutes": 7,
+                    "prompt": "这是 15 分钟独立固定兜底。旧版本",
+                }, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            runner = Runner()
+            scheduler = self.scheduler(root, runner)
+
+            scheduler.ensure(TARGET)
+
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+            self.assertEqual(config["prompt"], FIXED_ACTION_PROMPT)
+            self.assertEqual(config["interval_minutes"], 7)
+            create = next(call for call, _ in runner.calls if "/Create" in call)
+            self.assertEqual(create[create.index("/MO") + 1], "7")
+
+    def test_existing_custom_prompt_and_interval_are_preserved(self):
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
             config_dir = root / "fixed-action-timer"

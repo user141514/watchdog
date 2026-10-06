@@ -56,12 +56,17 @@ class WindowsFixedActionScheduler:
         path = self.config_path(target_url)
         if path.exists():
             current = load_config(path)
+            prompt = (
+                FIXED_ACTION_PROMPT
+                if current.prompt.startswith("这是 15 分钟独立固定兜底。")
+                else current.prompt
+            )
             return TimerConfig(
                 target_url=target_url,
                 relay_url=current.relay_url,
                 acceptance_timeout_seconds=current.acceptance_timeout_seconds,
                 interval_minutes=current.interval_minutes,
-                prompt=current.prompt,
+                prompt=prompt,
             )
         return TimerConfig(target_url=target_url, prompt=FIXED_ACTION_PROMPT)
 
