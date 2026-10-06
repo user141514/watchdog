@@ -24,6 +24,7 @@ from .simple_watchdog import (
     SIMPLE_INACTIVITY_TIMEOUT_SECONDS,
     SimpleWatcher,
 )
+from .fixed_action_scheduler import WindowsFixedActionScheduler
 
 
 def parse_agent_command(value: str) -> AgentSpec:
@@ -243,6 +244,11 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
         withdrawal_callback=owner_client.withdraw_watch if owner_client is not None else None,
         progress_store=progress_store,
     )
+    fixed_action_scheduler = (
+        _build_fixed_action_scheduler()
+        if args.simple and os.name == "nt"
+        else None
+    )
     wake_event = Event()
     try:
         server = create_control_server(
@@ -262,8 +268,13 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
     )
     try:
         while control.is_alive():
-            _registry_poll_cycle(registry, wake_event, poll_seconds,
-                                 is_control_alive=control.is_alive)
+            _registry_poll_cycle(
+                registry,
+                wake_event,
+                poll_seconds,
+                is_control_alive=control.is_alive,
+                fixed_action_scheduler=fixed_action_scheduler,
+            )
         raise RuntimeError("watchdog control server unexpectedly stopped")
     except KeyboardInterrupt:
         logging.info("stopped by user")
@@ -284,7 +295,7 @@ def _serve_registry_control(server, wake_event) -> None:
 
 
 def _registry_poll_cycle(registry, wake_event, poll_seconds: float, *,
-                         is_control_alive=None) -> None:
+                         is_control_alive=None, fixed_action_scheduler=None) -> None:
     # Clear before observing membership. A registration during the poll/check
     # leaves its wake set, so the subsequent wait cannot lose that change.
     wake_event.clear()
@@ -295,6 +306,13 @@ def _registry_poll_cycle(registry, wake_event, poll_seconds: float, *,
         registry.step_all()
     except Exception:
         logging.exception("watch registry polling failed; retaining desired watches")
+    if fixed_action_scheduler is not None:
+        try:
+            fixed_action_scheduler.reconcile(registry.list())
+        except Exception:
+            logging.exception(
+                "fixed ACTION task projection failed; retaining desired watches for retry"
+            )
     if not registry.has_scheduler_work():
         wake_event.wait()
         return
@@ -306,6 +324,20 @@ def _default_state_root() -> Path:
     if os.name == "nt":
         return Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
     return Path(os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state")))
+
+
+def _build_fixed_action_scheduler() -> WindowsFixedActionScheduler:
+    runtime_root = _default_state_root() / "chat-watchdog"
+    release_dir = Path(__file__).resolve().parents[1]
+    python = Path(sys.executable)
+    console_python = python.with_name("python.exe")
+    if console_python.exists():
+        python = console_python
+    return WindowsFixedActionScheduler(
+        runtime_root=runtime_root,
+        release_dir=release_dir,
+        python_executable=python,
+    )
 
 
 def default_registry_store() -> str:

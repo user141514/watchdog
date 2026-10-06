@@ -4,9 +4,14 @@ import argparse
 from dataclasses import dataclass
 import json
 import math
+import os
 from pathlib import Path
+import shutil
+import subprocess
+import time
 from typing import Callable
 from urllib.parse import urlsplit
+from urllib.request import urlopen
 
 from .model import Phase, PromptDelivery, is_done, is_need_input
 from .registry import conversation_id_from_url
@@ -30,6 +35,7 @@ class TimerConfig:
     target_url: str
     relay_url: str = "http://127.0.0.1:9224"
     acceptance_timeout_seconds: float = 10.0
+    interval_minutes: int = 15
     prompt: str = FIXED_ACTION_PROMPT
 
     def __post_init__(self) -> None:
@@ -51,18 +57,25 @@ class TimerConfig:
             or float(self.acceptance_timeout_seconds) <= 0
         ):
             raise ValueError("acceptance_timeout_seconds must be finite and positive")
+        if (
+            isinstance(self.interval_minutes, bool)
+            or not isinstance(self.interval_minutes, int)
+            or not 1 <= self.interval_minutes <= 1440
+        ):
+            raise ValueError("interval_minutes must be an integer between 1 and 1440")
         if not isinstance(self.prompt, str) or not self.prompt.strip():
             raise ValueError("prompt must be non-empty")
 
 
 def load_config(path: str | Path) -> TimerConfig:
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    value = json.loads(Path(path).read_text(encoding="utf-8-sig"))
     if not isinstance(value, dict):
         raise ValueError("timer config must be an object")
     allowed = {
         "target_url",
         "relay_url",
         "acceptance_timeout_seconds",
+        "interval_minutes",
         "prompt",
     }
     extra = set(value) - allowed
@@ -74,8 +87,105 @@ def load_config(path: str | Path) -> TimerConfig:
         target_url=value["target_url"],
         relay_url=value.get("relay_url", "http://127.0.0.1:9224"),
         acceptance_timeout_seconds=value.get("acceptance_timeout_seconds", 10.0),
+        interval_minutes=value.get("interval_minutes", 15),
         prompt=value.get("prompt", FIXED_ACTION_PROMPT),
     )
+
+
+def _fetch_json(url: str) -> object:
+    with urlopen(url, timeout=2.0) as response:
+        return json.load(response)
+
+
+def _target_present(payload: object, target_url: str) -> bool:
+    if not isinstance(payload, list):
+        return False
+    expected = conversation_id_from_url(target_url)
+    for item in payload:
+        if not isinstance(item, dict) or not isinstance(item.get("url"), str):
+            continue
+        try:
+            if conversation_id_from_url(item["url"]) == expected:
+                return True
+        except ValueError:
+            continue
+    return False
+
+
+def _start_relay(config: TimerConfig) -> None:
+    parsed = urlsplit(config.relay_url)
+    port = parsed.port or 80
+    if os.name == "nt":
+        omp = Path.home() / ".local" / "bin" / "omp.cmd"
+        if not omp.is_file():
+            found = shutil.which("omp.cmd") or shutil.which("omp")
+            if not found:
+                raise RuntimeError("omp browser-relay command unavailable")
+            omp = Path(found)
+        command = subprocess.list2cmdline(
+            [str(omp), "browser-relay", "-p", str(port)]
+        )
+        argv = [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/c", command]
+        creationflags = (
+            getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        )
+        runtime_root = Path(
+            os.environ.get(
+                "LOCALAPPDATA",
+                str(Path.home() / "AppData" / "Local"),
+            )
+        ) / "chat-watchdog"
+    else:
+        found = shutil.which("omp")
+        if not found:
+            raise RuntimeError("omp browser-relay command unavailable")
+        argv = [found, "browser-relay", "-p", str(port)]
+        creationflags = 0
+        runtime_root = Path(
+            os.environ.get("XDG_STATE_HOME", str(Path.home() / ".local" / "state"))
+        ) / "chat-watchdog"
+
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    stdout_path = runtime_root / f"omp-relay-{port}.stdout.log"
+    stderr_path = runtime_root / f"omp-relay-{port}.stderr.log"
+    with stdout_path.open("ab") as stdout, stderr_path.open("ab") as stderr:
+        subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=stdout,
+            stderr=stderr,
+            creationflags=creationflags,
+        )
+
+
+def _ensure_relay_target(
+    config: TimerConfig,
+    *,
+    timeout_seconds: float = 10.0,
+    fetch_json: Callable[[str], object] = _fetch_json,
+    start_relay: Callable[[TimerConfig], None] = _start_relay,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+) -> None:
+    target_list_url = config.relay_url.rstrip("/") + "/json/list"
+    deadline = clock() + timeout_seconds
+    relay_start_attempted = False
+    while True:
+        try:
+            payload = fetch_json(target_list_url)
+        except OSError:
+            if not relay_start_attempted:
+                start_relay(config)
+                relay_start_attempted = True
+        else:
+            if _target_present(payload, config.target_url):
+                return
+
+        now = clock()
+        if now >= deadline:
+            raise RuntimeError("relay_target_unavailable")
+        sleep(min(1.0, max(0.0, deadline - now)))
 
 
 def _result_from_delivery(delivery: PromptDelivery) -> dict[str, object]:
@@ -145,7 +255,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--config", required=True)
     args = parser.parse_args(argv)
     try:
-        result = run_once(load_config(args.config))
+        config = load_config(args.config)
+        _ensure_relay_target(config)
+        result = run_once(config)
     except Exception as error:
         result = {
             "status": "error",

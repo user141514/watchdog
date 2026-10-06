@@ -8,6 +8,7 @@ from chat_watchdog.fixed_action_timer import (
     TimerConfig,
     load_config,
     run_once,
+    _ensure_relay_target,
 )
 from chat_watchdog.model import PageSnapshot, Phase, PromptDelivery
 
@@ -109,6 +110,55 @@ class FixedActionTimerTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 load_config(path)
+
+    def test_relay_bootstrap_is_noop_when_exact_target_is_present(self):
+        starts = []
+        sleeps = []
+        config = TimerConfig(target_url=TARGET)
+        _ensure_relay_target(
+            config,
+            fetch_json=lambda _url: [{"url": TARGET}],
+            start_relay=lambda _config: starts.append(True),
+            sleep=lambda value: sleeps.append(value),
+            clock=iter([0.0]).__next__,
+        )
+        self.assertEqual(starts, [])
+        self.assertEqual(sleeps, [])
+
+    def test_relay_bootstrap_starts_once_then_waits_for_exact_target(self):
+        attempts = iter([
+            OSError("relay down"),
+            [{"url": TARGET}],
+        ])
+        starts = []
+        clock_values = iter([0.0, 0.1, 0.2, 0.3])
+        config = TimerConfig(target_url=TARGET)
+        def fetch(_url):
+            value = next(attempts)
+            if isinstance(value, Exception):
+                raise value
+            return value
+
+        _ensure_relay_target(
+            config,
+            fetch_json=fetch,
+            start_relay=lambda _config: starts.append(True),
+            sleep=lambda _value: None,
+            clock=clock_values.__next__,
+        )
+        self.assertEqual(starts, [True])
+
+    def test_load_config_accepts_legacy_utf8_bom(self):
+        with tempfile.TemporaryDirectory() as td:
+            path = Path(td) / "timer.json"
+            payload = json.dumps({
+                "target_url": TARGET,
+                "relay_url": "http://127.0.0.1:9224",
+                "acceptance_timeout_seconds": 10,
+            }).encode("utf-8")
+            path.write_bytes(b"\xef\xbb\xbf" + payload)
+            config = load_config(path)
+            self.assertEqual(config.target_url, TARGET)
 
     def test_finished_turn_directly_sends_on_bound_conversation(self):
         page = FakePage(snapshot(), PromptDelivery(accepted=True, message_id="m1"))
