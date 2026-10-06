@@ -171,6 +171,28 @@ class FixedActionSchedulerTests(unittest.TestCase):
             self.assertFalse(legacy.exists())
             self.assertTrue((root / "fixed-action-current.pyw").is_file())
 
+    def test_failed_task_replacement_keeps_legacy_launcher_for_coverage(self):
+        class FailingCreateRunner(Runner):
+            def __call__(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                if "/Create" in argv:
+                    return SimpleNamespace(returncode=1, stdout="", stderr="create failed")
+                if "/Query" in argv:
+                    return SimpleNamespace(returncode=0, stdout=self.query_stdout, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            legacy = root / "fixed-action-current.cmd"
+            legacy.write_text("@echo off\n", encoding="utf-8")
+            scheduler = self.scheduler(root, FailingCreateRunner())
+
+            with self.assertRaisesRegex(RuntimeError, "create failed"):
+                scheduler.ensure(TARGET)
+
+            self.assertTrue(legacy.exists())
+            self.assertTrue((root / "fixed-action-current.pyw").is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

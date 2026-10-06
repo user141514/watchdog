@@ -112,14 +112,12 @@ class WindowsFixedActionScheduler:
         if self.launcher_path.exists():
             try:
                 if self.launcher_path.read_text(encoding="utf-8") == wanted:
-                    self.legacy_launcher_path.unlink(missing_ok=True)
                     return
             except OSError:
                 pass
         temp = self.launcher_path.with_suffix(self.launcher_path.suffix + ".tmp")
         temp.write_text(wanted, encoding="utf-8")
         temp.replace(self.launcher_path)
-        self.legacy_launcher_path.unlink(missing_ok=True)
 
     def _task_command(self, target_url: str) -> str:
         conversation_id = conversation_id_from_url(target_url)
@@ -149,6 +147,7 @@ class WindowsFixedActionScheduler:
         )
         self._ensure_launcher()
         if config_path.exists() and self._applied.get(conversation_id) == fingerprint:
+            self.legacy_launcher_path.unlink(missing_ok=True)
             return
         self._write_config(config)
         command = self._task_command(target_url)
@@ -168,6 +167,10 @@ class WindowsFixedActionScheduler:
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "schtasks create failed").strip())
         self._applied[conversation_id] = fingerprint
+        # Retire the old console launcher only after Task Scheduler has accepted
+        # the new pythonw/.pyw action, so a failed migration cannot create a
+        # mechanical-fallback coverage gap.
+        self.legacy_launcher_path.unlink(missing_ok=True)
 
     def remove(self, target_url: str) -> None:
         conversation_id = conversation_id_from_url(target_url)
