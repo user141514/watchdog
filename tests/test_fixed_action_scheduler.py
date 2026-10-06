@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -33,6 +34,7 @@ class FixedActionSchedulerTests(unittest.TestCase):
         python = root / "venv" / "Scripts" / "python.exe"
         python.parent.mkdir(parents=True)
         python.write_text("", encoding="utf-8")
+        python.with_name("pythonw.exe").write_text("", encoding="utf-8")
         return WindowsFixedActionScheduler(
             runtime_root=root,
             release_dir=release,
@@ -57,15 +59,18 @@ class FixedActionSchedulerTests(unittest.TestCase):
             create = next(call for call, _ in runner.calls if "/Create" in call)
             self.assertIn(f"ChatGPT Fixed ACTION - {CID}", create)
             command = create[create.index("/TR") + 1]
-            launcher = root / "fixed-action-current.cmd"
+            launcher = root / "fixed-action-current.pyw"
             self.assertTrue(launcher.is_file())
+            self.assertIn(str(root / "venv" / "Scripts" / "pythonw.exe"), command)
             self.assertIn(str(launcher), command)
             self.assertIn(CID, command)
+            self.assertNotIn("cmd.exe", command.lower())
             self.assertLessEqual(len(command), 261)
             launcher_text = launcher.read_text(encoding="utf-8")
-            self.assertIn(str(root / "releases" / "abc123"), launcher_text)
-            self.assertIn("-m chat_watchdog fixed-action --config", launcher_text)
-            self.assertIn("%CID%.json", launcher_text)
+            self.assertIn(repr(str(root / "releases" / "abc123")), launcher_text)
+            compile(launcher_text, str(launcher), "exec")
+            self.assertIn("from chat_watchdog.fixed_action_timer import main", launcher_text)
+            self.assertIn('f"{conversation_id}.json"', launcher_text)
             self.assertNotIn("Sidecar", launcher_text)
             self.assertNotIn("fixed-action-v2", launcher_text)
 
@@ -135,6 +140,36 @@ class FixedActionSchedulerTests(unittest.TestCase):
             scheduler.remove(TARGET)
             delete = next(call for call, _ in runner.calls if "/Delete" in call)
             self.assertEqual(delete[delete.index("/TN") + 1], f"ChatGPT Fixed ACTION - {CID}")
+
+    def test_all_schtasks_calls_suppress_console_windows(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = Runner()
+            scheduler = self.scheduler(Path(td), runner)
+
+            scheduler.reconcile([SimpleNamespace(target_url=TARGET)])
+            scheduler.remove(TARGET)
+
+            expected = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+            schtasks_calls = [
+                kwargs
+                for argv, kwargs in runner.calls
+                if argv and argv[0].lower() == "schtasks.exe"
+            ]
+            self.assertTrue(schtasks_calls)
+            self.assertTrue(all(kwargs.get("creationflags") == expected for kwargs in schtasks_calls))
+
+    def test_legacy_cmd_launcher_is_retired_when_pythonw_launcher_is_written(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            legacy = root / "fixed-action-current.cmd"
+            legacy.write_text("@echo off\n", encoding="utf-8")
+            runner = Runner()
+            scheduler = self.scheduler(root, runner)
+
+            scheduler.ensure(TARGET)
+
+            self.assertFalse(legacy.exists())
+            self.assertTrue((root / "fixed-action-current.pyw").is_file())
 
 
 if __name__ == "__main__":

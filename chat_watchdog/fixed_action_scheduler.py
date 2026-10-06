@@ -12,6 +12,7 @@ from .registry import conversation_id_from_url
 
 TASK_PREFIX = "ChatGPT Fixed ACTION - "
 LEGACY_V2_PREFIX = "ChatGPT Fixed ACTION V2 - "
+_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 class WindowsFixedActionScheduler:
@@ -32,10 +33,13 @@ class WindowsFixedActionScheduler:
     ) -> None:
         self.runtime_root = Path(runtime_root)
         self.release_dir = Path(release_dir)
-        self.python_executable = Path(python_executable)
+        python = Path(python_executable)
+        windowless_python = python.with_name("pythonw.exe")
+        self.python_executable = windowless_python if windowless_python.exists() else python
         self._runner = runner
         self.config_dir = self.runtime_root / "fixed-action-timer"
-        self.launcher_path = self.runtime_root / "fixed-action-current.cmd"
+        self.launcher_path = self.runtime_root / "fixed-action-current.pyw"
+        self.legacy_launcher_path = self.runtime_root / "fixed-action-current.cmd"
         self._applied: dict[str, tuple[str, str, int]] = {}
 
     @staticmethod
@@ -77,18 +81,29 @@ class WindowsFixedActionScheduler:
         return path
 
     def _launcher_content(self) -> str:
-        release = str(self.release_dir).replace('"', '""')
-        python = str(self.python_executable).replace('"', '""')
-        config_root = str(self.config_dir).replace('"', '""')
+        release = repr(str(self.release_dir))
+        config_root = repr(str(self.config_dir))
         return (
-            "@echo off\n"
-            "setlocal\n"
-            "set \"CID=%~1\"\n"
-            "if \"%CID%\"==\"\" exit /b 2\n"
-            f'cd /d "{release}"\n'
-            f'"{python}" -m chat_watchdog fixed-action --config '
-            f'"{config_root}\\%CID%.json" >> "{config_root}\\%CID%.log" 2>&1\n'
-            "exit /b %errorlevel%\n"
+            "from __future__ import annotations\n"
+            "from contextlib import redirect_stderr, redirect_stdout\n"
+            "import os\n"
+            "from pathlib import Path\n"
+            "import sys\n\n"
+            f"release = Path({release})\n"
+            f"config_root = Path({config_root})\n"
+            "conversation_id = sys.argv[1] if len(sys.argv) == 2 else \"\"\n"
+            "if not conversation_id:\n"
+            "    raise SystemExit(2)\n"
+            "config_path = config_root / f\"{conversation_id}.json\"\n"
+            "log_path = config_root / f\"{conversation_id}.log\"\n"
+            "config_root.mkdir(parents=True, exist_ok=True)\n"
+            "with log_path.open(\"a\", encoding=\"utf-8\") as stream:\n"
+            "    with redirect_stdout(stream), redirect_stderr(stream):\n"
+            "        os.chdir(release)\n"
+            "        sys.path.insert(0, str(release))\n"
+            "        from chat_watchdog.fixed_action_timer import main\n"
+            "        exit_code = main([\"--config\", str(config_path)])\n"
+            "raise SystemExit(exit_code)\n"
         )
 
     def _ensure_launcher(self) -> None:
@@ -97,17 +112,31 @@ class WindowsFixedActionScheduler:
         if self.launcher_path.exists():
             try:
                 if self.launcher_path.read_text(encoding="utf-8") == wanted:
+                    self.legacy_launcher_path.unlink(missing_ok=True)
                     return
             except OSError:
                 pass
         temp = self.launcher_path.with_suffix(self.launcher_path.suffix + ".tmp")
         temp.write_text(wanted, encoding="utf-8")
         temp.replace(self.launcher_path)
+        self.legacy_launcher_path.unlink(missing_ok=True)
 
     def _task_command(self, target_url: str) -> str:
         conversation_id = conversation_id_from_url(target_url)
-        inner = subprocess.list2cmdline([str(self.launcher_path), conversation_id])
-        return f'cmd.exe /d /c "{inner}"'
+        return subprocess.list2cmdline([
+            str(self.python_executable),
+            str(self.launcher_path),
+            conversation_id,
+        ])
+
+    def _run_schtasks(self, argv: list[str]):
+        return self._runner(
+            argv,
+            capture_output=True,
+            text=True,
+            check=False,
+            creationflags=_NO_WINDOW,
+        )
 
     def ensure(self, target_url: str) -> None:
         conversation_id = conversation_id_from_url(target_url)
@@ -123,24 +152,19 @@ class WindowsFixedActionScheduler:
             return
         self._write_config(config)
         command = self._task_command(target_url)
-        result = self._runner(
-            [
-                "schtasks.exe",
-                "/Create",
-                "/F",
-                "/SC",
-                "MINUTE",
-                "/MO",
-                str(config.interval_minutes),
-                "/TN",
-                self.task_name(target_url),
-                "/TR",
-                command,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        result = self._run_schtasks([
+            "schtasks.exe",
+            "/Create",
+            "/F",
+            "/SC",
+            "MINUTE",
+            "/MO",
+            str(config.interval_minutes),
+            "/TN",
+            self.task_name(target_url),
+            "/TR",
+            command,
+        ])
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "schtasks create failed").strip())
         self._applied[conversation_id] = fingerprint
@@ -151,21 +175,15 @@ class WindowsFixedActionScheduler:
         self._applied.pop(conversation_id, None)
 
     def _delete_task(self, task_name: str, *, missing_ok: bool) -> None:
-        result = self._runner(
-            ["schtasks.exe", "/Delete", "/F", "/TN", task_name],
-            capture_output=True,
-            text=True,
-            check=False,
+        result = self._run_schtasks(
+            ["schtasks.exe", "/Delete", "/F", "/TN", task_name]
         )
         if result.returncode != 0 and not missing_ok:
             raise RuntimeError((result.stderr or result.stdout or "schtasks delete failed").strip())
 
     def _task_names(self) -> set[str]:
-        result = self._runner(
-            ["schtasks.exe", "/Query", "/FO", "CSV", "/NH"],
-            capture_output=True,
-            text=True,
-            check=False,
+        result = self._run_schtasks(
+            ["schtasks.exe", "/Query", "/FO", "CSV", "/NH"]
         )
         if result.returncode != 0:
             raise RuntimeError((result.stderr or result.stdout or "schtasks query failed").strip())

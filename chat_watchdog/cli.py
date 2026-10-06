@@ -330,9 +330,9 @@ def _build_fixed_action_scheduler() -> WindowsFixedActionScheduler:
     runtime_root = _default_state_root() / "chat-watchdog"
     release_dir = Path(__file__).resolve().parents[1]
     python = Path(sys.executable)
-    console_python = python.with_name("python.exe")
-    if console_python.exists():
-        python = console_python
+    windowless_python = python.with_name("pythonw.exe")
+    if windowless_python.exists():
+        python = windowless_python
     return WindowsFixedActionScheduler(
         runtime_root=runtime_root,
         release_dir=release_dir,
