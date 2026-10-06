@@ -30,11 +30,7 @@ class SimpleReviewLineageTests(unittest.TestCase):
         checkpoints = []
         runtime.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
         self.assertEqual(runtime.step(), "transition_sent")
-        reservations = [state for state in checkpoints if state["phase"] == 1]
-        self.assertEqual(len(reservations), 1)
-        self.assertIsNone(checkpoints[0]["expected_review_intent_id"])
-        self.assertEqual(reservations[0]["expected_review_intent_id"], owner.intents[0]["intentId"])
-        self.assertEqual(reservations[0]["transition_turn_id"], "a1")
+        self.assertEqual(checkpoints[0]["expected_review_intent_id"], owner.intents[0]["intentId"])
         self.assertEqual(runtime.step(), "done")
 
     def test_lost_ack_restart_retains_expected_owned_review_link(self):
@@ -44,13 +40,9 @@ class SimpleReviewLineageTests(unittest.TestCase):
         checkpoints = []
         first.set_persistence_callback(lambda state: checkpoints.append(copy.deepcopy(state)))
         self.assertEqual(first.step(), "submission_unknown")
-        reservations = [state for state in checkpoints if state["phase"] == 1]
-        self.assertEqual(len(reservations), 1)
-        self.assertIsNone(checkpoints[0]["expected_review_intent_id"])
-        self.assertEqual(reservations[0]["expected_review_intent_id"], owner.intents[0]["intentId"])
-        self.assertEqual(reservations[0]["transition_turn_id"], "a1")
+        self.assertEqual(checkpoints[0]["expected_review_intent_id"], owner.intents[0]["intentId"])
         restarted = watcher(owner)
-        restarted.restore_state(reservations[0])
+        restarted.restore_state(checkpoints[0])
         self.assertEqual(restarted.step(), "done")
         self.assertEqual(len(owner.intents), 1)
 
@@ -88,12 +80,8 @@ class SimpleReviewLineageTests(unittest.TestCase):
         clock = [0.0]
         runtime = watcher(owner, clock=lambda: clock[0])
         checkpoints = []
-        reservations = []
         def checkpoint(state):
-            review_link = state["expected_review_intent_id"]
-            if review_link is not None and all(sent["intentId"] != review_link for sent in owner.intents):
-                self.assertEqual(state["phase"], 1)
-                reservations.append((review_link, len(owner.intents)))
+            self.assertEqual(len(owner.intents), len(checkpoints))
             checkpoints.append(copy.deepcopy(state))
         runtime.set_persistence_callback(checkpoint)
         self.assertEqual(runtime.step(), "transition_sent")
@@ -102,8 +90,7 @@ class SimpleReviewLineageTests(unittest.TestCase):
         self.assertEqual(runtime.step(), "liveness_recovery_sent")
         self.assertEqual([x["action"] for x in owner.intents], ["continue", "stop", "continue"])
         self.assertEqual(checkpoints[-1]["expected_review_intent_id"], owner.intents[-1]["intentId"])
-        self.assertEqual(reservations, [(owner.intents[0]["intentId"], 0), (owner.intents[2]["intentId"], 2)])
-        self.assertNotEqual(reservations[0][0], reservations[1][0])
+        self.assertNotEqual(checkpoints[0]["expected_review_intent_id"], checkpoints[-1]["expected_review_intent_id"])
         self.assertEqual(runtime.step(), "done")
 
     def test_lost_recovery_ack_restart_keeps_new_review_link_and_never_replays(self):

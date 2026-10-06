@@ -70,11 +70,7 @@ class NativeObservationOwnerTests(unittest.TestCase):
         self.assertIn("REVIEW 0", effect["intent"]["text"])
         self.assertEqual(effect["intent"]["expectedStateVersion"], self.payload["state"]["stateVersion"])
         self.assertEqual(effect["intent"]["expectedWriterEpoch"], self.payload["state"]["writer"]["epoch"])
-        self.assertEqual(checkpoints[0]["phase"], 0)
-        self.assertIsNone(checkpoints[0]["expected_review_intent_id"])
-        review_reservations = [state for state in checkpoints if state["phase"] == 1]
-        self.assertEqual(len(review_reservations), 1)
-        self.assertEqual(review_reservations[0]["expected_review_intent_id"], effect["intent"]["intentId"])
+        self.assertEqual(checkpoints[0]["expected_review_intent_id"], effect["intent"]["intentId"])
 
     def test_missing_current_owner_lineage_cannot_finish_review(self):
         payload = copy.deepcopy(self.payload)

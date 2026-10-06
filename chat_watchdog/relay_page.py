@@ -615,6 +615,61 @@ class RelayChatGPTPage:
     websocket_factory: object = None
 
     @classmethod
+    def open_conversation_copy(
+        cls,
+        relay_url: str,
+        target_url: str,
+        *,
+        timeout: float = 10.0,
+        poll_interval: float = 0.1,
+        request_timeout: float = 30.0,
+        fetch_json: Callable[[str], object] = None,
+        websocket_factory=None,
+    ) -> "RelayChatGPTPage":
+        """Open a disposable tab for one existing ChatGPT conversation."""
+        if not _is_chatgpt_url(target_url):
+            raise ValueError("target_url must be a ChatGPT URL")
+        fetch = fetch_json or _fetch_json
+        ws_url = discover_websocket_url(relay_url, fetch_json=fetch)
+        if websocket_factory is None:
+            import websocket
+
+            websocket_factory = websocket.create_connection
+        socket = websocket_factory(ws_url, timeout=3.0, suppress_origin=True)
+        protocol = RelayCdpProtocol(socket, request_timeout=request_timeout)
+        target_id = ""
+        try:
+            target_id = protocol.create_target(target_url)
+            session_id = protocol.attach_target(target_id)
+            page = cls(
+                target_id=target_id,
+                target_url=target_url,
+                session_id=session_id,
+                socket=socket,
+                protocol=protocol,
+                match_url=target_url,
+                relay_url=relay_url,
+                fetch_json=fetch,
+                websocket_factory=websocket_factory,
+            )
+            deadline = time.monotonic() + timeout
+            while time.monotonic() < deadline:
+                current = protocol.evaluate(session_id, "location.href")
+                if isinstance(current, str) and target_url in current:
+                    snapshot = page.snapshot(_allow_reconnect=False)
+                    if snapshot.turn_key:
+                        return page
+                time.sleep(poll_interval)
+            raise TimeoutError("conversation copy did not expose a stable assistant turn")
+        except BaseException:
+            if target_id:
+                with suppress(Exception):
+                    protocol.command("Target.closeTarget", {"targetId": target_id})
+            with suppress(Exception):
+                socket.close()
+            raise
+
+    @classmethod
     def open_temporary_chat(
         cls,
         relay_url: str,
@@ -959,6 +1014,59 @@ class RelayChatGPTPage:
             require_frontend_acceptance=True,
         )
 
+    def stop_active_generation(
+        self,
+        expected_turn_key: TurnKey,
+        *,
+        stop_timeout: float = 10.0,
+    ) -> PromptDelivery:
+        """Stop one verified active turn without touching the composer draft."""
+        before = self.snapshot()
+        if before.turn_key != expected_turn_key:
+            return PromptDelivery(accepted=False, stale=True, reason="turn_changed")
+        if before.phase not in (Phase.THINKING, Phase.RESPONDING):
+            return PromptDelivery(accepted=False, stale=True, reason="not_active")
+        if not before.stop_visible:
+            return PromptDelivery(accepted=False, reason="stop_not_visible")
+
+        before_user_text = before.user_text.replace("\r\n", "\n").strip()
+        before_user_count = before.user_count
+        try:
+            stopped = self.protocol.evaluate(
+                self.session_id,
+                _build_stop_generation_expression(),
+            )
+        except RelayCdpError:
+            return PromptDelivery(accepted=False, uncertain=True, reason="stop_transport_error")
+        if not isinstance(stopped, Mapping):
+            return PromptDelivery(accepted=False, uncertain=True, reason="stop_invalid_result")
+        if stopped.get("stopped") is not True:
+            return PromptDelivery(
+                accepted=False,
+                reason=str(stopped.get("reason") or "stop_rejected"),
+            )
+
+        deadline = time.monotonic() + stop_timeout
+        while time.monotonic() < deadline:
+            current = self.snapshot()
+            current_user_text = current.user_text.replace("\r\n", "\n").strip()
+            if (
+                current.user_count > before_user_count
+                or (
+                    current_user_text
+                    and before_user_text
+                    and current_user_text != before_user_text
+                )
+            ):
+                return PromptDelivery(accepted=False, stale=True, reason="human_turn_changed")
+            if current.turn_key and current.turn_key != expected_turn_key:
+                return PromptDelivery(accepted=False, stale=True, reason="turn_changed")
+            if current.phase not in (Phase.THINKING, Phase.RESPONDING) and not current.stop_visible:
+                return PromptDelivery(accepted=True, message_id=current.assistant_turn_id)
+            time.sleep(0.1)
+
+        return PromptDelivery(accepted=False, uncertain=True, reason="stop_settle_timeout")
+
     def recover_stalled_active(
         self,
         prompt: str,
@@ -982,11 +1090,11 @@ class RelayChatGPTPage:
 
         before = self.snapshot()
         if before.turn_key != expected_turn_key:
-            return PromptDelivery(accepted=False, stale=True)
+            return PromptDelivery(accepted=False, stale=True, reason="turn_changed")
         if before.phase not in (Phase.THINKING, Phase.RESPONDING):
-            return PromptDelivery(accepted=False, stale=True)
+            return PromptDelivery(accepted=False, stale=True, reason="not_active")
         if not before.stop_visible:
-            return PromptDelivery(accepted=False)
+            return PromptDelivery(accepted=False, reason="stop_not_visible")
 
         # Stage only into an empty composer. If the user already has a draft,
         # never overwrite it.
@@ -996,11 +1104,14 @@ class RelayChatGPTPage:
                 _build_stage_composer_expression(prompt),
             )
         except RelayCdpError:
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="stage_transport_error")
         if not isinstance(staged, Mapping):
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="stage_invalid_result")
         if staged.get("staged") is not True:
-            return PromptDelivery(accepted=False)
+            return PromptDelivery(
+                accepted=False,
+                reason=str(staged.get("reason") or "stage_rejected"),
+            )
 
         def clear_our_draft() -> None:
             with suppress(Exception):
@@ -1016,13 +1127,16 @@ class RelayChatGPTPage:
             )
         except RelayCdpError:
             clear_our_draft()
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="stop_transport_error")
         if not isinstance(stopped, Mapping):
             clear_our_draft()
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="stop_invalid_result")
         if stopped.get("stopped") is not True:
             clear_our_draft()
-            return PromptDelivery(accepted=False)
+            return PromptDelivery(
+                accepted=False,
+                reason=str(stopped.get("reason") or "stop_rejected"),
+            )
 
         expected = prompt.replace("\r\n", "\n").strip()
         before_user_text = before.user_text.replace("\r\n", "\n").strip()
@@ -1084,7 +1198,7 @@ class RelayChatGPTPage:
 
         if settled is None:
             clear_our_draft()
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="settle_timeout")
 
         # Verify the exact watchdog draft survived semantic Stop finality and
         # focus the composer before issuing a real Enter keypress.
@@ -1095,10 +1209,10 @@ class RelayChatGPTPage:
             )
         except RelayCdpError:
             clear_our_draft()
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="focus_transport_error")
         if not isinstance(focused, Mapping) or focused.get("focused") is not True:
             clear_our_draft()
-            return PromptDelivery(accepted=False)
+            return PromptDelivery(accepted=False, reason="focus_failed")
         actual = str(focused.get("text") or "").replace("\r\n", "\n").strip()
         if actual != expected:
             # The draft changed while we were stopping; assume human/UI race and
@@ -1131,7 +1245,7 @@ class RelayChatGPTPage:
             )
         except RelayCdpError:
             # Enter may have taken effect before transport failure; freeze retry.
-            return PromptDelivery(accepted=False, uncertain=True)
+            return PromptDelivery(accepted=False, uncertain=True, reason="enter_transport_error")
 
         settled_user_text = settled.user_text.replace("\r\n", "\n").strip()
         settled_user_count = settled.user_count
@@ -1158,7 +1272,7 @@ class RelayChatGPTPage:
             time.sleep(0.1)
 
         # Enter was attempted but no causal user-turn receipt was observed.
-        return PromptDelivery(accepted=False, uncertain=True)
+        return PromptDelivery(accepted=False, uncertain=True, reason="causal_receipt_timeout")
 
     def send_liveness_continue(
         self,

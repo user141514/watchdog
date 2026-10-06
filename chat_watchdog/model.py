@@ -70,6 +70,7 @@ class PromptDelivery:
     message_id: str = ""
     stale: bool = False
     uncertain: bool = False
+    reason: str = ""
 
     def __bool__(self) -> bool:
         return self.accepted

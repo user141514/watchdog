@@ -170,24 +170,21 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
                 self.assertEqual(runtime.step(), "observation_unavailable")
                 self.assertEqual(runtime.diagnostics["reason"], "target_unavailable")
 
-    def test_action_done_transitions_to_review_only_once_using_sample_version_epoch(self):
+    def test_action_done_marker_latches_without_review(self):
         owner = Owner([sample(text="SUPERVISOR_DONE")])
         runtime = watcher(owner)
-        self.assertEqual(runtime.step(), "transition_sent")
-        self.assertEqual(runtime.step(), "transition_pending")
-        self.assertEqual(runtime.durable_state["phase"], 1)
-        self.assertEqual(len(owner.intents), 1)
-        intent = owner.intents[0]
-        self.assertEqual(intent["action"], "continue")
-        self.assertEqual(intent["expectedStateVersion"], 7)
-        self.assertEqual(intent["expectedWriterEpoch"], 4)
-        self.assertEqual(intent["expected"], {"userMessageId": "u1", "assistantMessageId": "a1"})
-        self.assertIn("REVIEW 0", intent["text"])
+
+        self.assertEqual(runtime.step(), "done")
+        self.assertEqual(runtime.durable_state["status"], "DONE")
+        self.assertEqual(runtime.durable_state["phase"], 0)
+        self.assertEqual(owner.intents, [])
+        self.assertEqual(runtime.step(), "done")
+        self.assertEqual(owner.intents, [])
 
     def test_review_continue_preserves_prompt_and_review_done_is_durable_noop(self):
         lineage = {"registrationId": REGISTRATION, "intentId": FIXTURE_REVIEW_INTENT}
         owner = Owner([sample(text='{"decision":"CONTINUE","next_prompt":"next concrete step"}', lineage=lineage)])
-        runtime = watcher(owner, wall_clock=lambda: NOW)
+        runtime = watcher(owner)
         runtime.restore_state({"phase": 1, "cycle": 3, "next_prompt": "", "status": "RUNNING",
                                "expected_review_intent_id": FIXTURE_REVIEW_INTENT})
         self.assertEqual(runtime.step(), "transition_sent")
@@ -195,7 +192,6 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
             "phase": 0, "cycle": 4, "next_prompt": "next concrete step", "status": "RUNNING",
             "transition_turn_id": "a1",
             "expected_review_intent_id": None, "liveness_attempted_for": None,
-            "fixed_prompt_next_due_at": 1790900100.0,
         })
         self.assertEqual(owner.intents[0]["text"], "next concrete step")
         done_owner = Owner([sample(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}', lineage=lineage)])
@@ -209,25 +205,15 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
 
     def test_phase_reservation_is_durable_before_owner_dispatch(self):
         owner = Owner()
-        runtime = watcher(owner, wall_clock=lambda: NOW)
+        runtime = watcher(owner)
         checkpoints = []
         def persist(state):
             self.assertEqual(owner.intents, [])
-            self.assertEqual(owner.reads, 0 if state["phase"] == 0 else 1)
             checkpoints.append(copy.deepcopy(state))
         runtime.set_persistence_callback(persist)
         self.assertEqual(runtime.step(), "transition_sent")
-        self.assertEqual(len(checkpoints), 2)
-        self.assertEqual(checkpoints[0], {
-            "phase": 0, "cycle": 0, "next_prompt": "", "status": "RUNNING",
-            "transition_turn_id": None, "expected_review_intent_id": None,
-            "liveness_attempted_for": None, "fixed_prompt_next_due_at": 1790900100.0,
-        })
-        reservations = [state for state in checkpoints if state["phase"] == 1]
-        self.assertEqual(len(reservations), 1)
-        self.assertEqual(reservations[0]["transition_turn_id"], "a1")
-        self.assertEqual(reservations[0]["expected_review_intent_id"], owner.intents[0]["intentId"])
-        self.assertEqual(reservations[0]["fixed_prompt_next_due_at"], 1790900100.0)
+        self.assertEqual(checkpoints[0]["phase"], 1)
+        self.assertEqual(checkpoints[0]["transition_turn_id"], "a1")
 
     def test_storage_failure_before_dispatch_never_reaches_owner(self):
         owner = Owner()
@@ -235,31 +221,8 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         def unavailable(state):
             raise OSError("store unavailable")
         runtime.set_persistence_callback(unavailable)
-        self.assertEqual(runtime.step(), "fixed_prompt_storage_unavailable")
-        self.assertEqual(owner.reads, 0)
+        self.assertEqual(runtime.step(), "transition_storage_unavailable")
         self.assertEqual(owner.intents, [])
-        self.assertEqual(runtime.durable_state["phase"], 0)
-        self.assertIsNone(runtime.durable_state["transition_turn_id"])
-        self.assertIsNone(runtime.durable_state["expected_review_intent_id"])
-        self.assertNotIn("fixed_prompt_next_due_at", runtime.durable_state)
-
-        transition_owner = Owner()
-        transition = watcher(transition_owner, wall_clock=lambda: NOW)
-        checkpoints = []
-        def fail_reservation(state):
-            if state["phase"] == 1:
-                self.assertEqual(transition_owner.intents, [])
-                raise OSError("transition store unavailable")
-            checkpoints.append(copy.deepcopy(state))
-        transition.set_persistence_callback(fail_reservation)
-        self.assertEqual(transition.step(), "transition_storage_unavailable")
-        self.assertEqual(transition_owner.reads, 1)
-        self.assertEqual(transition_owner.intents, [])
-        self.assertEqual(checkpoints, [{
-            "phase": 0, "cycle": 0, "next_prompt": "", "status": "RUNNING",
-            "transition_turn_id": None, "expected_review_intent_id": None,
-            "liveness_attempted_for": None, "fixed_prompt_next_due_at": 1790900100.0,
-        }])
 
     def test_supervisor_cannot_write_using_retained_terminal_with_unknown_fresh_observation(self):
         owner = Owner([sample(generating=None)])
@@ -419,18 +382,14 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
 
                     simple_owner = Owner([value])
                     clock = [0.0]
-                    simple = watcher(simple_owner, clock=lambda: clock[0], wall_clock=lambda: NOW + clock[0])
+                    simple = watcher(simple_owner, clock=lambda: clock[0])
                     checkpoints = []
                     simple.set_persistence_callback(checkpoints.append)
                     self.assertEqual(simple.step(), "blocked")
                     clock[0] = 900
                     self.assertEqual(simple.step(), "blocked")
                     self.assertEqual(simple_owner.intents, [])
-                    self.assertEqual(checkpoints, [{
-                        "phase": 0, "cycle": 0, "next_prompt": "", "status": "RUNNING",
-                        "transition_turn_id": None, "expected_review_intent_id": None,
-                        "liveness_attempted_for": None, "fixed_prompt_next_due_at": 1790900100.0,
-                    }])
+                    self.assertEqual(checkpoints, [])
 
     def test_pending_uncertain_or_human_gate_cannot_use_retained_blocked_authority(self):
         for changed in (
@@ -450,18 +409,14 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
                 self.assertEqual(classic_owner.intents, [])
                 simple_owner = Owner([value])
                 clock = [0.0]
-                simple = watcher(simple_owner, clock=lambda: clock[0], wall_clock=lambda: NOW + clock[0])
+                simple = watcher(simple_owner, clock=lambda: clock[0])
                 checkpoints = []
                 simple.set_persistence_callback(checkpoints.append)
                 simple.step()
                 clock[0] = 900
                 simple.step()
                 self.assertEqual(simple_owner.intents, [])
-                self.assertEqual(checkpoints, [{
-                    "phase": 0, "cycle": 0, "next_prompt": "", "status": "RUNNING",
-                    "transition_turn_id": None, "expected_review_intent_id": None,
-                    "liveness_attempted_for": None, "fixed_prompt_next_due_at": 1790900100.0,
-                }])
+                self.assertEqual(checkpoints, [])
 
     def test_authoritative_human_gate_returns_pause_without_writes(self):
         value = sample(gate=True, terminal=False, body="incomplete")
@@ -530,112 +485,6 @@ class ManagedSimpleWatcherTests(unittest.TestCase):
         self.assertEqual([x["action"] for x in owner.intents], ["stop"])
         runtime.step()
         self.assertEqual(len(owner.intents), 1)
-
-
-class FixedPromptAdapterTests(unittest.TestCase):
-    def page(self, owner):
-        observation, intent = owner.clients()
-        return SidecarObservationPage(TARGET, observation, intent, registration_id=REGISTRATION)
-
-    def test_growing_active_turn_is_stopped_then_continued_with_fresh_state(self):
-        active = sample(generating=True, terminal=False, body="incomplete")
-        growing = sample(text="additional current work", generating=True, terminal=False,
-                         body="incomplete", version=8)
-        stopped = sample(text="latest current work", terminal=False, body="incomplete", version=9)
-        stopped["state"]["writer"]["epoch"] = 6
-        owner = Owner([active, growing, stopped])
-        page = self.page(owner)
-        reservations = []
-        delivery = page.send_fixed_prompt(
-            "fixed ACTION continuation", page.snapshot().turn_key,
-            before_continue=reservations.append,
-        )
-        self.assertTrue(delivery.accepted)
-        self.assertEqual([x["action"] for x in owner.intents], ["stop", "continue"])
-        self.assertEqual(owner.intents[0]["expectedStateVersion"], 8)
-        self.assertEqual(owner.intents[1]["expectedStateVersion"], 9)
-        self.assertEqual(owner.intents[1]["expectedWriterEpoch"], 6)
-        self.assertEqual(owner.intents[1]["expected"], {"userMessageId": "u1", "assistantMessageId": "a1"})
-        self.assertEqual(reservations, [owner.intents[1]["intentId"]])
-
-    def test_uncertain_stop_never_dispatches_continuation(self):
-        active = sample(generating=True, terminal=False, body="incomplete")
-        owner = Owner([active, active], receipt=TimeoutError("stop acknowledgment lost"))
-        page = self.page(owner)
-        delivery = page.send_fixed_prompt("fixed continuation", page.snapshot().turn_key)
-        self.assertTrue(delivery.uncertain)
-        self.assertEqual([x["action"] for x in owner.intents], ["stop"])
-
-    def test_stop_ack_requires_observed_stop_before_continuation(self):
-        active = sample(generating=True, terminal=False, body="incomplete")
-        owner = Owner([active, active, active])
-        page = self.page(owner)
-        delivery = page.send_fixed_prompt("fixed continuation", page.snapshot().turn_key, stop_timeout=0)
-        self.assertFalse(delivery.accepted)
-        self.assertEqual([x["action"] for x in owner.intents], ["stop"])
-
-    def test_changed_identity_and_untrusted_stopped_samples_prevent_continuation(self):
-        fields = [
-            {"user": "other-user"}, {"assistant": "other-assistant"}, {"gate": True},
-            {"delivery": "uncertain"}, {"readable": False}, {"body": "unknown"},
-        ]
-        for changes in fields + [{"changed_turn": True}]:
-            with self.subTest(changes=changes):
-                active = sample(generating=True, terminal=False, body="incomplete")
-                changed_turn = changes.get("changed_turn")
-                changed = sample(**{"terminal": False, "body": "incomplete",
-                                    **{k: v for k, v in changes.items() if k != "changed_turn"}})
-                if changed_turn:
-                    changed["state"]["turn"]["turnId"] = "other-turn"
-                    changed["observation"]["turnId"] = "other-turn"
-                owner = Owner([active, active, changed])
-                page = self.page(owner)
-                delivery = page.send_fixed_prompt("fixed continuation", page.snapshot().turn_key)
-                self.assertFalse(delivery.accepted)
-                self.assertEqual([x["action"] for x in owner.intents], ["stop"])
-
-    def test_natural_finality_before_or_after_stop_wins_over_fixed_prompt(self):
-        active = sample(generating=True, terminal=False, body="incomplete")
-        done = sample(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}', version=9)
-        for observations, actions in (([active, done], []), ([active, active, done], ["stop"])):
-            with self.subTest(actions=actions):
-                owner = Owner(observations)
-                page = self.page(owner)
-                delivery = page.send_fixed_prompt("fixed REVIEW continuation", page.snapshot().turn_key)
-                self.assertFalse(delivery.accepted)
-                self.assertEqual([x["action"] for x in owner.intents], actions)
-
-    def test_stopped_nonterminal_fixed_prompt_needs_no_fault_or_stagnant_signature(self):
-        initial = sample(terminal=False, body="empty", text="")
-        fresh = sample(terminal=False, body="incomplete", text="new partial output", version=9)
-        owner = Owner([initial, fresh])
-        page = self.page(owner)
-        delivery = page.send_fixed_prompt("fixed continuation", page.snapshot().turn_key)
-        self.assertTrue(delivery.accepted)
-        self.assertEqual([x["action"] for x in owner.intents], ["continue"])
-        self.assertEqual(owner.intents[0]["expectedStateVersion"], 9)
-
-    def test_review_reservation_failure_prevents_continuation_after_stop(self):
-        active = sample(generating=True, terminal=False, body="incomplete")
-        stopped = sample(terminal=False, body="incomplete", version=9)
-        owner = Owner([active, active, stopped])
-        page = self.page(owner)
-        def fail(_):
-            raise OSError("durable review reservation unavailable")
-        delivery = page.send_fixed_prompt("fixed REVIEW", page.snapshot().turn_key, before_continue=fail)
-        self.assertFalse(delivery.accepted)
-        self.assertEqual([x["action"] for x in owner.intents], ["stop"])
-
-    def test_fresh_lineage_change_prevents_even_stop(self):
-        active = sample(generating=True, terminal=False, body="incomplete",
-                        lineage={"registrationId": REGISTRATION, "intentId": FIXTURE_REVIEW_INTENT})
-        changed = sample(generating=True, terminal=False, body="incomplete",
-                         lineage={"registrationId": REGISTRATION, "intentId": "different-intent"})
-        owner = Owner([active, changed])
-        page = self.page(owner)
-        delivery = page.send_fixed_prompt("fixed REVIEW", page.snapshot().turn_key)
-        self.assertFalse(delivery.accepted)
-        self.assertEqual(owner.intents, [])
 
 
 if __name__ == "__main__":

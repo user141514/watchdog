@@ -4,12 +4,10 @@ from contextlib import suppress
 from dataclasses import dataclass
 import json
 import logging
-import math
-from numbers import Real
 import time
 from typing import Callable
 
-from .model import PageSnapshot, Phase, is_need_input
+from .model import PageSnapshot, Phase, is_done, is_need_input
 from .intent_client import SidecarIntentClient
 from .observation_client import (
     ObservationProtocolError, ObservationUnavailable,
@@ -37,9 +35,11 @@ DONE_STATUS = "DONE"
 
 ACTION_RECOVERY_PROMPT = (
     "继续当前 ACTION，从已经完成的内容直接往下推进；不要重新调研、不要重复已完成步骤。"
-    "你仍处于 ACTION phase=0：不得输出 SUPERVISOR_DONE，也不得自行终止整个循环。"
-    "如果继续确实需要用户手动操作、登录、授权、确认或补充信息，"
-    "可以在回复最后单独输出 [SUPERVISOR_STATE: NEED_INPUT]。"
+    "你仍处于 ACTION phase=0。"
+    "如果整个任务已经真正完成，请在回复最后单独输出 SUPERVISOR_DONE。"
+    "如果继续确实需要用户手动操作、登录、授权、确认或补充信息，请说明需要的动作，"
+    "并在回复最后单独输出 [SUPERVISOR_STATE: NEED_INPUT]；不要自行假定用户已经完成。"
+    "如果还没完成且不需要用户介入，就继续实际推进任务。"
 )
 
 REVIEW_RECOVERY_PROMPT = (
@@ -50,15 +50,11 @@ REVIEW_RECOVERY_PROMPT = (
     "不要 markdown，不要在 JSON 外输出任何文字。"
 )
 
-ACTION_FIXED_PROMPT = "这是 15 分钟固定兜底。保持当前 ACTION 合约。" + ACTION_RECOVERY_PROMPT
-REVIEW_FIXED_PROMPT = "这是 15 分钟固定兜底。保持当前 REVIEW 合约。" + REVIEW_RECOVERY_PROMPT
-
 REVIEW_PROMPT = (
     "REVIEW {cycle}。只回顾紧邻的上一轮 ACTION，不继续执行任务，不使用工具。\n"
-    "机械协议：你是 REVIEW，相位固定为 1；只有 REVIEW 有资格终止整个循环。"
-    "上一轮 ACTION 即使输出过 SUPERVISOR_DONE，也没有终止权限。\n"
+    "机械协议：你是 REVIEW，相位固定为 1。\n"
     "如果总体目标尚未完成，只生成下一轮唯一 ACTION prompt；它必须承接上一轮真实产出、"
-    "禁止重复已完成工作，并明确 ACTION 不得输出 SUPERVISOR_DONE。\n"
+    "禁止重复已完成工作。\n"
     "未完成时严格只输出一个 JSON 对象："
     '{{"decision":"CONTINUE","review":"<上一ACTION完成了什么、还缺什么>",'
     '"next_prompt":"<下一ACTION完整提示词>"}}\n'
@@ -67,13 +63,6 @@ REVIEW_PROMPT = (
     '"terminal":"SUPERVISOR_DONE"}}\n'
     "不要 markdown，不要在 JSON 外输出任何文字。"
 )
-
-
-def _positive_fixed_time(value: object, label: str) -> float:
-    if (isinstance(value, bool) or not isinstance(value, Real)
-            or not math.isfinite(value) or value <= 0):
-        raise ValueError(f"{label} must be a finite positive real number")
-    return float(value)
 
 
 def _same_conversation(left: str, right: str) -> bool:
@@ -87,6 +76,16 @@ def _terminal_status(text: str) -> str | None:
     tail = (text or "")[-4096:]
     if is_need_input(tail):
         return "need_input"
+    last_line = tail.strip().splitlines()[-1].strip() if tail.strip() else ""
+    if last_line.upper() == "SUPERVISOR_DONE":
+        return "done"
+    if (
+        last_line.startswith("[")
+        and last_line.endswith("]")
+        and is_done(last_line)
+        and "SUPERVISOR_STATE" in last_line.upper()
+    ):
+        return "done"
     return None
 
 
@@ -143,15 +142,9 @@ class SimpleWatcher:
     intent_client: SidecarIntentClient | None = None
     legacy_direct_send: bool = False
     registration_id: str | None = None
-    wall_clock: Callable[[], float] = time.time
-    fixed_prompt_interval_seconds: float = 900.0
 
     def __post_init__(self) -> None:
         self.conversation_id = conversation_id_from_url(self.target_url)
-        self.fixed_prompt_interval_seconds = _positive_fixed_time(
-            self.fixed_prompt_interval_seconds, "fixed_prompt_interval_seconds",
-        )
-        self._fixed_prompt_next_due_at: float | None = None
         if self.page_factory is None and not self.legacy_direct_send:
             self.observation_client = self.observation_client or SidecarObservationClient()
             self.intent_client = self.intent_client or SidecarIntentClient()
@@ -205,8 +198,6 @@ class SimpleWatcher:
             "liveness_attempted_for": (None if self._liveness_attempted_for is None
                                        else list(self._liveness_attempted_for)),
         }
-        if self.observation_client is not None and self._fixed_prompt_next_due_at is not None:
-            state["fixed_prompt_next_due_at"] = self._fixed_prompt_next_due_at
         # Absence carries the unresolved legacy fence across regular registry
         # checkpoints and owner rebinds. Modern human-input release keeps an
         # explicit null, so a new ACTION is never mistaken for that old REVIEW.
@@ -216,12 +207,14 @@ class SimpleWatcher:
 
     def restore_state(self, value: dict[str, object]) -> None:
         base_keys = {"phase", "cycle", "next_prompt", "status"}
-        optional_keys = {"transition_turn_id", "expected_review_intent_id", "liveness_attempted_for",
-                         "fixed_prompt_next_due_at"}
+        optional_keys = {
+            "transition_turn_id",
+            "expected_review_intent_id",
+            "liveness_attempted_for",
+            "fixed_prompt_next_due_at",
+        }
         if not base_keys <= set(value) or set(value) - (base_keys | optional_keys):
             raise ValueError("invalid simple watchdog durable state fields")
-        fixed_due = (_positive_fixed_time(value["fixed_prompt_next_due_at"], "fixed_prompt_next_due_at")
-                     if "fixed_prompt_next_due_at" in value else None)
         transition_turn_id = value.get("transition_turn_id")
         if transition_turn_id is not None and (not isinstance(transition_turn_id, str) or not transition_turn_id):
             raise ValueError("transition_turn_id must be a non-empty string or null")
@@ -245,7 +238,6 @@ class SimpleWatcher:
         if status not in (RUNNING_STATUS, DONE_STATUS):
             raise ValueError("status must be RUNNING or DONE")
         self._phase = phase
-        self._fixed_prompt_next_due_at = fixed_due
         self._cycle = cycle
         self._next_prompt = next_prompt
         self._run_status = status
@@ -259,75 +251,6 @@ class SimpleWatcher:
 
     def set_persistence_callback(self, callback) -> None:
         self._persistence_callback = callback
-
-    def _fixed_prompt_due(self) -> bool:
-        return (self.observation_client is not None
-                and self._fixed_prompt_next_due_at is not None
-                and self.wall_clock() >= self._fixed_prompt_next_due_at)
-
-    def _advance_fixed_prompt(self) -> None:
-        if self._fixed_prompt_due():
-            elapsed = self.wall_clock() - self._fixed_prompt_next_due_at
-            slots = math.floor(elapsed / self.fixed_prompt_interval_seconds) + 1
-            self._fixed_prompt_next_due_at += slots * self.fixed_prompt_interval_seconds
-
-    def _arm_fixed_prompt(self) -> bool:
-        if self.observation_client is None or self._fixed_prompt_next_due_at is not None:
-            return True
-        self._fixed_prompt_next_due_at = _positive_fixed_time(
-            self.wall_clock() + self.fixed_prompt_interval_seconds, "fixed_prompt_next_due_at",
-        )
-        try:
-            if self._persistence_callback is not None:
-                self._persistence_callback(self.durable_state)
-        except Exception as error:
-            self._fixed_prompt_next_due_at = None
-            self._state = "fixed_prompt_storage_unavailable"
-            self._diagnostics = {"reason": "fixed_prompt_arm_failed", "error": str(error)[:1000]}
-            return False
-        return True
-
-    def _send_fixed_prompt(self, page, before) -> str:
-        previous_due = self._fixed_prompt_next_due_at
-        previous_transition = self._transition_attempted_for
-        previous_review = self._expected_review_intent_id
-        self._advance_fixed_prompt()
-        self._transition_attempted_for = before.turn_key
-        try:
-            if self._persistence_callback is not None:
-                self._persistence_callback(self.durable_state)
-        except Exception as error:
-            self._fixed_prompt_next_due_at = previous_due
-            self._transition_attempted_for = previous_transition
-            self._state = "fixed_prompt_storage_unavailable"
-            self._diagnostics = {"reason": "fixed_prompt_reservation_failed", "error": str(error)[:1000]}
-            return self._state
-        delivery = page.send_fixed_prompt(
-            REVIEW_FIXED_PROMPT if self._phase == 1 else ACTION_FIXED_PROMPT,
-            before.turn_key, stop_timeout=min(10.0, self.submission_confirm_seconds),
-            before_continue=self._reserve_review_recovery if self._phase == 1 else None,
-        )
-        if not delivery.accepted and not delivery.uncertain:
-            self._transition_attempted_for = previous_transition
-            self._expected_review_intent_id = previous_review
-            try:
-                if self._persistence_callback is not None:
-                    self._persistence_callback(self.durable_state)
-            except Exception as error:
-                self._state = "fixed_prompt_storage_unavailable"
-                self._diagnostics = {"reason": "fixed_prompt_rejection_checkpoint_failed",
-                                     "error": str(error)[:1000]}
-                return self._state
-        self._state = ("fixed_prompt_sent" if delivery.accepted else
-                       "fixed_prompt_unknown" if delivery.uncertain else
-                       "fixed_prompt_stale" if delivery.stale else "fixed_prompt_rejected")
-        self._diagnostics = {"frontend_user_message_id": delivery.message_id}
-        return self._state
-
-    def _fixed_prompt_eligible(self, before) -> bool:
-        return bool(self._fixed_prompt_due() and before.turn_key and before.user_turn_id
-                    and not before.interaction_required and not before.user_turn_pending
-                    and not before.send_timeout and not before.fault_text)
 
     def _checkpoint_liveness(self, key) -> bool:
         previous = self._liveness_attempted_for
@@ -368,10 +291,7 @@ class SimpleWatcher:
 
     @property
     def diagnostics(self) -> dict:
-        fixed = ({"fixed_prompt_next_due_at": self._fixed_prompt_next_due_at,
-                  "fixed_prompt_due": self._fixed_prompt_due()}
-                 if self.observation_client is not None else {})
-        return {**self._diagnostics, **self.durable_state, **fixed}
+        return {**self._diagnostics, **self.durable_state}
 
     def _connect_or_open(self) -> tuple[RelayChatGPTPage, bool]:
         # Polling observes an existing exact tab only. A missing target is a
@@ -412,8 +332,6 @@ class SimpleWatcher:
         # periodic continuation prompts on later ticks.
         if self._done_latched or self._run_status == DONE_STATUS:
             self._state = "done"
-            return self._state
-        if not self._arm_fixed_prompt():
             return self._state
 
         try:
@@ -473,52 +391,27 @@ class SimpleWatcher:
                 self._need_input_latched = True
                 self._need_input_user_turn_id = before.user_turn_id or ""
                 return self._state
-
-            if (self.observation_client is not None and before.turn_key
-                    and before.turn_key == self._transition_attempted_for):
-                # A fixed Stop reservation can survive a crash while this same
-                # owned REVIEW naturally finishes. Its final DONE may latch,
-                # while every continuation remains fenced on the consumed turn.
-                if (self._phase == 1 and before.phase is Phase.FINISHED
-                        and page.review_lineage_matches(
-                            self._expected_review_intent_id, self.registration_id)):
-                    try:
-                        review_decision, _ = _parse_review(before.assistant_text)
-                    except ValueError:
-                        pass
-                    else:
-                        if review_decision == "DONE":
-                            self._run_status = DONE_STATUS
-                            self._done_latched = True
-                            self._state = "done"
-                            self._diagnostics = {"review_decision": "DONE"}
-                            return self._state
-                self._state = "transition_pending"
-                self._diagnostics = {"reason": "awaiting_owned_turn_or_explicit_reregister"}
+            if terminal == "done":
+                self._state = terminal
+                self._done_latched = True
+                self._run_status = DONE_STATUS
                 return self._state
+
             if self._phase == 1 and self.observation_client is not None:
+                if before.turn_key and before.turn_key == self._transition_attempted_for:
+                    self._state = "transition_pending"
+                    self._diagnostics = {"reason": "awaiting_owned_review_turn_or_explicit_reregister"}
+                    return self._state
                 if not page.review_lineage_matches(self._expected_review_intent_id, self.registration_id):
                     self._state = "need_input"
                     self._diagnostics = {"reason": "review_lineage_unverified",
                                          "required_action": "explicit_unregister_then_register_to_reset_phase"}
                     return self._state
 
-            if (self.observation_client is not None and self._phase == 0 and self._next_prompt
-                    and self._legacy_transition_state and not self._transition_attempted_for):
-                try:
-                    _parse_review(before.assistant_text)
-                except ValueError:
-                    pass
-                else:
-                    self._state = "transition_pending"
-                    self._diagnostics = {"reason": "prior_review_still_visible"}
-                    return self._state
-            if before.phase is not Phase.FINISHED and self._fixed_prompt_eligible(before):
-                return self._send_fixed_prompt(page, before)
-
-            # The fixed fallback above owns its Stop-and-fresh-check path.
-            # Existing liveness recovery below keeps its inactivity guards;
-            # normal phase progression still requires positive finality.
+            # Simple mode is deliberately conservative: never double-text an
+            # active assistant, race a newer user turn, or push through a
+            # blocked/interaction state. The periodic nudge is only legal after
+            # positive assistant finality has produced Phase.FINISHED.
             if before.phase is not Phase.FINISHED:
                 if before.user_turn_pending:
                     self._last_active_key = None
@@ -755,8 +648,6 @@ class SimpleWatcher:
                 try:
                     review_decision, review_next_prompt = _parse_review(before.assistant_text)
                 except ValueError as error:
-                    if self._fixed_prompt_eligible(before):
-                        return self._send_fixed_prompt(page, before)
                     self._state = "review_invalid"
                     self._diagnostics = {"review_error": str(error)}
                     return self._state
@@ -788,7 +679,6 @@ class SimpleWatcher:
             self._phase = transition_phase
             self._cycle = transition_cycle
             self._transition_attempted_for = before.turn_key or None
-            self._advance_fixed_prompt()
             if self._persistence_callback is not None:
                 try:
                     self._persistence_callback(self.durable_state)
@@ -805,9 +695,7 @@ class SimpleWatcher:
             if not delivery.accepted and not delivery.uncertain:
                 # A definitive rejection proves no new semantic phase was
                 # accepted. Unknown delivery retains the durable reservation.
-                consumed_due = self._fixed_prompt_next_due_at
                 self.restore_state(previous_state)
-                self._fixed_prompt_next_due_at = consumed_due
             if not delivery.accepted:
                 self._state = "submission_unknown" if delivery.uncertain else "send_rejected"
                 return self._state

@@ -102,20 +102,32 @@ def test_send_failure_retains_phase_and_retries_only_on_next_scheduler_tick():
     assert len(page.sent) == 2
 
 
-def test_action_done_has_no_terminal_authority_but_review_done_latches():
-    old_done = snap(text="finished\nSUPERVISOR_DONE", assistant_id="assistant-old")
-    review_done = snap(text='{"decision":"DONE","terminal":"SUPERVISOR_DONE"}',
-                       assistant_id="review-new", signature="review-new-sig")
-    page = FakePage([old_done, old_done, review_done])
+def test_action_done_marker_latches_immediately_without_review():
+    done = snap(text="finished\nSUPERVISOR_DONE", assistant_id="assistant-done")
+    page = FakePage([done])
     watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page))
-    assert watcher.step() == "transition_sent"
-    assert watcher.durable_state["status"] == "RUNNING"
-    assert watcher.step() == "transition_pending"
+
     assert watcher.step() == "done"
+    assert watcher.durable_state["status"] == "DONE"
+    assert page.sent == []
+
     closed = page.closed
     assert watcher.step() == "done"
     assert page.closed == closed
-    assert len(page.sent) == 1
+    assert page.sent == []
+
+
+def test_need_input_marker_wins_over_done_marker():
+    gated = snap(
+        text="SUPERVISOR_DONE\n[SUPERVISOR_STATE: NEED_INPUT]",
+        assistant_id="assistant-gated",
+    )
+    page = FakePage([gated])
+    watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page))
+
+    assert watcher.step() == "need_input"
+    assert watcher.durable_state["status"] == "RUNNING"
+    assert page.sent == []
 
 
 def test_need_input_pauses_until_new_human_turn_then_release_tick_only_observes():
@@ -159,6 +171,25 @@ def test_target_change_never_sends():
     watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page))
     assert watcher.step() == "target_changed"
     assert page.sent == []
+
+
+def test_restore_ignores_legacy_embedded_fixed_prompt_deadline():
+    page = FakePage([snap()])
+    watcher = SimpleWatcher(URL, sleep=lambda _: None, page_factory=factory(page))
+
+    watcher.restore_state({
+        "phase": 0,
+        "cycle": 0,
+        "next_prompt": "",
+        "status": "RUNNING",
+        "transition_turn_id": None,
+        "expected_review_intent_id": None,
+        "liveness_attempted_for": None,
+        "fixed_prompt_next_due_at": 12345.0,
+    })
+
+    assert "fixed_prompt_next_due_at" not in watcher.durable_state
+    assert watcher.durable_state["status"] == "RUNNING"
 
 
 def test_registry_keeps_done_watch_registered_but_future_polls_are_noops(tmp_path: Path):
