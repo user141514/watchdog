@@ -4,6 +4,7 @@ import csv
 import json
 from pathlib import Path
 import subprocess
+from threading import RLock
 from typing import Iterable
 
 from .fixed_action_timer import FIXED_ACTION_PROMPT, TimerConfig, load_config
@@ -41,6 +42,7 @@ class WindowsFixedActionScheduler:
         self.launcher_path = self.runtime_root / "fixed-action-current.pyw"
         self.legacy_launcher_path = self.runtime_root / "fixed-action-current.cmd"
         self._applied: dict[str, tuple[str, str, int]] = {}
+        self._lock = RLock()
 
     @staticmethod
     def task_name(target_url: str) -> str:
@@ -142,45 +144,59 @@ class WindowsFixedActionScheduler:
         )
 
     def ensure(self, target_url: str) -> None:
-        conversation_id = conversation_id_from_url(target_url)
-        config = self._load_or_default(target_url)
-        config_path = self.config_path(target_url)
-        fingerprint = (
-            str(self.release_dir),
-            str(self.python_executable),
-            config.interval_minutes,
-        )
-        self._ensure_launcher()
-        if config_path.exists() and self._applied.get(conversation_id) == fingerprint:
+        with self._lock:
+            conversation_id = conversation_id_from_url(target_url)
+            config = self._load_or_default(target_url)
+            config_path = self.config_path(target_url)
+            fingerprint = (
+                str(self.release_dir),
+                str(self.python_executable),
+                config.interval_minutes,
+            )
+            self._ensure_launcher()
+            if config_path.exists() and self._applied.get(conversation_id) == fingerprint:
+                self.legacy_launcher_path.unlink(missing_ok=True)
+                return
+            self._write_config(config)
+            command = self._task_command(target_url)
+            result = self._run_schtasks([
+                "schtasks.exe",
+                "/Create",
+                "/F",
+                "/SC",
+                "MINUTE",
+                "/MO",
+                str(config.interval_minutes),
+                "/TN",
+                self.task_name(target_url),
+                "/TR",
+                command,
+            ])
+            if result.returncode != 0:
+                raise RuntimeError((result.stderr or result.stdout or "schtasks create failed").strip())
+            self._applied[conversation_id] = fingerprint
+            # Retire the old console launcher only after Task Scheduler has accepted
+            # the new pythonw/.pyw action, so a failed migration cannot create a
+            # mechanical-fallback coverage gap.
             self.legacy_launcher_path.unlink(missing_ok=True)
-            return
-        self._write_config(config)
-        command = self._task_command(target_url)
-        result = self._run_schtasks([
-            "schtasks.exe",
-            "/Create",
-            "/F",
-            "/SC",
-            "MINUTE",
-            "/MO",
-            str(config.interval_minutes),
-            "/TN",
-            self.task_name(target_url),
-            "/TR",
-            command,
-        ])
-        if result.returncode != 0:
-            raise RuntimeError((result.stderr or result.stdout or "schtasks create failed").strip())
-        self._applied[conversation_id] = fingerprint
-        # Retire the old console launcher only after Task Scheduler has accepted
-        # the new pythonw/.pyw action, so a failed migration cannot create a
-        # mechanical-fallback coverage gap.
-        self.legacy_launcher_path.unlink(missing_ok=True)
+
+    def ensure_attached(self, target_url: str) -> None:
+        """Synchronously re-materialize the canonical task for an explicit bind.
+
+        Manual binding is rare and is a correctness barrier, not a polling fast
+        path. Force one /Create /F so success means Task Scheduler accepted the
+        current canonical pythonw/.pyw action instead of trusting in-memory state.
+        """
+        with self._lock:
+            conversation_id = conversation_id_from_url(target_url)
+            self._applied.pop(conversation_id, None)
+            self.ensure(target_url)
 
     def remove(self, target_url: str) -> None:
-        conversation_id = conversation_id_from_url(target_url)
-        self._delete_task(self.task_name(target_url), missing_ok=True)
-        self._applied.pop(conversation_id, None)
+        with self._lock:
+            conversation_id = conversation_id_from_url(target_url)
+            self._delete_task(self.task_name(target_url), missing_ok=True)
+            self._applied.pop(conversation_id, None)
 
     def _delete_task(self, task_name: str, *, missing_ok: bool) -> None:
         result = self._run_schtasks(
@@ -205,27 +221,28 @@ class WindowsFixedActionScheduler:
         return names
 
     def reconcile(self, registrations: Iterable[object]) -> None:
-        desired_urls = {
-            str(getattr(item, "target_url"))
-            for item in registrations
-            if isinstance(getattr(item, "target_url", None), str)
-        }
-        desired_names = {self.task_name(url) for url in desired_urls}
-        desired_ids = {conversation_id_from_url(url) for url in desired_urls}
-        self._applied = {
-            conversation_id: fingerprint
-            for conversation_id, fingerprint in self._applied.items()
-            if conversation_id in desired_ids
-        }
+        with self._lock:
+            desired_urls = {
+                str(getattr(item, "target_url"))
+                for item in registrations
+                if isinstance(getattr(item, "target_url", None), str)
+            }
+            desired_names = {self.task_name(url) for url in desired_urls}
+            desired_ids = {conversation_id_from_url(url) for url in desired_urls}
+            self._applied = {
+                conversation_id: fingerprint
+                for conversation_id, fingerprint in self._applied.items()
+                if conversation_id in desired_ids
+            }
 
-        # Establish every desired canonical task before retiring stale/legacy
-        # tasks, so reconciliation never creates a fallback coverage gap.
-        for target_url in sorted(desired_urls):
-            self.ensure(target_url)
+            # Establish every desired canonical task before retiring stale/legacy
+            # tasks, so reconciliation never creates a fallback coverage gap.
+            for target_url in sorted(desired_urls):
+                self.ensure(target_url)
 
-        for name in sorted(self._task_names()):
-            if name.startswith(LEGACY_V2_PREFIX):
-                self._delete_task(name, missing_ok=False)
-                continue
-            if name.startswith(TASK_PREFIX) and name not in desired_names:
-                self._delete_task(name, missing_ok=False)
+            for name in sorted(self._task_names()):
+                if name.startswith(LEGACY_V2_PREFIX):
+                    self._delete_task(name, missing_ok=False)
+                    continue
+                if name.startswith(TASK_PREFIX) and name not in desired_names:
+                    self._delete_task(name, missing_ok=False)

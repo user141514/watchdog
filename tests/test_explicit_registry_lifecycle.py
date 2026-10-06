@@ -461,6 +461,109 @@ def test_empty_scheduler_wait_has_no_timeout_and_preserves_racing_wake():
     assert wake.timeout is None
 
 
+def test_explicit_register_materializes_mechanical_before_success_and_wakes_normal(tmp_path):
+    events = []
+    registry = WatchRegistry(lambda _url: Watcher(), store_path=tmp_path / "registry.sqlite3")
+
+    def projection(target_url):
+        assert target_url == URL
+        assert registry.list_ids() == [ID]
+        events.append("mechanical")
+
+    server = create_control_server(
+        registry,
+        port=0,
+        wake=lambda: events.append("normal"),
+        register_projection=projection,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        data = json.dumps(BIND).encode()
+        with urlopen(Request(
+            f"http://127.0.0.1:{server.server_port}/register",
+            data=data,
+            method="POST",
+            headers={"content-type": "application/json"},
+        ), timeout=2) as response:
+            payload = json.load(response)
+        assert payload["created"] is True
+        assert payload["mechanical_attached"] is True
+        assert events == ["mechanical", "normal"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        registry.close()
+
+
+def test_register_projection_failure_keeps_desired_membership_wakes_normal_and_returns_503(tmp_path):
+    wake = Event()
+    registry = WatchRegistry(lambda _url: Watcher(), store_path=tmp_path / "registry.sqlite3")
+
+    def projection(_target_url):
+        raise RuntimeError("task scheduler unavailable")
+
+    server = create_control_server(
+        registry,
+        port=0,
+        wake=wake.set,
+        register_projection=projection,
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        data = json.dumps(BIND).encode()
+        with pytest.raises(HTTPError) as raised:
+            urlopen(Request(
+                f"http://127.0.0.1:{server.server_port}/register",
+                data=data,
+                method="POST",
+                headers={"content-type": "application/json"},
+            ), timeout=2)
+        assert raised.value.code == 503
+        payload = json.load(raised.value)
+        assert payload["error"] == "registration_projection_unavailable"
+        assert payload["accepted"] is True
+        assert payload["mechanical_attached"] is False
+        assert registry.list_ids() == [ID]
+        assert wake.is_set()
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        registry.close()
+
+
+def test_reregister_rechecks_mechanical_projection_even_when_membership_already_exists(tmp_path):
+    projected = []
+    registry = WatchRegistry(lambda _url: Watcher(), store_path=tmp_path / "registry.sqlite3")
+    server = create_control_server(
+        registry,
+        port=0,
+        wake=lambda: None,
+        register_projection=lambda target_url: projected.append(target_url),
+    )
+    thread = Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        for _ in range(2):
+            data = json.dumps(BIND).encode()
+            with urlopen(Request(
+                f"http://127.0.0.1:{server.server_port}/register",
+                data=data,
+                method="POST",
+                headers={"content-type": "application/json"},
+            ), timeout=2) as response:
+                json.load(response)
+        assert projected == [URL, URL]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(2)
+        registry.close()
+
+
 def test_first_explicit_registration_wakes_empty_scheduler_immediately():
     entered = Event()
 

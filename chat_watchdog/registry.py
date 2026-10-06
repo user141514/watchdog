@@ -559,6 +559,7 @@ def create_control_server(
     *,
     stale_after: float = 120.0,
     wake: Callable[[], None] | None = None,
+    register_projection: Callable[[str], None] | None = None,
 ) -> HTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("watchdog control server must bind to localhost")
@@ -645,15 +646,36 @@ def create_control_server(
                     provenance = {key: payload[key] for key in
                                   ("source", "actor", "operation_id", "reason")}
                     result = registry.register(target_url, provenance=provenance)
+                    if register_projection is not None:
+                        try:
+                            register_projection(target_url)
+                        except Exception as error:
+                            # The durable desired membership is intentionally retained:
+                            # the normal scheduler is still woken, and its background
+                            # reconciliation can retry the mechanical projection.
+                            if wake is not None:
+                                wake()
+                            self._send_json(
+                                503,
+                                {
+                                    "error": "registration_projection_unavailable",
+                                    "reason": str(error)[:1000],
+                                    "conversation_id": result.conversation_id,
+                                    "created": result.created,
+                                    "accepted": True,
+                                    "mechanical_attached": False,
+                                },
+                            )
+                            return
                     if wake is not None:
                         wake()
-                    self._send_json(
-                        200,
-                        {
-                            "conversation_id": result.conversation_id,
-                            "created": result.created,
-                        },
-                    )
+                    response = {
+                        "conversation_id": result.conversation_id,
+                        "created": result.created,
+                    }
+                    if register_projection is not None:
+                        response["mechanical_attached"] = True
+                    self._send_json(200, response)
                     return
 
                 if self.path == "/unregister":

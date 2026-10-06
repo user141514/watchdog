@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from threading import Event, Thread
 from types import SimpleNamespace
 
 from chat_watchdog.fixed_action_scheduler import WindowsFixedActionScheduler
@@ -73,6 +74,32 @@ class FixedActionSchedulerTests(unittest.TestCase):
             self.assertIn('f"{conversation_id}.json"', launcher_text)
             self.assertNotIn("Sidecar", launcher_text)
             self.assertNotIn("fixed-action-v2", launcher_text)
+
+    def test_manual_attachment_forces_task_scheduler_to_accept_current_projection(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = Runner(query_stdout="")
+            scheduler = self.scheduler(root, runner)
+
+            scheduler.ensure(TARGET)
+            scheduler.ensure_attached(TARGET)
+
+            creates = [call for call, _ in runner.calls if "/Create" in call]
+            queries = [call for call, _ in runner.calls if "/Query" in call]
+            self.assertEqual(len(queries), 0)
+            self.assertEqual(len(creates), 2)
+
+    def test_manual_attachment_rewrites_existing_task_to_current_canonical_action(self):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            runner = Runner(query_stdout=f'"\\ChatGPT Fixed ACTION - {CID}","N/A","Ready"')
+            scheduler = self.scheduler(root, runner)
+
+            scheduler.ensure(TARGET)
+            scheduler.ensure_attached(TARGET)
+
+            creates = [call for call, _ in runner.calls if "/Create" in call]
+            self.assertEqual(len(creates), 2)
 
     def test_reconcile_does_not_recreate_unchanged_task_every_poll(self):
         with tempfile.TemporaryDirectory() as td:
@@ -197,6 +224,40 @@ class FixedActionSchedulerTests(unittest.TestCase):
 
             self.assertFalse(legacy.exists())
             self.assertTrue((root / "fixed-action-current.pyw").is_file())
+
+    def test_concurrent_ensure_serializes_task_projection(self):
+        class BlockingRunner(Runner):
+            def __init__(self):
+                super().__init__()
+                self.entered = Event()
+                self.release = Event()
+                self.create_calls = 0
+
+            def __call__(self, argv, **kwargs):
+                self.calls.append((list(argv), dict(kwargs)))
+                if "/Create" in argv:
+                    self.create_calls += 1
+                    self.entered.set()
+                    self.release.wait(2)
+                if "/Query" in argv:
+                    return SimpleNamespace(returncode=0, stdout=self.query_stdout, stderr="")
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        with tempfile.TemporaryDirectory() as td:
+            runner = BlockingRunner()
+            scheduler = self.scheduler(Path(td), runner)
+            first = Thread(target=scheduler.ensure, args=(TARGET,))
+            second = Thread(target=scheduler.ensure, args=(TARGET,))
+            first.start()
+            self.assertTrue(runner.entered.wait(1))
+            second.start()
+            self.assertEqual(runner.create_calls, 1)
+            runner.release.set()
+            first.join(2)
+            second.join(2)
+            self.assertFalse(first.is_alive())
+            self.assertFalse(second.is_alive())
+            self.assertEqual(runner.create_calls, 1)
 
     def test_failed_task_replacement_keeps_legacy_launcher_for_coverage(self):
         class FailingCreateRunner(Runner):

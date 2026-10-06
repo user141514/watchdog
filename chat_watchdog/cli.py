@@ -255,6 +255,11 @@ def _run_registry_mode(args, pool: AgentPool | None, intent_client, state_client
             registry, args.registry_host, args.registry_port,
             stale_after=max(30.0, poll_seconds * 3),
             wake=wake_event.set,
+            register_projection=(
+                fixed_action_scheduler.ensure_attached
+                if fixed_action_scheduler is not None
+                else None
+            ),
         )
     except BaseException:
         registry.close()
