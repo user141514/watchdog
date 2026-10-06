@@ -36,6 +36,7 @@ DONE_STATUS = "DONE"
 ACTION_RECOVERY_PROMPT = (
     "继续当前 ACTION，从已经完成的内容直接往下推进；不要重新调研、不要重复已完成步骤。"
     "你仍处于 ACTION phase=0。"
+    "如果后续需要通过 Orca / orca-sub 启动新的智能体，必须使用 OMP，不要使用 Claude；OMP 不可用时不要自动降级到 Claude。"
     "如果整个任务已经真正完成，请在回复最后单独输出 SUPERVISOR_DONE。"
     "如果继续确实需要用户手动操作、登录、授权、确认或补充信息，请说明需要的动作，"
     "并在回复最后单独输出 [SUPERVISOR_STATE: NEED_INPUT]；不要自行假定用户已经完成。"
@@ -45,6 +46,7 @@ ACTION_RECOVERY_PROMPT = (
 REVIEW_RECOVERY_PROMPT = (
     "继续完成当前 REVIEW；只审查紧邻的上一轮 ACTION，不执行 ACTION，不使用工具。"
     "你仍处于 REVIEW phase=1。严格遵守当前 REVIEW 协议，最终只输出一个 JSON 对象："
+    "如果后续需要通过 Orca / orca-sub 启动新的智能体，必须使用 OMP，不要使用 Claude；OMP 不可用时不要自动降级到 Claude。"
     "未完成则 decision=CONTINUE 并给出非空 next_prompt；"
     "只有总体目标已经充分完成时才允许 decision=DONE 且 terminal=SUPERVISOR_DONE。"
     "不要 markdown，不要在 JSON 外输出任何文字。"
@@ -53,6 +55,7 @@ REVIEW_RECOVERY_PROMPT = (
 REVIEW_PROMPT = (
     "REVIEW {cycle}。只回顾紧邻的上一轮 ACTION，不继续执行任务，不使用工具。\n"
     "机械协议：你是 REVIEW，相位固定为 1。\n"
+    "如果后续需要通过 Orca / orca-sub 启动新的智能体，必须使用 OMP，不要使用 Claude；OMP 不可用时不要自动降级到 Claude。\n"
     "如果总体目标尚未完成，只生成下一轮唯一 ACTION prompt；它必须承接上一轮真实产出、"
     "禁止重复已完成工作。\n"
     "未完成时严格只输出一个 JSON 对象："
