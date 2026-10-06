@@ -1,0 +1,404 @@
+{
+  "schemaVersion": 1,
+  "language": "zh",
+  "mapId": "watchdog-runtime-routing",
+  "revision": 1,
+  "project": {
+    "id": "chat-watchdog",
+    "name": "Chat Watchdog",
+    "revision": "695282fc318a15d1de0c670a89dfd2b742696f7d"
+  },
+  "constraintDiscovery": {
+    "checkedAt": "2026-10-06T06:27:00Z",
+    "checkedPaths": [
+      "README.md",
+      "chat_watchdog",
+      "scripts",
+      "docs/2026-10-02-quiet-observatory-contract.md",
+      "docs/2026-10-02-quiet-observatory-rollout.md"
+    ],
+    "uninspectedPaths": [
+      "reanchor",
+      ".github",
+      "docs/releases"
+    ]
+  },
+  "constraints": [
+    {
+      "id": "single-canonical-release",
+      "name": "只能保留一个缝合 V1 后的 canonical Watchdog 版本入口",
+      "note": "用户明确要求消除当前正常版本、V1 release、V2 release 并存的开发流程失败；最终运行态只允许一个 canonical release，正常监督和机械兜底由同一版本入口路由。",
+      "origin": "user",
+      "strength": "required",
+      "applicability": "applicable",
+      "scope": "task",
+      "taskId": "consolidate-v1-routes",
+      "modules": [],
+      "relationships": [],
+      "evidence": [],
+      "verification": "部署后检查 9235 runtime、Scheduled Task action 与 release 路径：都必须指向同一 immutable commit release；不得再引用 fixed-action-v2 或独立 V1 release 名称。"
+    },
+    {
+      "id": "mechanical-route-independent",
+      "name": "机械兜底必须独立于正常监督机制",
+      "note": "机械兜底必须继续由 Windows 定时触发并直接走 Relay/CDP；不能依赖 Sidecar observation、正常 ACTION/REVIEW 状态机或正常 daemon 的观测可用性。",
+      "origin": "user",
+      "strength": "required",
+      "applicability": "applicable",
+      "scope": "task",
+      "taskId": "consolidate-v1-routes",
+      "modules": [],
+      "relationships": [],
+      "evidence": [],
+      "verification": "在正常 Sidecar observation 不可用时，单独执行 fixed-action route，证明仍可从 Relay/CDP 读取目标对话并按 V1 规则决定发送/跳过。"
+    },
+    {
+      "id": "preserve-v1-semantics",
+      "name": "V1 机械兜底的行为与终止标记不得丢失",
+      "note": "保留 15 分钟独立固定兜底、SUPERVISOR_DONE、[SUPERVISOR_STATE: NEED_INPUT] 及其发送前抑制逻辑；不得退回 V2 的“不要输出 SUPERVISOR_DONE”语义。",
+      "origin": "user",
+      "strength": "required",
+      "applicability": "applicable",
+      "scope": "task",
+      "taskId": "consolidate-v1-routes",
+      "modules": [],
+      "relationships": [],
+      "evidence": [],
+      "verification": "对 fixed-action route 运行 DONE、NEED_INPUT、active、finished 四类回归测试，并与当前 V1 runtime prompt/terminal 行为对照。"
+    },
+    {
+      "id": "delete-v2",
+      "name": "删除 V2 机械兜底",
+      "note": "用户明确要求删除 V2；包括当前 Enabled 的 V2 Scheduled Task 以及不再被 canonical release 使用的 V2 runtime。",
+      "origin": "user",
+      "strength": "required",
+      "applicability": "applicable",
+      "scope": "task",
+      "taskId": "consolidate-v1-routes",
+      "modules": [],
+      "relationships": [],
+      "evidence": [],
+      "verification": "最终枚举 Windows Scheduled Tasks、进程命令行与 active release 引用，确认不存在 Fixed ACTION V2 任务或 fixed-action-v2 路径。"
+    },
+    {
+      "id": "no-integrated-fixed-timer",
+      "name": "不得把机械定时器重新塞进 SimpleWatcher 正常状态机",
+      "note": "同一 canonical release 可以共享 transport/helper，但两个机制必须由路由和独立进程边界隔开；正常 SimpleWatcher 不拥有 fixed timer 的时钟或调度。",
+      "origin": "user",
+      "strength": "required",
+      "applicability": "applicable",
+      "scope": "task",
+      "taskId": "consolidate-v1-routes",
+      "modules": [],
+      "relationships": [],
+      "evidence": [],
+      "verification": "代码审查确认 SimpleWatcher 不包含 fixed_prompt_due/arm/send 定时逻辑；fixed action 只由独立 route 调用。"
+    }
+  ],
+  "groups": [
+    {
+      "id": "canonical-watchdog",
+      "name": "Canonical Watchdog 代码",
+      "role": "runtime",
+      "members": [
+        "runtime-router",
+        "registry-runtime",
+        "normal-supervisor",
+        "sidecar-bridge",
+        "relay-transport"
+      ],
+      "evidence": [
+        {
+          "path": "chat_watchdog/__main__.py",
+          "note": "包级入口当前直接进入 cli.main；本任务会把这里作为单一版本的路由边界。",
+          "line": 1,
+          "endLine": 3
+        }
+      ]
+    },
+    {
+      "id": "external-runtime",
+      "name": "PC2 当前外部运行面",
+      "role": "external-services",
+      "members": [
+        "fixed-v1-runtime",
+        "fixed-v2-runtime",
+        "windows-scheduler",
+        "sidecar-runtime",
+        "chatgpt-tab"
+      ],
+      "evidence": [
+        {
+          "path": "scripts/pc2-deploy-watchdog.py",
+          "note": "仓库部署脚本只管理 canonical Watchdog daemon；当前机械 Scheduled Task/release 仍在仓库之外，形成版本漂移。",
+          "line": 45,
+          "endLine": 77
+        }
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "id": "runtime-router",
+      "name": "包入口与运行路由",
+      "kind": "local",
+      "responsibility": "从同一个 immutable Watchdog release 选择正常 daemon 路径或独立 fixed-action one-shot 路径；当前入口尚未承担 fixed-action 路由。",
+      "role": "backend",
+      "ownership": [
+        {"kind": "file", "path": "chat_watchdog/__main__.py"},
+        {"kind": "file", "path": "chat_watchdog/cli.py"},
+        {"kind": "file", "path": "scripts/pc2-deploy-watchdog.py"}
+      ],
+      "evidence": [
+        {"path": "chat_watchdog/__main__.py", "line": 1, "endLine": 3, "note": "当前包入口无路由层，直接调用 cli.main。"},
+        {"path": "chat_watchdog/cli.py", "line": 182, "endLine": 275, "note": "registry/simple 正常监督 daemon 的启动路径位于 _run_registry_mode。"}
+      ],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 0, "column": 1}
+    },
+    {
+      "id": "registry-runtime",
+      "name": "Watch Registry 与控制面",
+      "kind": "local",
+      "responsibility": "维护 durable watch membership、registration identity、轮询和 9235 控制面；绑定并驱动正常 watcher。",
+      "role": "backend",
+      "ownership": [
+        {"kind": "file", "path": "chat_watchdog/registry.py"},
+        {"kind": "file", "path": "chat_watchdog/registry_store.py"}
+      ],
+      "evidence": [
+        {"path": "chat_watchdog/registry.py", "line": 139, "endLine": 552, "note": "WatchRegistry 拥有 durable desired watches、bind/poll/lifecycle。"}
+      ],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 1, "column": 1}
+    },
+    {
+      "id": "normal-supervisor",
+      "name": "正常 ACTION/REVIEW 监督状态机",
+      "kind": "local",
+      "responsibility": "基于 Sidecar 的可信页面观测执行 ACTION/REVIEW、DONE/NEED_INPUT 和 liveness/recovery；本任务要求移除当前源码中误缝入的 fixed timer 调度职责。",
+      "role": "backend",
+      "ownership": [
+        {"kind": "file", "path": "chat_watchdog/simple_watchdog.py"}
+      ],
+      "evidence": [
+        {"path": "chat_watchdog/simple_watchdog.py", "line": 128, "endLine": 827, "note": "SimpleWatcher 实现正常监督状态机；当前 695282f 源码还含 integrated fixed prompt 逻辑。"}
+      ],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 2, "column": 1}
+    },
+    {
+      "id": "sidecar-bridge",
+      "name": "Sidecar 观测/意图桥",
+      "kind": "local",
+      "responsibility": "把正常监督读取映射为 Sidecar authoritative observation，并把正常 continuation/stop/refresh 提交给 Sidecar writer。",
+      "role": "backend",
+      "ownership": [
+        {"kind": "file", "path": "chat_watchdog/observation_client.py"},
+        {"kind": "file", "path": "chat_watchdog/intent_client.py"},
+        {"kind": "file", "path": "chat_watchdog/state_client.py"}
+      ],
+      "evidence": [
+        {"path": "chat_watchdog/observation_client.py", "line": 1, "endLine": 180, "note": "SidecarObservationClient 校验 fresh browser observation 并投影 PageSnapshot。"},
+        {"path": "chat_watchdog/intent_client.py", "line": 23, "endLine": 161, "note": "SidecarIntentClient 管理 watchdog bind 与 versioned intents。"}
+      ],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 3, "column": 0}
+    },
+    {
+      "id": "relay-transport",
+      "name": "Relay/CDP 浏览器直连传输",
+      "kind": "local",
+      "responsibility": "通过 OMP browser relay/CDP 对精确 ChatGPT tab 做 snapshot、stop、send/recovery；V1 机械兜底直接依赖此路径而绕过 Sidecar。",
+      "role": "backend",
+      "ownership": [
+        {"kind": "file", "path": "chat_watchdog/relay_page.py"},
+        {"kind": "file", "path": "chat_watchdog/relay_cdp.py"},
+        {"kind": "file", "path": "chat_watchdog/model.py"}
+      ],
+      "evidence": [
+        {"path": "chat_watchdog/relay_page.py", "line": 606, "endLine": 1382, "note": "RelayChatGPTPage 负责连接 target、snapshot 与发送/恢复。"},
+        {"path": "chat_watchdog/relay_cdp.py", "line": 19, "endLine": 164, "note": "RelayCdpProtocol 封装 CDP RPC。"}
+      ],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 3, "column": 2}
+    },
+    {
+      "id": "fixed-v1-runtime",
+      "name": "机械兜底 V1（当前外置）",
+      "kind": "external",
+      "responsibility": "当前 PC2 上独立 Scheduled Task 调用外置 active-recovery release 的 fixed_action_timer，经 Relay/CDP 每 15 分钟做一次固定 ACTION；包含 DONE/NEED_INPUT 抑制语义。目标是把其代码并回 canonical release，但仍保持独立 route/进程。",
+      "role": "backend",
+      "ownership": [],
+      "evidence": [],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 1, "column": 3}
+    },
+    {
+      "id": "fixed-v2-runtime",
+      "name": "机械兜底 V2（待删除）",
+      "kind": "external",
+      "responsibility": "当前 PC2 上第二个 Enabled Scheduled Task 指向 fixed-action-v2 release；与 V1 对同一对话重复调度，且语义禁止 SUPERVISOR_DONE。",
+      "role": "backend",
+      "ownership": [],
+      "evidence": [],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 2, "column": 3}
+    },
+    {
+      "id": "windows-scheduler",
+      "name": "Windows Task Scheduler",
+      "kind": "external",
+      "responsibility": "以固定 PT15M cadence 独立唤醒 fixed-action one-shot；这是机械兜底的调度权威，必须独立于正常 Watchdog daemon。",
+      "role": "queue",
+      "ownership": [],
+      "evidence": [],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 0, "column": 3}
+    },
+    {
+      "id": "sidecar-runtime",
+      "name": "Conversation Sidecar",
+      "kind": "external",
+      "responsibility": "正常监督路径的页面观测和 managed writer owner，当前 localhost 7337。",
+      "role": "backend",
+      "ownership": [],
+      "evidence": [],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 4, "column": 0}
+    },
+    {
+      "id": "chatgpt-tab",
+      "name": "ChatGPT 目标对话页",
+      "kind": "external",
+      "responsibility": "正常 Sidecar 路径与机械 Relay/CDP 路径共同作用的真实浏览器对话目标。",
+      "role": "frontend",
+      "ownership": [],
+      "evidence": [],
+      "status": "supported",
+      "openQuestions": [],
+      "layout": {"row": 4, "column": 2}
+    }
+  ],
+  "relationships": [
+    {
+      "id": "router-starts-normal",
+      "from": "runtime-router",
+      "to": "registry-runtime",
+      "label": "启动 normal registry/simple daemon",
+      "evidence": [{"path": "chat_watchdog/cli.py", "line": 182, "endLine": 275, "note": "_run_registry_mode 创建 WatchRegistry 并运行控制服务。"}],
+      "kind": "control",
+      "visibility": "overview",
+      "status": "supported",
+      "openQuestions": []
+    },
+    {
+      "id": "registry-drives-normal",
+      "from": "registry-runtime",
+      "to": "normal-supervisor",
+      "label": "bind / restore / poll watcher",
+      "evidence": [{"path": "chat_watchdog/registry.py", "line": 222, "endLine": 245, "note": "_bind 构造 watcher、绑定 registration 并恢复 durable state。"}],
+      "kind": "control",
+      "visibility": "overview",
+      "status": "supported",
+      "openQuestions": []
+    },
+    {
+      "id": "normal-reads-sidecar",
+      "from": "normal-supervisor",
+      "to": "sidecar-bridge",
+      "label": "读取 authoritative browser observation",
+      "evidence": [{"path": "chat_watchdog/simple_watchdog.py", "line": 375, "endLine": 383, "note": "managed SimpleWatcher 用 SidecarObservationPage，而不是 Relay page。"}],
+      "kind": "request",
+      "visibility": "overview",
+      "status": "supported",
+      "openQuestions": []
+    },
+    {
+      "id": "bridge-calls-sidecar",
+      "from": "sidecar-bridge",
+      "to": "sidecar-runtime",
+      "label": "localhost observation / intent API",
+      "evidence": [{"path": "chat_watchdog/observation_client.py", "line": 20, "endLine": 31, "note": "默认 observation endpoint 为 localhost Sidecar。"}],
+      "kind": "request",
+      "visibility": "overview",
+      "status": "supported",
+      "openQuestions": []
+    },
+    {
+      "id": "sidecar-observes-chat",
+      "from": "sidecar-runtime",
+      "to": "chatgpt-tab",
+      "label": "扩展 DOM 观测与 managed 写入",
+      "evidence": [],
+      "kind": "request",
+      "visibility": "overview",
+      "status": "uncertain",
+      "openQuestions": ["该关系由 PC2 现网 Sidecar/浏览器运行态确认，但证据位于仓库外；实施前后的 live gate 必须重新验证。"]
+    },
+    {
+      "id": "scheduler-v1",
+      "from": "windows-scheduler",
+      "to": "fixed-v1-runtime",
+      "label": "PT15M 独立触发",
+      "evidence": [],
+      "kind": "control",
+      "visibility": "overview",
+      "status": "uncertain",
+      "openQuestions": ["该 PT15M V1 task 是 PC2 外部运行态事实；需在变更前再次枚举任务计划程序并记录当前 action。"]
+    },
+    {
+      "id": "scheduler-v2",
+      "from": "windows-scheduler",
+      "to": "fixed-v2-runtime",
+      "label": "PT15M 重复触发（待删除）",
+      "evidence": [],
+      "kind": "control",
+      "visibility": "overview",
+      "status": "uncertain",
+      "openQuestions": ["V2 task/release 是 PC2 外部运行态事实；删除前需确认没有其它 active conversation 仍引用该 V2 task。"]
+    },
+    {
+      "id": "v1-uses-relay",
+      "from": "fixed-v1-runtime",
+      "to": "relay-transport",
+      "label": "Sidecar-free snapshot / send / recovery",
+      "evidence": [],
+      "kind": "request",
+      "visibility": "overview",
+      "status": "uncertain",
+      "openQuestions": ["V1 当前从外置 runtime 直连 Relay/CDP 的事实来自现网 task action 和 runtime 文件；并回 canonical release 后要用 live run 复证。"]
+    },
+    {
+      "id": "v2-uses-relay",
+      "from": "fixed-v2-runtime",
+      "to": "relay-transport",
+      "label": "旧 progress-aware snapshot / recovery",
+      "evidence": [],
+      "kind": "request",
+      "visibility": "detail",
+      "status": "uncertain",
+      "openQuestions": ["V2 当前通过 Relay/CDP 的事实来自外部 runtime；其实现会被删除，不作为目标架构保留。"]
+    },
+    {
+      "id": "relay-controls-chat",
+      "from": "relay-transport",
+      "to": "chatgpt-tab",
+      "label": "CDP 直接读取与提交",
+      "evidence": [{"path": "chat_watchdog/relay_page.py", "line": 675, "endLine": 711, "note": "RelayChatGPTPage.connect 通过 relay target attach 到 ChatGPT 页面。"}],
+      "kind": "request",
+      "visibility": "overview",
+      "status": "supported",
+      "openQuestions": []
+    }
+  ]
+}
