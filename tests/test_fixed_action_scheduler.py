@@ -57,10 +57,17 @@ class FixedActionSchedulerTests(unittest.TestCase):
             create = next(call for call, _ in runner.calls if "/Create" in call)
             self.assertIn(f"ChatGPT Fixed ACTION - {CID}", create)
             command = create[create.index("/TR") + 1]
-            self.assertIn(str(root / "releases" / "abc123"), command)
-            self.assertIn("-m chat_watchdog fixed-action --config", command)
-            self.assertNotIn("Sidecar", command)
-            self.assertNotIn("fixed-action-v2", command)
+            launcher = root / "fixed-action-current.cmd"
+            self.assertTrue(launcher.is_file())
+            self.assertIn(str(launcher), command)
+            self.assertIn(CID, command)
+            self.assertLessEqual(len(command), 261)
+            launcher_text = launcher.read_text(encoding="utf-8")
+            self.assertIn(str(root / "releases" / "abc123"), launcher_text)
+            self.assertIn("-m chat_watchdog fixed-action --config", launcher_text)
+            self.assertIn("%CID%.json", launcher_text)
+            self.assertNotIn("Sidecar", launcher_text)
+            self.assertNotIn("fixed-action-v2", launcher_text)
 
     def test_reconcile_does_not_recreate_unchanged_task_every_poll(self):
         with tempfile.TemporaryDirectory() as td:

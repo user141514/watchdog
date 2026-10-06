@@ -35,6 +35,7 @@ class WindowsFixedActionScheduler:
         self.python_executable = Path(python_executable)
         self._runner = runner
         self.config_dir = self.runtime_root / "fixed-action-timer"
+        self.launcher_path = self.runtime_root / "fixed-action-current.cmd"
         self._applied: dict[str, tuple[str, str, int]] = {}
 
     @staticmethod
@@ -75,15 +76,38 @@ class WindowsFixedActionScheduler:
         temp.replace(path)
         return path
 
-    def _task_command(self, config_path: Path, log_path: Path) -> str:
-        release = subprocess.list2cmdline([str(self.release_dir)])
-        python = subprocess.list2cmdline([str(self.python_executable)])
-        config = subprocess.list2cmdline([str(config_path)])
-        log = subprocess.list2cmdline([str(log_path)])
+    def _launcher_content(self) -> str:
+        release = str(self.release_dir).replace('"', '""')
+        python = str(self.python_executable).replace('"', '""')
+        config_root = str(self.config_dir).replace('"', '""')
         return (
-            f'cmd.exe /d /c "cd /d {release} && {python} -m chat_watchdog '
-            f'fixed-action --config {config} >> {log} 2>&1"'
+            "@echo off\n"
+            "setlocal\n"
+            "set \"CID=%~1\"\n"
+            "if \"%CID%\"==\"\" exit /b 2\n"
+            f'cd /d "{release}"\n'
+            f'"{python}" -m chat_watchdog fixed-action --config '
+            f'"{config_root}\\%CID%.json" >> "{config_root}\\%CID%.log" 2>&1\n'
+            "exit /b %errorlevel%\n"
         )
+
+    def _ensure_launcher(self) -> None:
+        self.runtime_root.mkdir(parents=True, exist_ok=True)
+        wanted = self._launcher_content()
+        if self.launcher_path.exists():
+            try:
+                if self.launcher_path.read_text(encoding="utf-8") == wanted:
+                    return
+            except OSError:
+                pass
+        temp = self.launcher_path.with_suffix(self.launcher_path.suffix + ".tmp")
+        temp.write_text(wanted, encoding="utf-8")
+        temp.replace(self.launcher_path)
+
+    def _task_command(self, target_url: str) -> str:
+        conversation_id = conversation_id_from_url(target_url)
+        inner = subprocess.list2cmdline([str(self.launcher_path), conversation_id])
+        return f'cmd.exe /d /c "{inner}"'
 
     def ensure(self, target_url: str) -> None:
         conversation_id = conversation_id_from_url(target_url)
@@ -94,10 +118,11 @@ class WindowsFixedActionScheduler:
             str(self.python_executable),
             config.interval_minutes,
         )
+        self._ensure_launcher()
         if config_path.exists() and self._applied.get(conversation_id) == fingerprint:
             return
-        config_path = self._write_config(config)
-        command = self._task_command(config_path, self.log_path(target_url))
+        self._write_config(config)
+        command = self._task_command(target_url)
         result = self._runner(
             [
                 "schtasks.exe",
