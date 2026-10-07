@@ -322,7 +322,9 @@ def _registry_poll_cycle(registry, wake_event, poll_seconds: float, *,
     if not registry.has_scheduler_work():
         wake_event.wait()
         return
-    remaining = max(0.01, poll_seconds - (time.monotonic() - started))
+    pending_rebind = getattr(registry, "has_pending_rebind_probe", lambda: False)()
+    interval = min(poll_seconds, 0.5) if pending_rebind else poll_seconds
+    remaining = max(0.01, interval - (time.monotonic() - started))
     wake_event.wait(timeout=remaining)
 
 

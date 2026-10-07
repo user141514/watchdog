@@ -18,6 +18,8 @@ from .registry_store import RegistryStore
 
 _LOG = logging.getLogger(__name__)
 
+NORMAL_REBIND_PROBE_TIMEOUT_SECONDS = 5.0
+
 
 class RegistrationRejected(RuntimeError):
     def __init__(self, code: str, reason: str) -> None:
@@ -412,6 +414,15 @@ class WatchRegistry:
         with self._lock:
             return bool(self._watchers or self._pending_withdrawals)
 
+    def has_pending_rebind_probe(self) -> bool:
+        with self._lock:
+            return any(
+                entry.rebind_probe
+                and isinstance(entry.normal_binding, dict)
+                and entry.normal_binding.get("status") == "pending"
+                for entry in self._watchers.values()
+            )
+
     def list_ids(self) -> list[str]:
         with self._lock:
             return sorted(self._watchers)
@@ -442,7 +453,14 @@ class WatchRegistry:
                 WatchRegistration(
                     conversation_id=entry.conversation_id,
                     target_url=entry.target_url,
-                    state=("rebinding" if entry.rebind_pending else
+                    state=("rebinding" if (
+                               entry.rebind_pending
+                               or (
+                                   entry.rebind_probe
+                                   and isinstance(entry.normal_binding, dict)
+                                   and entry.normal_binding.get("status") == "pending"
+                               )
+                           ) else
                            "observation_unavailable" if entry.observation_failure_reason else
                            "reconnecting" if entry.watcher is None else
                            "degraded" if entry.last_error else
@@ -565,11 +583,25 @@ class WatchRegistry:
                                 and diagnostics.get("observation_readable") is True
                                 and diagnostics.get("observation_source") == "browser"
                                 and diagnostics.get("normal_probe_complete") is not False)
+                    checked_at = self._clock()
+                    requested_at = binding_request.get("requested_at")
+                    within_probe_window = (
+                        not readable
+                        and isinstance(requested_at, (int, float))
+                        and checked_at - requested_at < NORMAL_REBIND_PROBE_TIMEOUT_SECONDS
+                    )
                     entry.normal_binding = {
-                        **binding_request, "status": "observed" if readable else "unavailable",
-                        "checked_at": self._clock(),
+                        **binding_request,
+                        "status": (
+                            "observed" if readable
+                            else "pending" if within_probe_window
+                            else "unavailable"
+                        ),
+                        "checked_at": checked_at,
                         "observed_at": diagnostics.get("observation_observed_at"),
-                        "reason": None if readable else diagnostics.get("reason", "observation_unavailable"),
+                        "reason": None if readable else diagnostics.get(
+                            "reason", "observation_unavailable"
+                        ),
                     }
                     if readable:
                         entry.rebind_probe = False

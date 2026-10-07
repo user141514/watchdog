@@ -4,6 +4,7 @@ from threading import Event, Thread
 
 import pytest
 
+from chat_watchdog import cli
 from chat_watchdog.registry import WatchRegistry, RegistrationRejected
 
 CID = "00000000-0000-4000-8000-000000000173"
@@ -147,6 +148,117 @@ def test_observation_unavailable_counts_as_degraded_not_success(tmp_path):
     try:
         assert registry.health()["degraded_count"] == 1
         assert registry.list()[0].last_success_at is None
+    finally:
+        registry.close()
+
+
+def test_transient_probe_failure_stays_pending_and_next_probe_can_observe(tmp_path):
+    events, watchers = [], []
+
+    class TransientWatcher(FakeWatcher):
+        def __init__(self, events):
+            super().__init__(events)
+            self.probes = 0
+
+        def observe_once(self):
+            self.probes += 1
+            self.events.append(("observe-only", self.probes))
+            if self.probes == 1:
+                self.state = "observation_unavailable"
+                self.diagnostics = {"observation_available": False, "reason": "observation_unavailable"}
+            else:
+                self.state = "observing"
+                self.diagnostics = {
+                    "normal_probe_complete": True,
+                    "observation_available": True,
+                    "observation_readable": True,
+                    "observation_source": "browser",
+                    "observation_observed_at": "fresh",
+                }
+
+    def factory(_url):
+        watcher = FakeWatcher(events) if not watchers else TransientWatcher(events)
+        watchers.append(watcher)
+        return watcher
+
+    registry = WatchRegistry(factory, store_path=tmp_path / "registry.sqlite3")
+    try:
+        registry.register(URL)
+        registry.step_all()
+        registry.request_rebind(CID, operation_id="transient")
+        registry.step_all()
+        first = registry.list()[0]
+        assert first.normal_binding["status"] == "pending"
+        assert first.state == "rebinding"
+        assert registry.has_pending_rebind_probe() is True
+
+        registry.step_all()
+        second = registry.list()[0]
+        assert second.normal_binding["status"] == "observed"
+        assert second.normal_binding["operation_id"] == "transient"
+        assert second.diagnostics["normal_probe_complete"] is True
+        assert registry.has_pending_rebind_probe() is False
+    finally:
+        registry.close()
+
+
+def test_pending_rebind_uses_short_scheduler_interval():
+    class Registry:
+        def step_all(self):
+            pass
+        def has_scheduler_work(self):
+            return True
+        def has_pending_rebind_probe(self):
+            return True
+        def list(self):
+            return []
+
+    class Wait:
+        timeout = None
+        def clear(self):
+            pass
+        def wait(self, timeout=None):
+            self.timeout = timeout
+
+    wake = Wait()
+    cli._registry_poll_cycle(Registry(), wake, 15)
+    assert wake.timeout is not None
+    assert 0 < wake.timeout <= 0.5
+
+
+def test_persistent_probe_failure_becomes_unavailable_after_bounded_window(tmp_path):
+    now = [100.0]
+    events, watchers = [], []
+
+    class UnavailableWatcher(FakeWatcher):
+        def observe_once(self):
+            self.events.append(("observe-only", None))
+            self.state = "observation_unavailable"
+            self.diagnostics = {"observation_available": False, "reason": "observation_unavailable"}
+
+    def factory(_url):
+        watcher = FakeWatcher(events) if not watchers else UnavailableWatcher(events)
+        watchers.append(watcher)
+        return watcher
+
+    registry = WatchRegistry(
+        factory,
+        store_path=tmp_path / "registry.sqlite3",
+        clock=lambda: now[0],
+    )
+    try:
+        registry.register(URL)
+        registry.step_all()
+        registry.request_rebind(CID, operation_id="bounded")
+        registry.step_all()
+        assert registry.list()[0].normal_binding["status"] == "pending"
+
+        now[0] += 6.0
+        registry.step_all()
+        watch = registry.list()[0]
+        assert watch.normal_binding["status"] == "unavailable"
+        assert watch.normal_binding["reason"] == "observation_unavailable"
+        assert registry.has_pending_rebind_probe() is False
     finally:
         registry.close()
 
