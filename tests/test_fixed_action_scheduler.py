@@ -187,6 +187,27 @@ class FixedActionSchedulerTests(unittest.TestCase):
             self.assertIn("ChatGPT Fixed ACTION V2 - 6ac34d31", deleted_names)
             self.assertNotIn(f"ChatGPT Fixed ACTION - {CID}", deleted_names)
 
+    def test_reconcile_reads_desired_membership_after_taking_projection_lock(self):
+        with tempfile.TemporaryDirectory() as td:
+            runner = Runner(query_stdout=f'"\\\\ChatGPT Fixed ACTION - {CID}","N/A","Ready"')
+            scheduler = self.scheduler(Path(td), runner)
+            self.assertTrue(hasattr(scheduler, "reconcile_current"))
+            read_started = Event()
+            desired = []
+            def load():
+                read_started.set()
+                return list(desired)
+            worker = Thread(target=scheduler.reconcile_current, args=(load,))
+            with scheduler._lock:
+                worker.start()
+                self.assertFalse(read_started.wait(0.05))
+                scheduler.ensure_attached(TARGET)
+                desired.append(SimpleNamespace(target_url=TARGET))
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertTrue(read_started.is_set())
+            self.assertFalse(any('/Delete' in args for args, _ in runner.calls))
+
     def test_remove_deletes_only_exact_canonical_task(self):
         with tempfile.TemporaryDirectory() as td:
             runner = Runner()

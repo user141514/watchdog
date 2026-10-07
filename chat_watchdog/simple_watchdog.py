@@ -206,6 +206,9 @@ class SimpleWatcher:
         # explicit null, so a new ACTION is never mistaken for that old REVIEW.
         if self._legacy_transition_state and self._transition_attempted_for is None:
             state.pop("transition_turn_id")
+        if self._need_input_latched:
+            state["need_input_latched"] = True
+            state["need_input_user_turn_id"] = self._need_input_user_turn_id
         return state
 
     def restore_state(self, value: dict[str, object]) -> None:
@@ -215,6 +218,8 @@ class SimpleWatcher:
             "expected_review_intent_id",
             "liveness_attempted_for",
             "fixed_prompt_next_due_at",
+            "need_input_latched",
+            "need_input_user_turn_id",
         }
         if not base_keys <= set(value) or set(value) - (base_keys | optional_keys):
             raise ValueError("invalid simple watchdog durable state fields")
@@ -240,6 +245,10 @@ class SimpleWatcher:
             raise ValueError("next_prompt must be a string")
         if status not in (RUNNING_STATUS, DONE_STATUS):
             raise ValueError("status must be RUNNING or DONE")
+        latched = value.get("need_input_latched", False)
+        input_user = value.get("need_input_user_turn_id")
+        if not isinstance(latched, bool) or (input_user is not None and not isinstance(input_user, str)):
+            raise ValueError("invalid durable human gate")
         self._phase = phase
         self._cycle = cycle
         self._next_prompt = next_prompt
@@ -248,9 +257,13 @@ class SimpleWatcher:
         self._legacy_transition_state = "transition_turn_id" not in value
         self._expected_review_intent_id = expected_review_intent_id
         self._liveness_attempted_for = None if liveness is None else tuple(liveness)
+        self._need_input_latched = latched
+        self._need_input_user_turn_id = input_user
         self._done_latched = status == DONE_STATUS
         if self._done_latched:
             self._state = "done"
+        elif self._need_input_latched:
+            self._state = "need_input"
 
     def set_persistence_callback(self, callback) -> None:
         self._persistence_callback = callback
@@ -329,14 +342,20 @@ class SimpleWatcher:
                 self.sleep(0.25)
         raise RuntimeError("new exact conversation tab did not appear")
 
-    def step(self) -> str:
+    def observe_once(self) -> str:
+        """Rebind verification cannot submit a continuation or clear a human gate."""
+        return self.step(observe_only=True)
+
+    def step(self, *, observe_only: bool = False) -> str:
         # DONE is a terminal semantic state even when registry lifecycle remains
         # externally owned. Once observed, do not reconnect, refresh, or send
         # periodic continuation prompts on later ticks.
-        if self._done_latched or self._run_status == DONE_STATUS:
+        if (self._done_latched or self._run_status == DONE_STATUS) and not observe_only:
             self._state = "done"
             return self._state
 
+        if observe_only:
+            self._diagnostics = {}
         try:
             page, opened = self._connect_or_open()
         except (ObservationUnavailable, ObservationProtocolError) as error:
@@ -361,6 +380,16 @@ class SimpleWatcher:
 
             before = page.snapshot()
             self._completion_text = before.assistant_text
+
+            if observe_only:
+                complete = bool(before.user_turn_id and before.assistant_turn_id and not before.fault_text)
+                self._diagnostics["normal_probe_complete"] = complete
+                if not complete:
+                    self._diagnostics["reason"] = before.fault_text or "observation_identity_incomplete"
+                self._state = ("done" if self._done_latched else
+                               "need_input" if self._need_input_latched else
+                               "observing" if complete else "waiting_for_assistant")
+                return self._state
 
             if self._need_input_latched:
                 current_user_turn_id = before.user_turn_id or ""

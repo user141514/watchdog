@@ -48,6 +48,7 @@ class Watcher(Protocol):
 class RegisterResult:
     conversation_id: str
     created: bool
+    registration_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -64,6 +65,7 @@ class WatchRegistration:
     diagnostics: dict | None = None
     last_registration: dict | None = None
     registration_id: str | None = None
+    normal_binding: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -88,9 +90,19 @@ class _WatchEntry:
     registration_id: str = field(default_factory=lambda: str(uuid4()))
     lock: object = field(default_factory=RLock)
     logged_failure: tuple[type[Exception], str] | None = None
+    rebind_pending: bool = False
+    rebind_probe: bool = False
+    normal_binding: dict | None = None
 
     @property
     def observation_failure_reason(self) -> str | None:
+        if self.rebind_pending:
+            return "normal_rebind_pending"
+        diagnostics = getattr(self.watcher, "diagnostics", None) or {}
+        if diagnostics.get("normal_probe_complete") is False:
+            return "observation_identity_incomplete"
+        if diagnostics.get("observation_available") is False or diagnostics.get("observation_readable") is False:
+            return str(diagnostics.get("reason") or "observation_unavailable")
         # This typed native refusal proves no readable persistent turn identity.
         # Unknown identity/protocol failures retain their own full error.
         if self.last_error == "RuntimeError: persistent_turn_identity_unavailable":
@@ -212,6 +224,9 @@ class WatchRegistry:
                 return
             entry.consecutive_failures += 1
             entry.last_error = f"{type(error).__name__}: {error}"
+            if entry.rebind_probe and entry.normal_binding is not None and not entry.rebind_pending:
+                entry.normal_binding = {**entry.normal_binding, "status": "unavailable",
+                                        "reason": entry.last_error, "checked_at": self._clock()}
             self._store.observe(entry)
             changed = entry.logged_failure != failure
             entry.logged_failure = failure
@@ -220,6 +235,7 @@ class WatchRegistry:
             _LOG.warning("watchdog %s retained for retry: %s", entry.conversation_id, detail)
 
     def _bind(self, entry: _WatchEntry) -> bool:
+        watcher = None
         try:
             watcher = self._watcher_factory(entry.target_url)
             bind_registration = getattr(watcher, "bind_registration", None)
@@ -234,6 +250,7 @@ class WatchRegistry:
             entry.watcher = watcher
             return True
         except Exception as error:  # noqa: BLE001 - isolate arbitrary transport plugins
+            self._close_transport(entry.conversation_id, watcher)
             self._record_error(entry, error)
             return False
 
@@ -279,7 +296,8 @@ class WatchRegistry:
             if conversation_id in self._pending_withdrawals:
                 raise RegistrationRejected("withdrawal_pending", "confirm prior withdrawal before rebinding")
             if conversation_id in self._watchers:
-                return RegisterResult(conversation_id=conversation_id, created=False)
+                return RegisterResult(conversation_id=conversation_id, created=False,
+                                      registration_id=self._watchers[conversation_id].registration_id)
             metadata = self._provenance(provenance, "explicit Python registration")
             at = metadata["at"]
             if self._progress_store is not None:
@@ -302,7 +320,38 @@ class WatchRegistry:
                     current = self._current(entry)
                 if current and entry.watcher is None:
                     self._bind(entry)
-        return RegisterResult(conversation_id=conversation_id, created=True)
+        return RegisterResult(conversation_id=conversation_id, created=True, registration_id=registration_id)
+
+    def request_rebind(self, conversation: str, *, operation_id: str,
+                       expected_registration_id: str | None = None) -> dict:
+        """Replace a disposable normal binding on the next tick, never its task identity.
+
+        Do not wait for entry.lock here: a blocked normal poll must not hold up
+        the HTTP acknowledgement of an already established mechanical task.
+        The poll owner drains in-flight work under entry.lock before disposal.
+        Restart is safe: the durable registration is loaded without any cache.
+        """
+        conversation_id = _conversation_id(conversation)
+        if not isinstance(operation_id, str) or not operation_id.strip():
+            raise ValueError("rebind operation_id is required")
+        with self._lock:
+            entry = self._watchers.get(conversation_id)
+            if (entry is None or not self._current(entry)
+                    or conversation_id in self._pending_withdrawals):
+                raise RegistrationRejected("registration_inactive", "cannot rebind a withdrawn generation")
+            if expected_registration_id is not None and entry.registration_id != expected_registration_id:
+                raise RegistrationRejected("registration_changed", "cannot rebind a replacement generation")
+            if (entry.normal_binding is not None
+                    and entry.normal_binding.get("operation_id") == operation_id):
+                return deepcopy(entry.normal_binding)
+            entry.rebind_pending = True
+            entry.last_success_at = None
+            entry.normal_binding = {
+                "status": "pending", "operation_id": operation_id,
+                "registration_id": entry.registration_id,
+                "requested_at": self._clock(), "reason": "normal_rebind_pending",
+            }
+            return deepcopy(entry.normal_binding)
 
     def unregister(self, conversation: str, *, provenance: dict | None = None) -> bool:
         conversation_id = _conversation_id(conversation)
@@ -393,7 +442,8 @@ class WatchRegistry:
                 WatchRegistration(
                     conversation_id=entry.conversation_id,
                     target_url=entry.target_url,
-                    state=("observation_unavailable" if entry.observation_failure_reason else
+                    state=("rebinding" if entry.rebind_pending else
+                           "observation_unavailable" if entry.observation_failure_reason else
                            "reconnecting" if entry.watcher is None else
                            "degraded" if entry.last_error else
                            getattr(entry.watcher, "state", "active")),
@@ -411,6 +461,7 @@ class WatchRegistry:
                         getattr(entry.watcher, "diagnostics", None)),
                     last_registration=None if entry.last_registration is None else dict(entry.last_registration),
                     registration_id=entry.registration_id,
+                    normal_binding=deepcopy(entry.normal_binding),
                 )
                 for entry in sorted(self._watchers.values(), key=lambda item: item.conversation_id)
             ]
@@ -441,6 +492,7 @@ class WatchRegistry:
                 "last_poll_completed_at": last,
                 "active_count": len(self._watchers),
                 "degraded_count": sum(e.watcher is None or e.last_error is not None
+                                      or e.observation_failure_reason is not None
                                       for e in self._watchers.values()),
             }
 
@@ -452,17 +504,42 @@ class WatchRegistry:
 
     def _step_entry(self, entry: _WatchEntry) -> None:
         with entry.lock:
+            retired = None
             with self._lock:
                 if not self._current(entry):
                     return
                 generation = entry.registration_id
+                binding_request = entry.normal_binding
+                if entry.rebind_pending:
+                    # Persist the final in-flight reservation before closing anything.
+                    # DONE, human gates and uncertain REVIEW lineage must survive.
+                    state = getattr(entry.watcher, "durable_state", entry.runtime_state)
+                    if state is not None:
+                        if not isinstance(state, dict):
+                            raise TypeError("watcher durable_state must be a dict")
+                        self._store.reserve_runtime_state(entry.conversation_id, generation, state)
+                        entry.runtime_state = deepcopy(state)
+                    retired, entry.watcher = entry.watcher, None
+                    entry.rebind_pending = False
+                    entry.rebind_probe = True
+                    entry.last_error = None
+                    entry.last_success_at = None
                 entry.last_poll_at = self._clock()
                 # A broken durable store closes the side-effect gate, not just logging.
                 self._store.observe(entry)
+            if retired is not None:
+                self._close_transport(entry.conversation_id, retired)
             if entry.watcher is None and not self._bind(entry):
                 return
+            probing = entry.rebind_probe
             try:
-                entry.watcher.step()
+                if probing:
+                    probe = getattr(entry.watcher, "observe_once", None)
+                    if not callable(probe):
+                        raise RuntimeError("normal_binding_probe_unsupported")
+                    probe()
+                else:
+                    entry.watcher.step()
                 durable_state = getattr(entry.watcher, "durable_state", None)
                 if durable_state is not None:
                     if not isinstance(durable_state, dict):
@@ -480,7 +557,22 @@ class WatchRegistry:
                         or entry.conversation_id in self._pending_withdrawals):
                     return
                 recovered_error = entry.last_error
-                entry.last_success_at = self._clock()
+                if not entry.observation_failure_reason:
+                    entry.last_success_at = self._clock()
+                if probing and entry.normal_binding is binding_request and binding_request is not None and not entry.rebind_pending:
+                    diagnostics = getattr(entry.watcher, "diagnostics", None) or {}
+                    readable = (diagnostics.get("observation_available") is True
+                                and diagnostics.get("observation_readable") is True
+                                and diagnostics.get("observation_source") == "browser"
+                                and diagnostics.get("normal_probe_complete") is not False)
+                    entry.normal_binding = {
+                        **binding_request, "status": "observed" if readable else "unavailable",
+                        "checked_at": self._clock(),
+                        "observed_at": diagnostics.get("observation_observed_at"),
+                        "reason": None if readable else diagnostics.get("reason", "observation_unavailable"),
+                    }
+                    if readable:
+                        entry.rebind_probe = False
                 entry.consecutive_failures = 0
                 entry.last_error = None
                 entry.logged_failure = None
@@ -560,6 +652,7 @@ def create_control_server(
     stale_after: float = 120.0,
     wake: Callable[[], None] | None = None,
     register_projection: Callable[[str], None] | None = None,
+    rebind_on_register: bool = False,
 ) -> HTTPServer:
     if host not in {"127.0.0.1", "localhost"}:
         raise ValueError("watchdog control server must bind to localhost")
@@ -653,6 +746,10 @@ def create_control_server(
                             # The durable desired membership is intentionally retained:
                             # the normal scheduler is still woken, and its background
                             # reconciliation can retry the mechanical projection.
+                            normal = (registry.request_rebind(result.conversation_id,
+                                      operation_id=payload["operation_id"],
+                                      expected_registration_id=result.registration_id)
+                                      if rebind_on_register else None)
                             if wake is not None:
                                 wake()
                             self._send_json(
@@ -664,15 +761,23 @@ def create_control_server(
                                     "created": result.created,
                                     "accepted": True,
                                     "mechanical_attached": False,
+                                    "normal_binding": normal,
+                                    "operation_id": payload["operation_id"],
                                 },
                             )
                             return
+                    normal = (registry.request_rebind(result.conversation_id,
+                              operation_id=payload["operation_id"],
+                              expected_registration_id=result.registration_id)
+                              if rebind_on_register else None)
                     if wake is not None:
                         wake()
                     response = {
                         "conversation_id": result.conversation_id,
                         "created": result.created,
                     }
+                    if rebind_on_register:
+                        response.update(operation_id=payload["operation_id"], normal_binding=normal)
                     if register_projection is not None:
                         response["mechanical_attached"] = True
                     self._send_json(200, response)

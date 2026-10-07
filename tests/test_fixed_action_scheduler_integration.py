@@ -24,8 +24,8 @@ def test_registry_poll_reconciles_independent_fixed_action_projection():
         def __init__(self):
             self.snapshots = []
 
-        def reconcile(self, registrations):
-            self.snapshots.append([item.target_url for item in registrations])
+        def reconcile_current(self, load_registrations):
+            self.snapshots.append([item.target_url for item in load_registrations()])
 
     registry = Registry()
     scheduler = Scheduler()

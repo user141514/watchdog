@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 from threading import RLock
-from typing import Iterable
+from typing import Callable, Iterable
 
 from .fixed_action_timer import FIXED_ACTION_PROMPT, TimerConfig, load_config
 from .registry import conversation_id_from_url
@@ -219,6 +219,12 @@ class WindowsFixedActionScheduler:
             if name:
                 names.add(name)
         return names
+
+    def reconcile_current(self, load_registrations: Callable[[], Iterable[object]]) -> None:
+        # Take the membership snapshot under the same projection lock used by
+        # explicit bind, or a delayed old snapshot can delete a newly attached task.
+        with self._lock:
+            self.reconcile(load_registrations())
 
     def reconcile(self, registrations: Iterable[object]) -> None:
         with self._lock:
